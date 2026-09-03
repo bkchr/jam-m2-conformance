@@ -21,6 +21,10 @@ STF/authoring engine** to validate every block the NUT authors and every off-cha
 - Emulated validators are **scenario-driven, not full nodes**. The scenario decides which messages are
   exchanged and when; emulated peers still *react* to NUT-initiated streams (serve blocks/state/shards,
   accept reports/assurances/judgments, take work-package submissions).
+- Emulated validators are **skeletons, not nodes**: `m2-reference` computes ground truth exactly once
+  and emits decisions; `m2-emu` never executes core logic (no PVM refinement, no erasure coding, no
+  verification). Honest signals are derived from reference truth so emulation is indistinguishable from
+  real validators; fault lanes override those signals deliberately.
 - The NUT is launched from a **command template**; a **Docker preset** provides the M1-style
   `JAM_*` environment contract for submissions.
 - Everything the harness does is **seed-deterministic**; everything the NUT does is **recorded** so a
@@ -54,7 +58,7 @@ content` messages (`:122-130`). Stream kinds: UP 0; CE 128, 129, 131, 132, 133, 
 ```
  ┌──────────────────────────────── jam-m2-conformance (Rust workspace) ────────────────────────────────┐
  │                                                                                                      │
- │  m2-runner (bin)      scenario file (TOML) ──► Scheduler (wall-clock, slot/offset) ──► Report        │
+ │  m2-runner (bin)      scenario check functions ──► Scheduler (event-driven) ──► Report         │
  │        │                                             │                                               │
  │        │ spawns NUT (cmd template / docker preset)   │ drives                                        │
  │        ▼                                             ▼                                               │
@@ -73,7 +77,7 @@ content` messages (`:122-130`). Stream kinds: UP 0; CE 128, 129, 131, 132, 133, 
 |---|---|
 | `jamnp-s` | Independent JAMNP-S: QUIC endpoint (quinn 0.11 + rustls), Ed25519 self-signed cert and SAN derivation, ALPN, preferred-initiator rule, stream-kind byte, `u32 LE` framing, typed codecs for every UP/CE message (GP codec via `jam-types`/`codec`), request/response helpers, full message trace recording. No policy. |
 | `m2-reference` | Wrapper over `polkajam-fuzz` (lib) + `jam-node` (`hazmat`): reference chain state for the 6-validator net; authors blocks for emulated slots; signs tickets/guarantees/assurances/judgments/audit announcements with the five emulated keysets; refines work packages; erasure-codes bundles and builds justifications; imports NUT blocks and diffs state. |
-| `m2-emu` | The five emulated validators plus an optional builder / non-validator peer. One `jamnp-s` endpoint each; reactive handlers (serve CE 128/129/137/138/139/140/147/148/136/143; accept UP 0, CE 131/132/134/135/141/142/144/145/133/146); every inbound and outbound message goes to the observation log. Behaviour is data-driven by the scenario. |
+| `m2-emu` | The five emulated validators plus an optional builder / non-validator peer. One `jamnp-s` endpoint each; reactive handlers (serve CE 128/129/137/138/139/140/147/148/136/143; accept UP 0, CE 131/132/134/135/141/142/144/145/133/146); every inbound and outbound message goes to the observation log. Behaviour is data-driven by the scenario: `m2-emu` executes **no core protocol logic** — every value (report results, segments, shards, proofs) and every decision (audit verdicts, assurance bits) is computed once by `m2-reference` and injected; `m2-emu` only keeps per-peer state, frames, and signs. |
 | `m2-scenario` | Scenario model and scheduler: steps keyed by `(slot_rel, offset_ms)`; actions (emulated side) and expectations (NUT side) with severity; lanes are scenario collections. |
 | `m2-runner` | CLI: generates spec and keys, launches the NUT (command template / preset), runs the scenario, writes report and traces, sets the exit code. |
 
@@ -93,9 +97,10 @@ polkajam needs first).
 3. **Connectivity phase.** Each emulated validator that is the preferred initiator towards the NUT
    connects immediately; the others wait for the NUT to connect (5 s grace, then connect anyway and
    record a soft finding). Certificate, SAN and ALPN checks are recorded as assertions.
-4. **Scenario execution.** The scheduler ticks on the wall clock. At each step it performs actions via
-   `m2-emu` and evaluates expectations against the observation log. Blocks for emulated authors'
-   slots are produced by `m2-reference` and announced (UP 0) and served (CE 128) like a real author.
+4. **Scenario execution.** The scheduler is event-driven: it fires each check's stimulus when its
+   dependencies are satisfied, then matches the expected answer sequence against the observation log
+   (§5). Blocks for emulated authors' slots are produced by `m2-reference` and announced (UP 0) and
+   served (CE 128) like a real author.
 5. **NUT block handling.** On a UP 0 announcement from the NUT: fetch via CE 128 from the NUT, import
    with the reference STF, compare state roots, check the header (seal, entropy VRF, markers, slot ≤
    wall clock), and check the extrinsic against the delivery ledger (inclusion of every valid item the
@@ -108,47 +113,111 @@ polkajam needs first).
 
 ## 5. Scenario model
 
-A scenario is data (TOML), deterministic given `seed`:
+A scenario is a **conversation script**: for every stimulus the harness sends, the NUT's expected
+**answer** is a sequence of messages that must appear in the observation log in response. Sequences
+are **hard-coded in Rust** — authoring them in an external format (TOML/JSON) buys nothing and adds
+a parser, a validation layer, and indirection for no benefit; the checks are code and need the full
+expression power of code. Rust is also the language a conformance reviewer already needs to read
+(the reference engine and harness both are it), so it doubles as the "spec as code" deliverable.
 
-```toml
-[meta]
-name = "L3a-guarantee-basic"
-spec = "tiny"
-nut_validator_index = 0
-epochs = 2
+```rust
+// src/scenarios/l3.rs — one function per scenario
+use crate::{check, log, stimulus::{self, *}, expect::Seq as *};
 
-[params]
-seed = "0x…"
-slot_tolerance_ms = 1500
+/// L3: a work-package is submitted to the NUT; it must refine, share (CE 134 ×2)
+/// with its co-guarantors and report (CE 135) to all validators.
+pub fn wp_refine_and_report(net: &mut Net, sched: &mut Scheduler) -> CheckId {
+    check("wp_refine_and_report", sched, |obs| {
+        net.submit_wp(builder, nut, /*core*/ 1, /*profile*/ Full(Rng::seed(&seed, 7)));
 
-[[step]]
-at = { slot = 3, offset_ms = 500 }
-action = { kind = "submit_work_package", from = "builder", to = "nut", core = 1, profile = "full" }
-expect = [
-  { kind = "ce134_share",  from = "nut", to = "coguarantors", within_ms = 3000 },
-  { kind = "ce135_report", from = "nut", to = "all", within_ms = 4000, matches = "reference_refine" },
-]
+        // The answer: sharing before the report leaves the NUT. Anything else in between
+        // is allowed and recorded, just not counted towards the check.
+        obs.expect_subseq(vec![
+            // window relative to the previous matched event, not a slot offset,
+            // checked with a soft-finding fallback for tolerance clauses.
+            Obs::from(nut).ce134_msg1(to coguarantors).within(3s)  // Core ++ ShardCount ++ len++[…]
+                .verify(|m| m.core == 1),
+            Obs::from(nut).ce134_msg2(to coguarantors).within(1s)  // bundle bytes, byte-identical
+                .verify(|m| m.bytes == reference_bundle()),
+            Obs::from(nut).ce135_report(to all).within(2s)         // Report ++ Slot ++ len++[(Idx,Sig)]
+                .verify(|m| m.report == reference_refine()),
+        ]);
 
-[[step]]
-at = { slot = 4 }
-expect = [ { kind = "block_includes_guarantee", author = "any", report = "step:1" } ]
+        // Standalone extra check on top of the sequence (runs regardless of the above :within):
+        log::check("ce134_msg1_shard_count_is_6",
+            obs.first::<Ce134Msg1>().map(|m| m.shard_count == 6),
+            Severity::Hard);
+    })
+}
 ```
 
-**Actions (emulated side).** `announce_block`, `send_tickets`, `submit_work_package`,
-`submit_bundle`, `share_work_package`, `distribute_report`, `distribute_shards`, `send_assurance`,
-`announce_preimage`, `announce_audit`, `publish_judgment`, `request_<protocol>`, `skip_slot`,
-`kill_nut` / `restart_nut`, and `inject_fault` (a mutation applied to any of the above: bad
-signature, wrong slot, duplicate, oversize, wrong stream kind, truncated frame, stream reset
-mid-message; the mutation vocabulary follows `polkajam-fuzz/src/mutator.rs`).
+```rust
+// src/scenarios/l7.rs — a fault as a delta: reuse an existing sequence, inject the failure
+pub fn equivocating_emulated_author(net: &mut Net, sched: &mut Scheduler) -> CheckId {
+    check("equivocating_emulated_author", sched, |obs| {
+        // reuse the authoring base, then override the emulated slot with a second block
+        let base = l1::authoring_basic(net, sched);
+        net.fault(Fault::EquivocateAuthor /* bad sig, wrong slot, duplicate, … */);
+        // same expectation, one-step window
+        obs.expect_subseq(vec![Obs::from(nut).authors_block().within(0s, 4s)]);
+    })
+}
+```
 
-**Expectations (NUT side).** `connects`, `accepts_connection`, `handshake_up0`, `serves_ce128`,
-`serves_ce129`, `sends_tickets`, `authors_block { valid, on_time, includes, excludes }`,
-`ce134_share`, `ce135_report { matches }`, `serves_ce137/138/139/140/147/148/136/143`,
-`ce141_assurance`, `ce142_announce`, `ce143_request`, `ce144_announce`, `ce145_judgment { validity }`,
+**Semantics.** Each check reads as "we did X; the NUT must answer with A, B, C":
+
+- Expectations are matched as a **subsequence** of the observation log: messages in between are
+  allowed and recorded, they just don't count towards the check. Order between listed events is
+  enforced (CE 134 msg 1 before msg 2 before CE 135); anything not listed is ignored unless it is
+  *invalid* for the protocol, which fails the check.
+- Timing windows are **relative to the previous matched event** (`within(3s)`), not to a slot offset —
+  "reach the expected point within a reasonable time". If a window expires the check fails (or is a
+  soft finding for timing-tolerance clauses).
+- A check fires after its dependencies are satisfied; a `trigger` variant fires when a prior
+  expectation is observed (e.g. "once the CE 135 report is seen, we request shards"). `at_slot` is
+  only used where the protocol itself is slot-relative (authoring, ticket epochs, assurance timing).
+- `depends_on` gives ordering and fail-fast: if the NUT never opens CE 134, we never request shards,
+  and the scenario stops at the first hard failure.
+- **Extra checks live in the same check body**: `log::check(...)`-style assertions on the
+  observation log (shard count is 6, WPHash equals reference, size caps, sorted keys, exclusive
+  ranges) are embedded Rust checks that run alongside the sequence — they are how the §11 check
+  catalogue's "asserts" column is expressed.**
+
+```rust
+// the plain assertions from §11 that need no stimulus fall out of the same DSL:
+pub fn upgrade_asserts(net: &mut Net, sched: &mut Scheduler) -> CheckId {
+    check("ce129_key_shape", sched, |obs| {
+        net.send(emu0, Ce129Request{ range: KeyRange::AscExclusive(known_root) });
+        obs.expect_subseq(vec![Obs::from(nut).serves_ce129()
+            .verify(|m| { m.keys_sorted() && m.boundaries_parent_before_child() && m.len_prefixed_values() })]);
+        log::check("ce129_size_cap", obs.last::<Ce129Served>().map(|m| m.size() <= max_size), Severity::Hard);
+    })
+}
+```
+
+**Hard-coded sequences + on-top tests, in one bucket.** Each scenario file is a module of `check`
+functions; a scenario "runs" by executing its checks in dependency order. A standalone
+JavaScript/TypeScript port of the sequence DSL is planned as a v1.1 companion so the conformance
+group can hand-verify scenarios without the Rust toolchain — the Rust version is the source of truth.
+(§7 keeps the machine-readable *spec file* that a NUT consumes; it is not a scenario format.)
+
+**Stimuli (emulated side).** `connect` / `accept`, `announce_block`, `send_tickets`,
+`submit_work_package`, `submit_bundle`, `share_work_package`, `distribute_report`,
+`request_shards` (CE 137/138/139/140/148), `request_ce129`, `send_assurances`, `announce_preimage`,
+`announce_audit`, `publish_judgment`, `skip_slot`, `kill_nut` / `restart_nut`, and `inject_fault`
+(a mutation applied to any of the above: bad signature, wrong slot, duplicate, oversize, wrong
+stream kind, truncated frame, stream reset mid-message; the mutation vocabulary follows
+`polkajam-fuzz/src/mutator.rs`).
+
+**Expected-answer events (NUT side).** `accept`, `open_up0`, `up0_announce`, `serves_ce128`
+`serves_ce129`, `sends_tickets`, `ce134_msg1 { wphash, segroot }`, `ce134_msg2 { bytes }`,
+`ce135_report { matches, sigs }`, `serves_ce137/138/139/140/147/148/136/143`,
+`ce141_assurance`, `ce142_announce`, `ce143_request`, `ce144_announce`,
+`ce145_judgment { validity }`, `authors_block { valid, on_time, includes, excludes }`,
 `resets_stream`, `ignores` (no message, or no inclusion), `state_root_matches`.
 
-**Severity.** `hard` fails the lane; `soft` is reported only (typically timing outside tolerance but
-inside the slot, or "should" clauses of the spec).
+**Severity.** `hard` fails the scenario; `soft` is reported only (timing outside tolerance,
+"should" clauses, e.g. serving CE 148 when 139/140 would do).
 
 **Role control.** Because the harness holds five of six keysets and sees every ticket, it knows in
 advance who authors, guarantees, assures and audits what:
@@ -162,13 +231,16 @@ advance who authors, guarantees, assures and audits what:
 | Ticket proxy | `BE_u32(vrf_out[28..32]) mod 6` over the *next* epoch's validator list (`:318-325`); about one in six emulated tickets has the NUT as proxy. |
 | Grid neighbour | With W=2 and k=0: neighbours 1, 2, 4; non-neighbours 3, 5 (`:182-190`). |
 
-## 6. Time model
+**Scenario catalogue.** Scenarios are hard-coded modules under `src/scenarios/<lane>/`; the runner
+executes their checks and renders a coverage table (§11 row ↔ scenario module) into every
+`report.md`. A module whose expectations are unsatisfiable (checked by simulating it against
+`m2-reference` in virtual time before any NUT is spent) is rejected up front.
 
 - Slot `s` starts at `JAM_COMMON_ERA + 6·s` (`jam-types/src/simple.rs:13`, 1735732800). Genesis
   has slot 0 (`jam-std-common/src/header.rs:70`); the first authored block carries the current
   wall-clock slot. The harness sets its reference `next_slot = (now − JCE) / 6` at start. Scenario
-  times are `(slot_rel, offset_ms)` relative to the first slot after the NUT is up. Lanes that need
-  "start of epoch" wait for `slot % 12 == 0` (at most 72 s).
+  timings are event-relative (`within_ms` windows, §5); a check pins to a slot only where the
+  protocol is slot-relative. Lanes that need "start of epoch" wait for `slot % 12 == 0` (at most 72 s).
 - The reference authoring engine is virtual-time (`node/src/chain/authoring/harness.rs:49,208-216`)
   and only claims a slot if its keystore holds the author's Bandersnatch key
   (`node/src/chain/authoring/mod.rs:431-458`). With only the five emulated keysets loaded it skips the
@@ -263,7 +335,26 @@ emulated slots; best-chain tracking; signing with five emulated keysets (seals, 
 tickets, guarantees, assurances, judgments, audit s₀/sₙ); refine (PVM) of scenario work packages
 into report, exported segments and bundle bytes; authorizer evaluation; erasure coding (6 shards,
 recovery 2), `M_B`, co-paths `T`, segment proofs; guarantor-assignment, author-per-slot, grid and
-proxy calculators; a delivery ledger (item, peer, timestamp) to derive inclusion/exclusion.
+proxy calculators; a delivery ledger (item, peer, timestamp) to derive inclusion/exclusion. These
+run exactly once in `m2-reference`; `m2-emu` consumes the outputs and never recomputes them.
+
+**Relationship to `polkajam-fuzz` (what is and is not reused).** The M1 fuzzer is a seed-driven
+generator and white-box mutator, not a repository of named test cases: its "cases" are produced on
+the fly by its built-in authoring engine, and its conformance mode speaks fuzz-proto over a unix
+socket (synchronous `Initialize`/`ImportBlock`/`GetState` requests). Neither maps onto M2's JAMNP-S
+surface, so the harness does **not** replay fuzzer sessions and does **not** adopt fuzzer-generated
+scenarios. Reuse is limited to:
+
+- the `hazmat` reference engine as the **oracle** (§3 above);
+- the mutation vocabulary (`mutator.rs`) as the primitives behind `inject_fault` (§5);
+- the `FUZZ_PROTOCOL_TRACE_DIR` framing for `trace/jamnp.bin` and the
+  `TraceStep { pre_state, block, post_state }` shape for per-block records (§9);
+- the M1 `JAM_*` environment contract and spec-file parsing as the model for the M2 contract (§7).
+
+The one *content* reuse is the fuzzer's **work-package generator**: scenarios wrap new, curated
+JAMNP-S choreography around fuzzer-generated package content (`profile = "full"`, §5). The fuzzer
+may additionally be run as a bug-finding pass on top of the conformance suite — complementary, not a
+substitute for the catalogue.
 
 ## 9. Traces and reports
 
