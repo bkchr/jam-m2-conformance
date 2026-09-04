@@ -7,3 +7,4 @@
 #![deny(unsafe_code)]
 
 pub mod dsl;
+pub mod scenarios;

@@ -7,3 +7,6 @@ description = "Scenario model and scheduler: hard-coded Rust check DSL with expe
 
 [dependencies]
 jam-types = { workspace = true }
+
+[dev-dependencies]
+m2-reference = { path = "../m2-reference" }

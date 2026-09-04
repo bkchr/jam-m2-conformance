@@ -1998,6 +1998,7 @@ name = "m2-scenario"
 version = "0.1.0"
 dependencies = [
  "jam-types",
+ "m2-reference",
 ]
 
 [[package]]
