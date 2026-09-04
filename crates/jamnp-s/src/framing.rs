@@ -148,16 +148,19 @@ impl FrameReader {
     ///
     /// Errors on an invalid or refused kind byte and on an oversize length prefix.
     pub fn next_frame(&mut self) -> Result<Option<(u8, Vec<u8>)>, FrameError> {
-        if self.kind.is_none() {
-            if self.buf.is_empty() {
-                return Ok(None);
+        let kind = match self.kind {
+            Some(kind) => kind,
+            None => {
+                if self.buf.is_empty() {
+                    return Ok(None);
+                }
+                let kind = self.buf[0];
+                validate_kind(kind)?;
+                self.kind = Some(kind);
+                self.buf.drain(0..1);
+                kind
             }
-            let kind = self.buf[0];
-            validate_kind(kind)?;
-            self.kind = Some(kind);
-            self.buf.drain(0..1);
-        }
-        let kind = self.kind.unwrap();
+        };
         if self.buf.len() < 4 {
             return Ok(None);
         }
