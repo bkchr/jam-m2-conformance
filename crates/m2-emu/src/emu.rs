@@ -212,22 +212,16 @@ pub async fn dial_nut(
         .map_err(|e| EmuError::Protocol(e.to_string()))?;
     record(&obs, peer, ObsKind::OpenUp0);
     let handshake = Handshake {
-        final_block: Final {
-            header_hash: HeaderHash::from(genesis_hash),
-            slot: 0,
-        },
+        final_block: advertised_final(&ref_chain.chain_blocks(), genesis_hash),
         leaves: vec![],
     };
     let wire = frame(UP, &handshake.encode());
-    trace_record(peer, UP, u64::from(send.id()), &wire, &trace, TraceDir::Tx);
+    trace_record(peer, UP, u64::from(send.id()), &wire, &trace, TraceDir::Rx);
     let _ = send.write_all(&wire).await;
 
     // Announce the reference blocks (skip genesis) so the NUT has something to
     // sync and re-announce (L1 authoring is announced like a real author).
-    let final_block = Final {
-        header_hash: HeaderHash::from(genesis_hash),
-        slot: 0,
-    };
+    let final_block = advertised_final(&ref_chain.chain_blocks(), genesis_hash);
     for block in ref_chain.chain_blocks().iter().skip(1) {
         record(&obs, peer, ObsKind::Up0Announce);
         let ann = Announcement {
@@ -235,7 +229,7 @@ pub async fn dial_nut(
             final_block,
         };
         let wire = frame_message(&ann.encode());
-        trace_record(peer, UP, u64::from(send.id()), &wire, &trace, TraceDir::Tx);
+        trace_record(peer, UP, u64::from(send.id()), &wire, &trace, TraceDir::Rx);
         let _ = send.write_all(&wire).await;
     }
     // UP 0 is a persistent stream: keep the send half open for future
@@ -425,10 +419,46 @@ async fn handle_up0(
         if handshake.final_block.header_hash == HeaderHash::from(genesis_hash) {
             record(obs, peer_index, ObsKind::Other(l0::UP0_FINAL_GENESIS));
         }
-        respond_up0(send, peer_index, genesis_hash, stream_id, trace, obs).await;
+        respond_up0(
+            send,
+            peer_index,
+            genesis_hash,
+            stream_id,
+            ref_chain,
+            trace,
+            obs,
+        )
+        .await;
         return;
     }
-    respond_up0(send, peer_index, genesis_hash, stream_id, trace, obs).await;
+    respond_up0(
+        send,
+        peer_index,
+        genesis_hash,
+        stream_id,
+        ref_chain,
+        trace,
+        obs,
+    )
+    .await;
+}
+
+/// The `Final` block the emulator advertises on UP 0.
+///
+/// polkajam only requests blocks from a peer whose advertised final slot is
+/// *strictly* greater than its own queued slot (`sync/mod.rs`
+/// `maybe_request_from_peer`), so advertising genesis means it never syncs.
+pub fn advertised_final(chain: &[Block], genesis_hash: [u8; 32]) -> Final {
+    match chain.last() {
+        Some(head) => Final {
+            header_hash: head.header.hash(),
+            slot: head.header.slot,
+        },
+        None => Final {
+            header_hash: HeaderHash::from(genesis_hash),
+            slot: 0,
+        },
+    }
 }
 
 /// Respond to the NUT's UP 0 handshake with our own, recording `OpenUp0`.
@@ -437,15 +467,13 @@ async fn respond_up0(
     peer_index: u16,
     genesis_hash: [u8; 32],
     stream_id: u64,
+    ref_chain: &RefChain,
     trace: &Mutex<Trace>,
     obs: &Mutex<ObsLog>,
 ) {
     record(obs, peer_index, ObsKind::OpenUp0);
     let handshake = Handshake {
-        final_block: Final {
-            header_hash: HeaderHash::from(genesis_hash),
-            slot: 0,
-        },
+        final_block: advertised_final(&ref_chain.chain_blocks(), genesis_hash),
         leaves: vec![],
     };
     let wire = frame_message(&handshake.encode());
@@ -713,5 +741,48 @@ mod tests {
             // The rule is a strict total order: the winner is one of the two keys.
             assert!(winner == emu_key || winner == nut_key);
         }
+    }
+
+    fn chain_with_blocks() -> Result<RefChain, m2_reference::chain::ChainError> {
+        let mut chain = RefChain::tiny(1..6)?;
+        let start = chain.next_slot();
+        let mut authored = 0;
+        for slot in start..start + 12 {
+            if chain.author_block(slot)?.is_some() {
+                authored += 1;
+                if authored >= 2 {
+                    break;
+                }
+            }
+        }
+        assert!(authored > 0, "an emulated slot appears within 12 slots");
+        Ok(chain)
+    }
+
+    #[test]
+    fn advertised_final_is_reference_head() -> Result<(), m2_reference::chain::ChainError> {
+        let chain = chain_with_blocks()?;
+        let genesis = chain.genesis_hash();
+        let blocks = chain.chain_blocks();
+        let head = blocks.last().expect("chain has a head beyond genesis");
+
+        let advertised = advertised_final(&blocks, genesis);
+
+        assert_eq!(
+            advertised.slot, head.header.slot,
+            "advertised final slot must be the reference head, else polkajam \
+             never requests blocks (it needs peer.final_slot > its queued slot)"
+        );
+        assert_eq!(advertised.header_hash.0, head.header.hash().0);
+        assert!(advertised.slot > 0, "head slot is past genesis");
+        Ok(())
+    }
+
+    #[test]
+    fn advertised_final_falls_back_to_genesis_when_empty() {
+        let genesis = [7u8; 32];
+        let advertised = advertised_final(&[], genesis);
+        assert_eq!(advertised.header_hash.0, genesis);
+        assert_eq!(advertised.slot, 0);
     }
 }

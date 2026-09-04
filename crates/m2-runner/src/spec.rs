@@ -216,6 +216,32 @@ mod tests {
         assert!(spec.bootnodes.is_empty());
     }
 
+    /// KNOWN BUG (unfixed): genesis sits at slot 0, ~8.8M slots behind the
+    /// wall clock, so a fresh NUT's finalized block (genesis) is never in the
+    /// current epoch and polkajam refuses every ticket
+    /// (`finality lagging (final: 0, curr: ...)`) and never authors.
+    ///
+    /// Anchoring genesis requires rebuilding the genesis *state* too:
+    /// `dev_spec` closes over `genesis_header.hash()` when building storage,
+    /// and `TheState::genesis` writes that hash into `recent_blocks.history[0]`
+    /// (with `now: 0`), so patching the header alone desynchronises state from
+    /// header and authoring fails with `BestBlockChanged`.
+    #[test]
+    #[ignore = "genesis anchoring needs the genesis state rebuilt; see docstring"]
+    fn genesis_is_anchored_to_the_current_epoch() {
+        let chain_spec = tiny_spec(&loopback_ips(), &ports()).expect("tiny spec builds");
+        let period = jam_types::epoch_period();
+        let now = m2_reference::chain::wall_clock_slot();
+
+        let genesis_slot = chain_spec.genesis_header.slot;
+
+        assert_eq!(
+            genesis_slot / period,
+            now / period,
+            "genesis must sit in the current epoch"
+        );
+    }
+
     #[test]
     fn genesis_header_hash_consistency() {
         let chain_spec = tiny_spec(&loopback_ips(), &ports()).expect("tiny spec builds");

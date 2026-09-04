@@ -47,6 +47,8 @@ pub struct ScheduledTicket {
     pub ticket: EmulatedTicket,
     pub delivery: TicketDelivery,
     pub slot: u32,
+    /// Epoch the ticket is *for*, which is not the epoch it is delivered in.
+    pub target_epoch: u32,
 }
 
 impl RefChain {
@@ -104,6 +106,21 @@ pub fn proxy_index(ticket_id: &[u8; 32], val_count: usize) -> usize {
     u32::from_be_bytes([last4[0], last4[1], last4[2], last4[3]]) as usize % val_count
 }
 
+/// First slot at which the emulator delivers tickets to the NUT.
+///
+/// Tickets are *for* the next epoch but must be *submitted* during the current
+/// one, before its tail (`epoch_tail_start`); scheduling them at the next
+/// epoch's start pushes delivery a whole epoch into the future, past any
+/// realistic observation window.
+pub fn first_delivery_slot(now_slot: u32) -> u32 {
+    let period = jam_types::epoch_period();
+    if now_slot % period < jam_types::epoch_tail_start() {
+        now_slot + 1
+    } else {
+        (now_slot / period + 1) * period + 1
+    }
+}
+
 /// Schedule delivery of each ticket within the epoch submission window.
 ///
 /// A ticket whose proxy is the NUT goes via CE 131 at `epoch_start + 1`; any
@@ -112,7 +129,8 @@ pub fn proxy_index(ticket_id: &[u8; 32], val_count: usize) -> usize {
 pub fn plan_tickets(
     tickets: &[EmulatedTicket],
     nut_index: usize,
-    epoch_start_slot: u32,
+    first_slot: u32,
+    target_epoch: u32,
 ) -> Vec<ScheduledTicket> {
     tickets
         .iter()
@@ -121,13 +139,15 @@ pub fn plan_tickets(
                 ScheduledTicket {
                     ticket: t.clone(),
                     delivery: TicketDelivery::Ce131,
-                    slot: epoch_start_slot + 1,
+                    slot: first_slot,
+                    target_epoch,
                 }
             } else {
                 ScheduledTicket {
                     ticket: t.clone(),
                     delivery: TicketDelivery::Ce132,
-                    slot: epoch_start_slot + 1 + (t.author % 5) as u32,
+                    slot: first_slot + (t.author % 5) as u32,
+                    target_epoch,
                 }
             }
         })
@@ -205,23 +225,24 @@ mod tests {
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         let nut_index = 0;
-        let epoch_start = 1000;
-        let plan = plan_tickets(&tickets, nut_index, epoch_start);
+        let first = 1001;
+        let plan = plan_tickets(&tickets, nut_index, first, 42);
         assert!(!plan.is_empty());
         for s in &plan {
             assert!(
-                (epoch_start + 1..=epoch_start + 5).contains(&s.slot),
+                (first..first + 5).contains(&s.slot),
                 "slot {} outside submission window",
                 s.slot
             );
+            assert_eq!(s.target_epoch, 42);
             if s.ticket.proxy == nut_index {
                 assert_eq!(s.delivery, TicketDelivery::Ce131);
-                assert_eq!(s.slot, epoch_start + 1);
+                assert_eq!(s.slot, first);
             } else {
                 assert_eq!(s.delivery, TicketDelivery::Ce132);
             }
         }
-        let plan2 = plan_tickets(&tickets, nut_index, epoch_start);
+        let plan2 = plan_tickets(&tickets, nut_index, first, 42);
         assert_eq!(plan, plan2);
         Ok(())
     }
@@ -237,5 +258,66 @@ mod tests {
             .map_err(|e| ChainError::Tickets(e.to_string()))?;
         assert_eq!(ctx.entropy, entropy[1].0);
         Ok(())
+    }
+
+    #[test]
+    fn delivery_starts_inside_the_current_submission_window() {
+        let period = jam_types::epoch_period();
+        let now = 100 * period + 2;
+
+        let first = first_delivery_slot(now);
+
+        assert_eq!(
+            first,
+            now + 1,
+            "with the submission window open, delivery starts at the next slot"
+        );
+        assert!(
+            first - now <= period,
+            "delivery must not be pushed a whole epoch out"
+        );
+    }
+
+    #[test]
+    fn delivery_defers_to_next_window_inside_the_epoch_tail() {
+        let period = jam_types::epoch_period();
+        let tail = jam_types::epoch_tail_start();
+        let now = 100 * period + tail;
+
+        let first = first_delivery_slot(now);
+
+        assert!(
+            first >= 101 * period,
+            "inside the tail the submission window is closed, so defer"
+        );
+        assert!(first <= 101 * period + 1);
+    }
+
+    #[test]
+    fn planned_delivery_fits_a_short_observation_window() {
+        let period = jam_types::epoch_period();
+        let now = 100 * period + 1;
+        let tickets: Vec<EmulatedTicket> = (0..5)
+            .map(|author| EmulatedTicket {
+                id: [author as u8; 32],
+                author,
+                attempt: 0,
+                proof: [0u8; 784],
+                proxy: 5,
+            })
+            .collect();
+
+        let plan = plan_tickets(&tickets, 5, first_delivery_slot(now), 101);
+        let last = plan
+            .iter()
+            .map(|scheduled| scheduled.slot)
+            .max()
+            .expect("plan is non-empty");
+
+        assert!(
+            last - now <= 10,
+            "every ticket must be delivered within ~60s of the run start, \
+             got slot {last} vs now {now}"
+        );
     }
 }

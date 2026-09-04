@@ -21,8 +21,6 @@ use m2_scenario::scenarios::obs::{
     BAD_PROOF_IGNORED, EMU_SENT_131, EMU_SENT_132, RECV_CE131, RECV_CE132, UNKNOWN_EPOCH_RESET,
 };
 
-/// Slots per Safrole epoch (JAM `EpochPeriod` = 2 × `RotationPeriod` = 12).
-const EPOCH_LEN: u32 = 12;
 /// Seconds per slot (JAM common slot period).
 const SLOT_PERIOD_SEC: u64 = 6;
 
@@ -35,11 +33,6 @@ pub enum TicketInbound {
     Ce132(TicketDistribution),
     /// Undecodable payload or a kind other than CE 131/132.
     Invalid,
-}
-
-/// The epoch a slot belongs to (`slot / EPOCH_LEN`; DESIGN.md §5).
-fn epoch_for_slot(slot: u32) -> u32 {
-    slot / EPOCH_LEN
 }
 
 /// Which observation a NUT stream reset maps to: a ticket targeted at a
@@ -102,7 +95,7 @@ pub async fn spawn_ticket_sender(
     let Some(first) = plan.first() else {
         return;
     };
-    let plan_epoch = epoch_for_slot(first.slot);
+    let plan_epoch = first.target_epoch;
     for scheduled in plan {
         let (kind, sent) = match scheduled.delivery {
             TicketDelivery::Ce131 => (CE131, EMU_SENT_131),
@@ -112,7 +105,7 @@ pub async fn spawn_ticket_sender(
         let Ok((mut send, mut recv)) = connection.open_bi().await else {
             continue;
         };
-        let epoch_index = epoch_for_slot(scheduled.slot);
+        let epoch_index = scheduled.target_epoch;
         let distribution = TicketDistribution {
             epoch_index,
             ticket: Ticket {
@@ -215,6 +208,7 @@ mod tests {
 
         fn scheduled(author: usize, attempt: u8) -> ScheduledTicket {
             ScheduledTicket {
+                target_epoch: 9,
                 ticket: EmulatedTicket {
                     id: [attempt; 32],
                     author,

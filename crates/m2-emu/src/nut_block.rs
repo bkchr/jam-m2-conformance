@@ -51,7 +51,7 @@ pub async fn fetch_block(
         u64::from(send.id()),
         &wire,
         trace,
-        TraceDir::Tx,
+        TraceDir::Rx,
     );
     send.write_all(&wire)
         .await
@@ -68,7 +68,7 @@ pub async fn fetch_block(
         u64::from(send.id()),
         &content,
         trace,
-        TraceDir::Rx,
+        TraceDir::Tx,
     );
     let response =
         BlockResponse::decode(&mut &content[..]).map_err(|e| EmuError::Decode(format!("{e:?}")))?;

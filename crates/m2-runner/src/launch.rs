@@ -82,7 +82,7 @@ pub fn preset_polkajam(cfg: &LaunchConfig) -> String {
     let spec = cfg.spec_path.display();
     let data = cfg.data_path.display();
     format!(
-        "polkajam --chain {spec} run --key-seed-file {data}/seed.seed \
+        "polkajam --chain {spec} run --temp --key-seed-file {data}/seed.seed \
          --listen-ip {listen_ip} --port {port} --peer-id {{peer-id}} \
          --external-ip {external_ip} --mode validator"
     )
@@ -250,6 +250,20 @@ mod tests {
         let cfg = test_config();
         let err = substitute("run --flag {bogus}", &cfg).unwrap_err();
         assert!(matches!(err, LaunchError::MalformedTemplate(_)));
+    }
+
+    /// polkajam defaults its data dir to `~/.local/share/polkajam/<chain-id>`
+    /// and RESUMES that chain on the next run. A conformance run must start
+    /// from the spec's genesis, so the preset has to isolate node state.
+    #[test]
+    fn preset_polkajam_isolates_node_state() {
+        let cfg = test_config();
+        let cmd = preset_polkajam(&cfg);
+        assert!(
+            cmd.contains(" --temp") || cmd.contains(" --data-path"),
+            "polkajam must not reuse its default persistent data dir across \
+             runs (stale chain state blocks sync/authoring); got: {cmd}"
+        );
     }
 
     #[test]

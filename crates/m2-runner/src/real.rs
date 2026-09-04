@@ -10,7 +10,8 @@ use jamnp_s::framing::{CE131, CE132};
 use jamnp_s::trace::{Direction as TraceDir, Trace};
 use m2_reference::chain::RefChain;
 use m2_reference::tickets::{
-    plan_tickets, verify_ticket, ScheduledTicket, TicketCtx, TicketDelivery as ReferenceDelivery,
+    first_delivery_slot, plan_tickets, verify_ticket, ScheduledTicket, TicketCtx,
+    TicketDelivery as ReferenceDelivery,
 };
 use m2_scenario::ctx::{
     DeliveredTicket, EmuTicket, ImportFact, L1Ctx, L2Ctx, NutBlock, NutTicketFacts,
@@ -39,9 +40,14 @@ pub(crate) fn compute_ticket_plan(
 ) -> Result<(TicketCtx, Vec<ScheduledTicket>, u32), m2_reference::chain::ChainError> {
     let ticket_ctx = ref_chain.ticket_ctx()?;
     let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
-    let target_epoch = ref_chain.next_slot() / jam_types::epoch_period() + 1;
-    let epoch_start_slot = target_epoch * jam_types::epoch_period();
-    let plan = plan_tickets(&tickets, nut_index, epoch_start_slot);
+    let now_slot = ref_chain.next_slot();
+    let target_epoch = now_slot / jam_types::epoch_period() + 1;
+    let plan = plan_tickets(
+        &tickets,
+        nut_index,
+        first_delivery_slot(now_slot),
+        target_epoch,
+    );
     Ok((ticket_ctx, plan, target_epoch))
 }
 
@@ -282,6 +288,53 @@ mod tests {
         Ok(())
     }
 
+    /// Trace convention (`jamnp_s::trace::Direction`): `Tx` is NUT → peer,
+    /// `Rx` is peer → NUT. L2 judges the NUT, so tickets the emulator itself
+    /// sent (`Rx`) must never be counted as NUT behaviour.
+    #[test]
+    fn run_collect_nut_tickets_ignores_harness_sent_frames() -> Result<(), ChainError> {
+        let ref_chain = RefChain::tiny(1..6)?;
+        let ticket_ctx = ref_chain.ticket_ctx()?;
+        let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
+        let nut_ticket = &tickets[0];
+        let emu_ticket = &tickets[1];
+        let distribution = |t: &m2_reference::tickets::EmulatedTicket, epoch| TicketDistribution {
+            epoch_index: epoch,
+            ticket: Ticket {
+                attempt: t.attempt,
+                proof: t.proof,
+            },
+        };
+
+        let mut trace = Trace::default();
+        trace.push(record(
+            TraceDir::Tx,
+            2,
+            CE131,
+            distribution(nut_ticket, 7).encode(),
+            1234,
+        ));
+        trace.push(record(
+            TraceDir::Rx,
+            3,
+            CE132,
+            distribution(emu_ticket, 7).encode(),
+            2345,
+        ));
+
+        let facts = collect_nut_tickets(&trace, &ticket_ctx);
+
+        assert_eq!(
+            facts.len(),
+            1,
+            "only the NUT-sent (Tx) ticket is a NUT fact; the harness-sent \
+             (Rx) ticket must be ignored"
+        );
+        assert_eq!(facts[0].peer, 2);
+        assert_eq!(facts[0].received_at_ms, 1234);
+        Ok(())
+    }
+
     #[test]
     fn run_build_l1_from_nut_blocks() -> Result<(), ChainError> {
         let mut ref_chain = RefChain::tiny(1..6)?;
@@ -323,8 +376,7 @@ mod tests {
         let ticket_ctx = ref_chain.ticket_ctx()?;
         let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
         let nut_index = 5;
-        let epoch_start_slot = 1000;
-        let plan = plan_tickets(&tickets, nut_index, epoch_start_slot);
+        let plan = plan_tickets(&tickets, nut_index, 1001, 84);
 
         let emu_plan = plan_emu_tickets(&plan, &ticket_ctx);
 

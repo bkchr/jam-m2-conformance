@@ -31,6 +31,25 @@ pub enum ChainError {
     Tickets(String),
 }
 
+/// Current wall-clock slot (`(now - JAM_COMMON_ERA) / 6`).
+pub fn wall_clock_slot() -> u32 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    (now.saturating_sub(jam_types::JAM_COMMON_ERA) / SLOT_PERIOD_SEC) as u32
+}
+
+/// First slot of the current epoch.
+///
+/// polkajam gates ticket acceptance and authoring on the finalized block being
+/// in the *current* epoch, which a genesis at slot 0 can never satisfy. See the
+/// ignored `genesis_is_anchored_to_the_current_epoch` test in `m2-runner`.
+pub fn current_epoch_start_slot() -> u32 {
+    let now = wall_clock_slot();
+    now - (now % jam_types::epoch_period())
+}
+
 /// Reference chain over the polkajam hazmat authoring harness.
 ///
 /// Wraps a virtual-time `AuthoringHarness` that only claims slots whose author
@@ -90,11 +109,7 @@ impl RefChain {
 
     /// Current wall-clock slot (`(now - JAM_COMMON_ERA) / 6`).
     pub fn next_slot(&self) -> u32 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        (now.saturating_sub(jam_types::JAM_COMMON_ERA) / SLOT_PERIOD_SEC) as u32
+        wall_clock_slot()
     }
 
     /// Advance virtual time to `slot` and author a block there if the slot

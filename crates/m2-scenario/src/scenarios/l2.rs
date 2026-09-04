@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 
 use crate::ctx::{L2Ctx, TicketDelivery, NUT_INDEX};
-use crate::dsl::{check, log, Check, CheckResult, ObsKind, ObsLog, Outcome, Severity};
+use crate::dsl::{check, log, Check, ObsKind, ObsLog, Severity};
 use crate::scenarios::obs::{BAD_PROOF_IGNORED, RECV_CE131, RECV_CE132, UNKNOWN_EPOCH_RESET};
 
 /// Emulated observation-log peers (`l0.rs`: `1..=5`; the NUT is obs peer 0).
@@ -234,7 +234,7 @@ pub fn all(ctx: &L2Ctx) -> Vec<Check> {
 mod tests {
     use super::*;
     use crate::ctx::{EmuTicket, NutTicketFacts};
-    use crate::dsl::Obs;
+    use crate::dsl::{CheckResult, Obs, Outcome};
 
     fn ev(peer: u16, kind: ObsKind, at_ms: u64) -> Obs {
         Obs { peer, kind, at_ms }
