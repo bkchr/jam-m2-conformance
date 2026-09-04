@@ -1,6 +1,6 @@
 # JAM M2 Conformance Harness — Design
 
-Status: draft for review, 2026-09-03. No code exists yet; this document is the deliverable.
+Status: draft for review, 2026-09-03. Implementation now exists for P0 + L0/L1/L2 (see README.md); this document remains the design contract.
 
 ## 1. Goals and non-goals
 
