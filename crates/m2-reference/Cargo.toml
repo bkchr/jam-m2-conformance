@@ -6,4 +6,7 @@ license.workspace = true
 description = "Reference oracle over polkajam's hazmat engine: chain state, authoring, signing for emulated keysets"
 
 [dependencies]
+jam-node = { workspace = true }
+jam-std-common = { workspace = true }
 jam-types = { workspace = true }
+thiserror = { workspace = true }
