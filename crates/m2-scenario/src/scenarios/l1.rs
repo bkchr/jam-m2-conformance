@@ -179,6 +179,26 @@ pub fn l1_skipped_slots(ctx: &L1Ctx) -> Check {
 
 /// All six L1 checks in order.
 pub fn all(ctx: &L1Ctx) -> Vec<Check> {
+    if ctx.nut_blocks.is_empty() {
+        // No NUT-authored blocks were observed in the window: every L1 check is
+        // "not exercised" — an honest soft finding, not a conformance pass.
+        let names: [&str; 6] = [
+            "l1_timing",
+            "l1_parent",
+            "l1_header_seal",
+            "l1_state_root",
+            "l1_extrinsic_completeness",
+            "l1_skipped_slots",
+        ];
+        return names
+            .into_iter()
+            .map(|id| {
+                check(id, Severity::Hard, |_| {
+                    vec![log::check("no_nut_blocks_observed", false, Severity::Soft)]
+                })
+            })
+            .collect();
+    }
     vec![
         l1_timing(ctx),
         l1_parent(ctx),
@@ -472,5 +492,30 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), 6, "all check ids are distinct");
+    }
+
+    #[test]
+    fn all_l1_empty_ctx_is_soft_finding() {
+        use crate::ctx::L1Ctx;
+        let empty = L1Ctx {
+            reference_best: [0u8; 32],
+            reference_block_hashes: vec![],
+            nut_blocks: vec![],
+            imports: vec![],
+            delivered_tickets: vec![],
+            slot_period_ms: 6000,
+        };
+        let checks = all(&empty);
+        assert_eq!(checks.len(), 6, "six checks even with no NUT blocks");
+        let mut sched = crate::dsl::Scheduler::new();
+        let obs = ObsLog::new();
+        let results: Vec<CheckResult> = checks.iter().flat_map(|c| sched.fire(c, &obs)).collect();
+        assert_eq!(results.len(), 6);
+        assert!(
+            results
+                .iter()
+                .all(|r| r.outcome == Outcome::Fail(Severity::Soft)),
+            "empty lane is an honest soft finding, not a pass"
+        );
     }
 }
