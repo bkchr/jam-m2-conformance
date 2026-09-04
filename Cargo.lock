@@ -1999,7 +1999,9 @@ dependencies = [
 name = "m2-scenario"
 version = "0.1.0"
 dependencies = [
+ "jam-std-common",
  "jam-types",
+ "jamnp-s",
  "m2-reference",
 ]
 

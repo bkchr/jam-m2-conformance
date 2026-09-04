@@ -119,6 +119,11 @@ impl Trace {
         self.records.len()
     }
 
+    /// The traced records, in observation order.
+    pub fn records(&self) -> &[TraceRecord] {
+        &self.records
+    }
+
     /// Whether the trace holds no records.
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
