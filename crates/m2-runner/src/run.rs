@@ -56,7 +56,9 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     let mut conn_findings: Vec<Finding> = Vec::new();
     if !cli.dry_run {
         let cfg = launch_config(&keys, &cli, spec_path);
-        let peer_id = hex::encode(keys.keysets[0].ed25519.0.verification_key().to_bytes());
+        // The peer-id is the 53-char text form ("e" + base32 of the Ed25519
+        // key) — the same string as the certificate SAN.
+        let peer_id = nut_san.clone();
         let image = std::env::var("JAM_M2_IMAGE").unwrap_or_else(|_| "polkajam".to_string());
         let cmd = match cli.preset {
             Preset::Polkajam => launch::preset_polkajam(&cfg).replace("{peer-id}", &peer_id),
@@ -99,7 +101,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     } else {
         let mut ref_chain = RefChain::tiny(1..6).map_err(internal)?;
         let count = author_emulated_slots(&mut ref_chain).map_err(internal)?;
-        let emu = Emulator::l0(1..6, genesis_hash, cli.base_port).map_err(internal)?;
+        let emu = Emulator::l0(1..6, genesis_hash, cli.base_port).await.map_err(internal)?;
         let obs = emu.obs();
         let trace = emu.trace();
         let _accept = emu.accept_loop(Arc::new(ref_chain));

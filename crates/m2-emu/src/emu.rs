@@ -48,11 +48,10 @@ pub enum EmuError {
 /// The five emulated validators (indices `1..=5` by default).
 ///
 /// Each validator is one [`Endpoint`] bound to `127.0.0.1:(base_port + i)` with
-/// the Ed25519 identity `SecretKeyset::trivial(i)`. `l0` owns a tokio runtime so
-/// the endpoints stay alive; [`Emulator::accept_loop`] spawns one reactive
+/// the Ed25519 identity `SecretKeyset::trivial(i)`. The endpoints stay alive
+/// in the caller's runtime; [`Emulator::accept_loop`] spawns one reactive
 /// accept task per endpoint.
 pub struct Emulator {
-    runtime: tokio::runtime::Runtime,
     endpoints: Vec<Arc<Endpoint>>,
     emu_start: usize,
     genesis_hash: [u8; 32],
@@ -66,17 +65,16 @@ impl Emulator {
     /// Endpoint `i` listens on `127.0.0.1:(base_port + i)` with the Ed25519
     /// secret `SecretKeyset::trivial(i)` and identifies as a non-builder peer
     /// for `genesis_hash`.
-    pub fn l0(
+    pub async fn l0(
         emu_keyset_indices: Range<usize>,
         genesis_hash: [u8; 32],
         base_port: u16,
     ) -> Result<Self, EmuError> {
-        let runtime = tokio::runtime::Runtime::new()?;
         let config = EndpointConfig {
             genesis_hash,
             builder: false,
         };
-        let endpoints = runtime.block_on(async {
+        let endpoints = async {
             let mut endpoints = Vec::with_capacity(emu_keyset_indices.len());
             for i in emu_keyset_indices.clone() {
                 let secret = SecretKeyset::trivial(i as u32).ed25519;
@@ -87,9 +85,9 @@ impl Emulator {
                 endpoints.push(Arc::new(endpoint));
             }
             Ok::<_, EmuError>(endpoints)
-        })?;
+        }
+        .await?;
         Ok(Self {
-            runtime,
             endpoints,
             emu_start: emu_keyset_indices.start,
             genesis_hash,
@@ -120,7 +118,7 @@ impl Emulator {
     /// `ref_chain`. The returned handle completes when every accept task ends
     /// (i.e. once the endpoints are closed).
     pub fn accept_loop(&self, ref_chain: Arc<RefChain>) -> JoinHandle<()> {
-        let handle = self.runtime.handle().clone();
+        let handle = tokio::runtime::Handle::current();
         let tasks: Vec<JoinHandle<()>> = self
             .endpoints
             .iter()
@@ -445,9 +443,9 @@ mod tests {
         EmuError::Protocol(e.to_string())
     }
 
-    #[test]
-    fn boots_five_endpoints() -> Result<(), EmuError> {
-        let emu = Emulator::l0(1..6, [0xaa; 32], 40000)?;
+    #[tokio::test]
+    async fn boots_five_endpoints() -> Result<(), EmuError> {
+        let emu = Emulator::l0(1..6, [0xaa; 32], 40000).await?;
         let addrs = emu.local_addrs();
         assert_eq!(addrs.len(), 5);
         let ports: HashSet<u16> = addrs.iter().map(|a| a.port()).collect();

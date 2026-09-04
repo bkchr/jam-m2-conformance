@@ -21,6 +21,8 @@ pub struct GeneratedKeys {
     pub nut_ed25519_secret_hex: String,
     /// Hex of the NUT's 32-byte Bandersnatch secret seed.
     pub nut_bandersnatch_secret_hex: String,
+    /// The run seed (recorded for scenario reproducibility).
+    pub run_seed: u64,
 }
 
 /// Deterministically generates keysets for `validator_count` validators and the NUT secret
@@ -35,9 +37,11 @@ pub fn generate(seed: u64, validator_count: usize) -> GeneratedKeys {
     // The NUT's Ed25519 secret must match the on-chain genesis key of validator 0.
     let nut_ed25519_secret_hex = hex::encode(keysets[0].ed25519.to_bytes());
     // `bandersnatch::Secret` at the pinned rev exposes no raw-byte accessor, so the raw 32-byte
-    // seed (trivial_seed semantics over the run seed) is handed over instead: a NUT feeds it
-    // straight to `bandersnatch::Secret::from_seed`. The same bytes back `seed.seed`.
-    let nut_seed = SecretKeyset::trivial_seed(seed as u32);
+    // seed for validator 0 is handed over instead: a NUT feeds it straight to
+    // `bandersnatch::Secret::from_seed` and it derives the same keyset as the genesis entry.
+    // The NUT's on-chain identity is fixed (validator index 0), so the seed file does not depend
+    // on the run `seed`; the run seed is recorded for scenario reproducibility instead.
+    let nut_seed = SecretKeyset::trivial_seed(0);
     let nut_bandersnatch_secret_hex = hex::encode(nut_seed);
 
     GeneratedKeys {
@@ -45,6 +49,7 @@ pub fn generate(seed: u64, validator_count: usize) -> GeneratedKeys {
         nut_seed,
         nut_ed25519_secret_hex,
         nut_bandersnatch_secret_hex,
+        run_seed: seed,
     }
 }
 
