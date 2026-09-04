@@ -17,6 +17,8 @@ use crate::scenario::{evaluate, fabricated_obs_log, Evaluation, ObsSource};
 use crate::spec;
 
 /// How many emulated slots the dry-run baseline pretends were authored.
+/// Seconds to let JAMNP traffic accumulate before evaluating the scenario.
+const OBSERVATION_WINDOW: u64 = 12;
 const DRY_RUN_BLOCK_COUNT: usize = 3;
 
 /// Errors from a run, mapped to exit codes (startup = 1, internal = 2).
@@ -52,6 +54,11 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     let nut_san = san_for_key(&keys.keysets[0].ed25519.0.verification_key());
 
     // §4.2 launch + startup probe, §4.3 connectivity (both skipped in dry-run).
+    let emu_keys: Vec<[u8; 32]> = (1..=5)
+        .map(|i| keys.keysets[i].ed25519.0.verification_key().to_bytes())
+        .collect();
+    let nut_key = keys.keysets[0].ed25519.0.verification_key().to_bytes();
+    let plan = connectivity::plan_connectivity(&emu_keys, &nut_key);
     let mut nut: Option<NutProcess> = None;
     let mut conn_findings: Vec<Finding> = Vec::new();
     if !cli.dry_run {
@@ -76,11 +83,6 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             )));
         }
 
-        let emu_keys: Vec<[u8; 32]> = (1..=5)
-            .map(|i| keys.keysets[i].ed25519.0.verification_key().to_bytes())
-            .collect();
-        let nut_key = keys.keysets[0].ed25519.0.verification_key().to_bytes();
-        let plan = connectivity::plan_connectivity(&emu_keys, &nut_key);
         let emu_addrs: Vec<SocketAddr> = (1..=5)
             .map(|i| SocketAddr::from((Ipv4Addr::LOCALHOST, cli.base_port + i as u16)))
             .collect();
@@ -90,21 +92,52 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     }
 
     // §4.4 scenario: reference chain + emulator, or the fabricated dry-run log.
-    let (source, reference_block_count) = if cli.dry_run {
+    let (source, reference_block_count, dial_tasks) = if cli.dry_run {
         (
             ObsSource::Fabricated {
                 log: fabricated_obs_log(DRY_RUN_BLOCK_COUNT),
                 trace: jamnp_s::trace::Trace::default(),
             },
             DRY_RUN_BLOCK_COUNT,
+            Vec::new(),
         )
     } else {
         let mut ref_chain = RefChain::tiny(1..6).map_err(internal)?;
         let count = author_emulated_slots(&mut ref_chain).map_err(internal)?;
+        let ref_chain = Arc::new(ref_chain);
         let emu = Emulator::l0(1..6, genesis_hash, cli.base_port).await.map_err(internal)?;
         let obs = emu.obs();
         let trace = emu.trace();
-        let _accept = emu.accept_loop(Arc::new(ref_chain));
+        let _accept = emu.accept_loop(ref_chain.clone());
+        // Drive the preferred-initiator connectivity: emulated validators that
+        // are the preferred initiator dial the NUT now; the rest wait the 5 s
+        // grace then dial anyway (a soft finding).
+        let mut dial_tasks = Vec::new();
+        for i in plan.initiate_now {
+            let trace = trace.clone();
+            let obs = obs.clone();
+            let ref_chain = ref_chain.clone();
+            let nut_san = nut_san.clone();
+            dial_tasks.push(tokio::spawn(async move {
+                let _ = m2_emu::emu::dial_nut(
+                    1, i, genesis_hash, nut_addr, nut_san, ref_chain, trace, obs,
+                )
+                .await;
+            }));
+        }
+        for i in plan.wait_then_connect {
+            let trace = trace.clone();
+            let obs = obs.clone();
+            let ref_chain = ref_chain.clone();
+            let nut_san = nut_san.clone();
+            dial_tasks.push(tokio::spawn(async move {
+                tokio::time::sleep(connectivity::INITIATOR_GRACE).await;
+                let _ = m2_emu::emu::dial_nut(
+                    1, i, genesis_hash, nut_addr, nut_san, ref_chain, trace, obs,
+                )
+                .await;
+            }));
+        }
         (
             ObsSource::Emulator {
                 obs,
@@ -112,8 +145,14 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                 _emu: emu,
             },
             count,
+            dial_tasks,
         )
     };
+
+    if !dial_tasks.is_empty() {
+        tokio::time::sleep(Duration::from_secs(OBSERVATION_WINDOW)).await;
+    }
+    drop(dial_tasks);
 
     let evaluation = match &source {
         ObsSource::Emulator { obs, .. } => evaluate(&lock(obs), reference_block_count),

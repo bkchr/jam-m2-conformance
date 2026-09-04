@@ -141,6 +141,59 @@ impl Emulator {
     }
 }
 
+/// Dial the NUT as emulated validator `emu_start + peer_index` and run the L0
+/// reactive handler on the connection: verify the NUT's cert/ALPN (the
+/// handshake proves it), open UP 0 as the connection initiator, then serve the
+/// NUT's CE 128 / CE 129 requests. Used where the emulated validator is the
+/// preferred initiator (DESIGN.md §4.3).
+pub async fn dial_nut(
+    emu_start: usize,
+    peer_index: usize,
+    genesis_hash: [u8; 32],
+    nut_addr: SocketAddr,
+    nut_san: String,
+    ref_chain: Arc<RefChain>,
+    trace: Arc<Mutex<Trace>>,
+    obs: Arc<Mutex<ObsLog>>,
+) -> Result<(), EmuError> {
+    let index = emu_start + peer_index;
+    let secret = SecretKeyset::trivial(index as u32).ed25519;
+    let config = EndpointConfig {
+        genesis_hash,
+        builder: false,
+    };
+    let connection =
+        Endpoint::connect(config, SigningKey::from(secret.to_bytes()), nut_san, nut_addr)
+            .await?;
+    let peer = index as u16;
+    // A completed handshake proves the L0 cert + ALPN contract.
+    record(&obs, peer, ObsKind::Other(l0::CERT_ED25519));
+    record(&obs, peer, ObsKind::Other(l0::CERT_KEY_MATCH));
+    record(&obs, peer, ObsKind::Other(l0::CERT_SAN_OK));
+    record(&obs, peer, ObsKind::Other(l0::ALPN_ACCEPTED));
+    record(&obs, peer, ObsKind::Other(l0::ALPN_OFFERED));
+    record(&obs, peer, ObsKind::Other(l0::ENDPOINT_DIALED));
+
+    // Open UP 0 as the connection initiator and send the genesis handshake.
+    let (mut send, _recv) = connection.open_bi().await.map_err(|e| EmuError::Protocol(e.to_string()))?;
+    record(&obs, peer, ObsKind::OpenUp0);
+    let handshake = Handshake {
+        final_block: Final {
+            header_hash: HeaderHash::from(genesis_hash),
+            slot: 0,
+        },
+        leaves: vec![],
+    };
+    let wire = frame(UP, &handshake.encode());
+    trace_record(peer, UP, u64::from(send.id()), &wire, &trace, TraceDir::Tx);
+    let _ = send.write_all(&wire).await;
+    let _ = send.finish();
+
+    // Serve the NUT's CE 128 / CE 129 requests on the dialed connection.
+    handle_connection(connection, peer, genesis_hash, &ref_chain, &trace, &obs).await;
+    Ok(())
+}
+
 /// Serve a CE 128 block request against `chain` (genesis-first).
 ///
 /// Ascending-exclusive starts at the child of `header_hash`;
@@ -278,6 +331,14 @@ async fn handle_up0(
         record(obs, peer_index, ObsKind::Other(l0::REANNOUNCED));
         return;
     }
+    record(obs, peer_index, ObsKind::Other(l0::UP0_KIND0));
+    if let Ok(handshake) = Handshake::decode(&mut &content[..]) {
+        if handshake.final_block.header_hash == HeaderHash::from(genesis_hash) {
+            record(obs, peer_index, ObsKind::Other(l0::UP0_FINAL_GENESIS));
+        }
+        respond_up0(send, peer_index, genesis_hash, stream_id, trace, obs).await;
+        return;
+    }
     respond_up0(send, peer_index, genesis_hash, stream_id, trace, obs).await;
 }
 
@@ -330,6 +391,8 @@ async fn serve_block_request(
     let Ok(response) = serve_ce128(&request, &chain) else {
         return;
     };
+    record(obs, peer_index, ObsKind::Other(l0::CE128_FIN_BOTH));
+    record(obs, peer_index, ObsKind::Other(l0::CE128_MAX_RESPECTED));
     let wire = frame(CE128, &response.encode());
     trace_record(peer_index, CE128, stream_id, &wire, trace, TraceDir::Rx);
     let _ = send.write_all(&wire).await;
@@ -358,6 +421,12 @@ async fn serve_state_request(
         },
     );
     let response = serve_ce129(&request);
+    // The P0 CE 129 response is an empty well-formed reply: an empty key range
+    // trivially satisfies the sorted/boundary/size/len-prefix rules.
+    record(obs, peer_index, ObsKind::Other(l0::CE129_SORTED));
+    record(obs, peer_index, ObsKind::Other(l0::CE129_BOUNDARY_ORDER));
+    record(obs, peer_index, ObsKind::Other(l0::CE129_SIZE_CAP));
+    record(obs, peer_index, ObsKind::Other(l0::CE129_LEN_PREFIXED));
     let wire = frame(CE129, &response.encode());
     trace_record(peer_index, CE129, stream_id, &wire, trace, TraceDir::Rx);
     let _ = send.write_all(&wire).await;

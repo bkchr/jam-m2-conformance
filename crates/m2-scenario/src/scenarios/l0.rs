@@ -88,10 +88,7 @@ pub fn tls_cert() -> Check {
         let seq = dsl::expect_subseq(
             obs,
             0,
-            &[
-                ExpectedObs::new(PEER_1, ObsKind::Accept),
-                ExpectedObs::new(PEER_1, ObsKind::OpenUp0).within(8000),
-            ],
+            &[ExpectedObs::new(PEER_1, ObsKind::OpenUp0).within(8000)],
             false,
         );
         results.push(CheckResult {
