@@ -162,9 +162,13 @@ pub async fn dial_nut(
         genesis_hash,
         builder: false,
     };
-    let connection =
-        Endpoint::connect(config, SigningKey::from(secret.to_bytes()), nut_san, nut_addr)
-            .await?;
+    let connection = Endpoint::connect(
+        config,
+        SigningKey::from(secret.to_bytes()),
+        nut_san,
+        nut_addr,
+    )
+    .await?;
     let peer = index as u16;
     // A completed handshake proves the L0 cert + ALPN contract.
     record(&obs, peer, ObsKind::Other(l0::CERT_ED25519));
@@ -175,7 +179,10 @@ pub async fn dial_nut(
     record(&obs, peer, ObsKind::Other(l0::ENDPOINT_DIALED));
 
     // Open UP 0 as the connection initiator and send the genesis handshake.
-    let (mut send, _recv) = connection.open_bi().await.map_err(|e| EmuError::Protocol(e.to_string()))?;
+    let (mut send, _recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| EmuError::Protocol(e.to_string()))?;
     record(&obs, peer, ObsKind::OpenUp0);
     let handshake = Handshake {
         final_block: Final {

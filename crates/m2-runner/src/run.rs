@@ -105,7 +105,9 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         let mut ref_chain = RefChain::tiny(1..6).map_err(internal)?;
         let count = author_emulated_slots(&mut ref_chain).map_err(internal)?;
         let ref_chain = Arc::new(ref_chain);
-        let emu = Emulator::l0(1..6, genesis_hash, cli.base_port).await.map_err(internal)?;
+        let emu = Emulator::l0(1..6, genesis_hash, cli.base_port)
+            .await
+            .map_err(internal)?;
         let obs = emu.obs();
         let trace = emu.trace();
         let _accept = emu.accept_loop(ref_chain.clone());
@@ -120,7 +122,14 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             let nut_san = nut_san.clone();
             dial_tasks.push(tokio::spawn(async move {
                 let _ = m2_emu::emu::dial_nut(
-                    1, i, genesis_hash, nut_addr, nut_san, ref_chain, trace, obs,
+                    1,
+                    i,
+                    genesis_hash,
+                    nut_addr,
+                    nut_san,
+                    ref_chain,
+                    trace,
+                    obs,
                 )
                 .await;
             }));
@@ -133,7 +142,14 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             dial_tasks.push(tokio::spawn(async move {
                 tokio::time::sleep(connectivity::INITIATOR_GRACE).await;
                 let _ = m2_emu::emu::dial_nut(
-                    1, i, genesis_hash, nut_addr, nut_san, ref_chain, trace, obs,
+                    1,
+                    i,
+                    genesis_hash,
+                    nut_addr,
+                    nut_san,
+                    ref_chain,
+                    trace,
+                    obs,
                 )
                 .await;
             }));

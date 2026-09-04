@@ -201,7 +201,10 @@ pub enum LaunchError {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{preset_docker, preset_polkajam, spawn, split_host_port, substitute, LaunchConfig, LaunchError};
+    use super::{
+        preset_docker, preset_polkajam, spawn, split_host_port, substitute, LaunchConfig,
+        LaunchError,
+    };
 
     fn test_config() -> LaunchConfig {
         LaunchConfig {
@@ -257,14 +260,23 @@ mod tests {
         assert!(cmd.contains("--mode validator"));
         assert!(cmd.contains("--key-seed-file"));
         assert!(cmd.contains(&cfg.spec_path.display().to_string()));
-        assert!(cmd.contains("--listen-ip ::"), "bracketed IPv6 is split into a bare --listen-ip");
-        assert!(cmd.contains("--port 3000"), "the port is split out of the listen address");
+        assert!(
+            cmd.contains("--listen-ip ::"),
+            "bracketed IPv6 is split into a bare --listen-ip"
+        );
+        assert!(
+            cmd.contains("--port 3000"),
+            "the port is split out of the listen address"
+        );
     }
 
     #[test]
     fn split_host_port_bracketed_ipv6() {
         assert_eq!(split_host_port("[::]:40000"), ("::", "40000"));
-        assert_eq!(split_host_port("[::ffff:127.0.0.1]:40000"), ("::ffff:127.0.0.1", "40000"));
+        assert_eq!(
+            split_host_port("[::ffff:127.0.0.1]:40000"),
+            ("::ffff:127.0.0.1", "40000")
+        );
         assert_eq!(split_host_port("127.0.0.1:40000"), ("127.0.0.1", "40000"));
     }
 
