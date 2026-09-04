@@ -3,8 +3,11 @@
 #![deny(unsafe_code)]
 
 pub mod cli;
+pub mod connectivity;
 pub mod keygen;
+pub mod launch;
 pub mod report;
+pub mod spec;
 
 /// Session directory layout as in `scripts/fuzz-workflow.py`:
 /// `sessions/<id>/{logs,traces,report}`.

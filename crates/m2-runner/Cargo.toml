@@ -18,6 +18,11 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 jam-types = { workspace = true }
 jam-std-common = { workspace = true }
+jam-node = { workspace = true }
+codec = { package = "jam-codec", version = "0.1.1", default-features = false, features = ["derive", "max-encoded-len"] }
 ed25519-consensus = { workspace = true }
 m2-scenario = { path = "../../crates/m2-scenario" }
 jamnp-s = { path = "../../crates/jamnp-s" }
+
+[dev-dependencies]
+m2-reference = { path = "../../crates/m2-reference" }
