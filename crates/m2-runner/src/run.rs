@@ -18,7 +18,7 @@ use crate::spec;
 
 /// How many emulated slots the dry-run baseline pretends were authored.
 /// Seconds to let JAMNP traffic accumulate before evaluating the scenario.
-const OBSERVATION_WINDOW: u64 = 12;
+const OBSERVATION_WINDOW: u64 = 30;
 const DRY_RUN_BLOCK_COUNT: usize = 3;
 
 /// Errors from a run, mapped to exit codes (startup = 1, internal = 2).
