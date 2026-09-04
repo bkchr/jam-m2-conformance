@@ -1,8 +1,8 @@
 //! The §4 run lifecycle, orchestrated by [`crate::cli::run`].
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
 use std::ops::Range;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use jamnp_s::cert::san_for_key;
@@ -63,7 +63,11 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         .clone()
         .map(|i| keys.keysets[i].ed25519.0.verification_key().to_bytes())
         .collect();
-    let nut_key = keys.keysets[nut_index].ed25519.0.verification_key().to_bytes();
+    let nut_key = keys.keysets[nut_index]
+        .ed25519
+        .0
+        .verification_key()
+        .to_bytes();
     let plan = connectivity::plan_connectivity(&emu_keys, &nut_key);
     let mut nut: Option<NutProcess> = None;
     let mut conn_findings: Vec<Finding> = Vec::new();
@@ -290,7 +294,10 @@ fn launch_config(
         ed25519_secret_hex: keys.nut_ed25519_secret_hex.clone(),
         bandersnatch_secret_hex: keys.nut_bandersnatch_secret_hex.clone(),
         listen: format!("[::]:{}", cli.base_port + cli.validator_index as u16),
-        public_addr: format!("::ffff:127.0.0.1:{}", cli.base_port + cli.validator_index as u16),
+        public_addr: format!(
+            "::ffff:127.0.0.1:{}",
+            cli.base_port + cli.validator_index as u16
+        ),
         data_path: cli.session_dir.clone(),
         log_level: "info".to_string(),
     }
