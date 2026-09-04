@@ -17,13 +17,16 @@ use jamnp_s::{
     codec::ce128_129::{BlockRequest, BlockResponse, Direction, StateRequest, StateResponse},
     codec::up0::{Announcement, Final, Handshake},
     endpoint::{Endpoint, EndpointConfig, EndpointError},
-    framing::{frame, frame_message, FrameReader, CE128, CE129, UP},
+    framing::{frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, UP},
     trace::{mono_ts, wall_ts, Direction as TraceDir, Trace, TraceRecord},
 };
 use m2_reference::chain::RefChain;
+use m2_scenario::ctx::NutBlock;
 use m2_scenario::dsl::{Obs, ObsKind, ObsLog};
 use m2_scenario::scenarios::l0;
 use tokio::task::JoinHandle;
+
+use crate::nut_block::{fetch_block, should_fetch};
 
 /// Errors raised while building or running the emulated validators.
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +46,9 @@ pub enum EmuError {
     /// A frame or codec-level protocol error.
     #[error("protocol error: {0}")]
     Protocol(String),
+    /// A response failed to decode into the expected type.
+    #[error("decode error: {0}")]
+    Decode(String),
 }
 
 /// The five emulated validators (indices `1..=5` by default).
@@ -57,6 +63,7 @@ pub struct Emulator {
     genesis_hash: [u8; 32],
     trace: Arc<Mutex<Trace>>,
     obs: Arc<Mutex<ObsLog>>,
+    nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
 }
 
 impl Emulator {
@@ -93,6 +100,7 @@ impl Emulator {
             genesis_hash,
             trace: Arc::new(Mutex::new(Trace::default())),
             obs: Arc::new(Mutex::new(ObsLog::new())),
+            nut_blocks: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -114,6 +122,11 @@ impl Emulator {
         Arc::clone(&self.obs)
     }
 
+    /// The shared store of blocks fetched from the NUT (announce, then CE 128).
+    pub fn nut_blocks(&self) -> Arc<Mutex<Vec<NutBlock>>> {
+        Arc::clone(&self.nut_blocks)
+    }
+
     /// Spawn one reactive accept task per endpoint, serving the L0 subset from
     /// `ref_chain`. The returned handle completes when every accept task ends
     /// (i.e. once the endpoints are closed).
@@ -128,10 +141,20 @@ impl Emulator {
                 let ref_chain = Arc::clone(&ref_chain);
                 let trace = Arc::clone(&self.trace);
                 let obs = Arc::clone(&self.obs);
+                let nut_blocks = Arc::clone(&self.nut_blocks);
                 let peer_index = (self.emu_start + i) as u16;
                 let genesis_hash = self.genesis_hash;
                 handle.spawn(async move {
-                    endpoint_task(endpoint, peer_index, genesis_hash, ref_chain, trace, obs).await;
+                    endpoint_task(
+                        endpoint,
+                        peer_index,
+                        genesis_hash,
+                        ref_chain,
+                        trace,
+                        obs,
+                        nut_blocks,
+                    )
+                    .await;
                 })
             })
             .collect();
@@ -155,6 +178,7 @@ pub async fn dial_nut(
     ref_chain: Arc<RefChain>,
     trace: Arc<Mutex<Trace>>,
     obs: Arc<Mutex<ObsLog>>,
+    nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
 ) -> Result<(), EmuError> {
     let index = emu_start + peer_index;
     let secret = SecretKeyset::trivial(index as u32).ed25519;
@@ -215,7 +239,16 @@ pub async fn dial_nut(
     // announcements rather than finishing it (simple.md:108-111).
 
     // Serve the NUT.s CE 128 / CE 129 requests on the dialed connection.
-    handle_connection(connection, peer, genesis_hash, &ref_chain, &trace, &obs).await;
+    handle_connection(
+        connection,
+        peer,
+        genesis_hash,
+        &ref_chain,
+        &trace,
+        &obs,
+        &nut_blocks,
+    )
+    .await;
     Ok(())
 }
 
@@ -264,6 +297,7 @@ async fn endpoint_task(
     ref_chain: Arc<RefChain>,
     trace: Arc<Mutex<Trace>>,
     obs: Arc<Mutex<ObsLog>>,
+    nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
 ) {
     while let Some(incoming) = endpoint.accept().await {
         record(&obs, peer_index, ObsKind::Accept);
@@ -289,6 +323,7 @@ async fn endpoint_task(
             &ref_chain,
             &trace,
             &obs,
+            &nut_blocks,
         )
         .await;
     }
@@ -303,6 +338,7 @@ async fn handle_connection(
     ref_chain: &RefChain,
     trace: &Mutex<Trace>,
     obs: &Mutex<ObsLog>,
+    nut_blocks: &Mutex<Vec<NutBlock>>,
 ) {
     while let Ok((mut send, mut recv)) = connection.accept_bi().await {
         let stream_id = u64::from(send.id());
@@ -313,13 +349,16 @@ async fn handle_connection(
         match kind {
             UP => {
                 handle_up0(
+                    &connection,
                     &mut send,
                     peer_index,
                     genesis_hash,
+                    ref_chain,
                     stream_id,
                     &content,
                     trace,
                     obs,
+                    nut_blocks,
                 )
                 .await
             }
@@ -332,6 +371,9 @@ async fn handle_connection(
             CE129 => {
                 serve_state_request(&mut send, peer_index, &content, stream_id, trace, obs).await
             }
+            CE131 | CE132 => {
+                crate::ticket_io::handle_inbound_ticket(kind, &content, peer_index, obs).await;
+            }
             // Spec-known-but-refused and unknown kinds: reset the stream.
             _ => {}
         }
@@ -343,17 +385,27 @@ async fn handle_connection(
 /// announce from re-announce) and left unanswered; anything else is a
 /// handshake, answered with our own (recording `OpenUp0`).
 async fn handle_up0(
+    connection: &quinn::Connection,
     send: &mut quinn::SendStream,
     peer_index: u16,
     genesis_hash: [u8; 32],
+    ref_chain: &RefChain,
     stream_id: u64,
     content: &[u8],
     trace: &Mutex<Trace>,
     obs: &Mutex<ObsLog>,
+    nut_blocks: &Mutex<Vec<NutBlock>>,
 ) {
-    if Announcement::decode(&mut &content[..]).is_ok() {
+    if let Ok(announcement) = Announcement::decode(&mut &content[..]) {
         record(obs, peer_index, ObsKind::Up0Announce);
         record(obs, peer_index, ObsKind::Other(l0::REANNOUNCED));
+        // An announced block outside the reference chain is a NUT-authored
+        // block: fetch it over CE 128 and record it (fetch errors leave the
+        // announcement recorded and the stream open).
+        let hash = announcement.header.hash().0;
+        if should_fetch(&hash, ref_chain) {
+            let _ = fetch_block(connection, hash, trace, obs, peer_index, nut_blocks).await;
+        }
         return;
     }
     record(obs, peer_index, ObsKind::Other(l0::UP0_KIND0));
@@ -459,7 +511,9 @@ async fn serve_state_request(
 }
 
 /// Read the next complete frame from `recv`, or `None` at end of stream.
-async fn read_frame(recv: &mut quinn::RecvStream) -> Result<Option<(u8, Vec<u8>)>, EmuError> {
+pub(crate) async fn read_frame(
+    recv: &mut quinn::RecvStream,
+) -> Result<Option<(u8, Vec<u8>)>, EmuError> {
     let mut reader = FrameReader::new();
     let mut buf = [0u8; 4096];
     loop {
@@ -485,7 +539,7 @@ async fn read_frame(recv: &mut quinn::RecvStream) -> Result<Option<(u8, Vec<u8>)
 
 /// Record a frame in the shared trace (direction is from the NUT's perspective:
 /// `Tx` = the NUT sent it, `Rx` = the emulator sent it).
-fn trace_record(
+pub(crate) fn trace_record(
     peer: u16,
     kind: u8,
     stream_id: u64,
@@ -505,14 +559,14 @@ fn trace_record(
 }
 
 /// Lock a shared mutex, recovering from poisoning (emulator code never panics).
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Record an observation from `peer` at the current monotonic time.
-fn record(obs: &Mutex<ObsLog>, peer: u16, kind: ObsKind) {
+pub(crate) fn record(obs: &Mutex<ObsLog>, peer: u16, kind: ObsKind) {
     let at = mono_ts();
     lock(obs).push(
         at,
