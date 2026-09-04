@@ -11,7 +11,7 @@
 //! codec used across the workspace: fixed-size arrays raw, `u32` little-endian,
 //! collection lengths jam-codec-compact (`jam-np/simple.md` `:238-303`).
 
-use codec::{Decode, Encode};
+use codec::{Decode, Encode, Input, Output};
 use jam_std_common::Block;
 use jam_types::HeaderHash;
 
@@ -37,9 +37,31 @@ pub struct BlockRequest {
 }
 
 /// CE 128 response: `[Block]` (`simple.md:263`).
-#[derive(Clone, Debug, Encode, Decode)]
+///
+/// The block sequence is transmitted with its length implied by the message
+/// size (`simple.md:148-153`): blocks are encoded raw, one after another, with
+/// no collection length prefix.
+#[derive(Clone, Debug)]
 pub struct BlockResponse {
     pub blocks: Vec<Block>,
+}
+
+impl Encode for BlockResponse {
+    fn encode_to<T: Output + ?Sized>(&self, dest: &mut T) {
+        for block in &self.blocks {
+            block.encode_to(dest);
+        }
+    }
+}
+
+impl Decode for BlockResponse {
+    fn decode<I: Input>(input: &mut I) -> Result<Self, codec::Error> {
+        let mut blocks = Vec::new();
+        while input.remaining_len()?.is_some_and(|n| n > 0) {
+            blocks.push(Block::decode(input)?);
+        }
+        Ok(Self { blocks })
+    }
 }
 
 /// A state-trie boundary node returned by CE 129, covering the path from the
@@ -155,31 +177,28 @@ mod tests {
     }
 
     #[test]
-    fn block_response_empty_encodes_len_zero() {
+    fn block_response_empty_encodes_empty() {
         let resp = BlockResponse { blocks: vec![] };
-        assert_eq!(resp.encode(), vec![0x00]); // jam-codec compact len 0
+        assert_eq!(resp.encode(), Vec::<u8>::new()); // no collection length prefix
     }
 
     #[test]
-    fn block_response_one_block_encodes_len_one_plus_block() {
+    fn block_response_one_block_encodes_raw_block() {
         let block = test_block();
         let resp = BlockResponse {
             blocks: vec![block.clone()],
         };
-        let mut expected = vec![0x01]; // jam-codec compact len 1
-        expected.extend_from_slice(&block.encode());
-        assert_eq!(resp.encode(), expected);
+        assert_eq!(resp.encode(), block.encode());
     }
 
     #[test]
-    fn block_response_two_blocks_encodes_len_two_plus_blocks() {
+    fn block_response_two_blocks_encodes_raw_concatenation() {
         let b1 = test_block();
         let b2 = test_block();
         let resp = BlockResponse {
             blocks: vec![b1.clone(), b2.clone()],
         };
-        let mut expected = vec![0x02]; // jam-codec compact len 2
-        expected.extend_from_slice(&b1.encode());
+        let mut expected = b1.encode();
         expected.extend_from_slice(&b2.encode());
         assert_eq!(resp.encode(), expected);
     }

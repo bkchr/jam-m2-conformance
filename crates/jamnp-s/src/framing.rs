@@ -1,11 +1,14 @@
 //! Stream framing for JAMNP-S.
 //!
-//! Wire model per `jam-np/simple.md:102-124`: stream kinds are classified into
-//! Unique Persistent (UP) kinds (`0..=127`) and Common Ephemeral (CE) kinds
-//! (`128..=255`); this spec only defines UP 0. Each message is transmitted
-//! (`simple.md:126-130`) as a single frame: `[kind] ++ [content len: u32 LE] ++
-//! [content]`.
+//! Wire model per `jam-np/simple.md:102-130`: the stream initiator sends the
+//! single stream-kind byte once when the stream opens (`:122-124`); after that,
+//! every message is `[content len: u32 LE] ++ [content]` (`:126-130`). So a
+//! stream is `[kind] ++ [len]++[content] ++ [len]++[content] ++ ...`:
+//! [`frame`] encodes the stream-opening message (kind + length + content),
+//! [`frame_message`] every subsequent one (length + content).
 //!
+//! Stream kinds are classified into Unique Persistent (UP) kinds (`0..=127`)
+//! and Common Ephemeral (CE) kinds (`128..=255`); this spec only defines UP 0.
 //! The harness protocol surface is UP 0 and CE 128, 129, 131..=148 (there is no
 //! CE 130, DESIGN.md `:54`). CE 130 and the GRANDPA kinds 149..=152 (DESIGN.md
 //! `:379`) are spec-known but refused; any other byte is an unknown kind.
@@ -99,7 +102,9 @@ pub enum FrameError {
     RefusedKind(u8),
 }
 
-/// Encodes `content` as a frame: `[kind] ++ [len: u32 LE] ++ [content]`.
+/// Encodes the stream-opening message: `[kind] ++ [len: u32 LE] ++ [content]`.
+/// The kind byte is sent exactly once per stream (`simple.md:122-124`); every
+/// message after the first must use [`frame_message`].
 pub fn frame(kind: u8, content: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(5 + content.len());
     out.push(kind);
@@ -108,11 +113,23 @@ pub fn frame(kind: u8, content: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Encodes a message after the stream-opening kind byte: `[len: u32 LE] ++
+/// [content]` (`simple.md:126-130`).
+pub fn frame_message(content: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + content.len());
+    out.extend_from_slice(&(content.len() as u32).to_le_bytes());
+    out.extend_from_slice(content);
+    out
+}
+
 /// Incremental frame reader that buffers pushed bytes and yields complete
-/// frames as `(kind, content)`.
+/// messages as `(kind, content)`. The stream-opening kind byte is consumed
+/// once on the first [`FrameReader::next_frame`] call; subsequent calls read
+/// `[len: u32 LE] ++ [content]` messages under that same kind.
 #[derive(Debug, Default)]
 pub struct FrameReader {
     buf: Vec<u8>,
+    kind: Option<u8>,
 }
 
 impl FrameReader {
@@ -126,57 +143,77 @@ impl FrameReader {
         self.buf.extend_from_slice(bytes);
     }
 
-    /// Returns the next complete frame, or `None` when more bytes are needed.
+    /// Consumes the stream-opening kind byte if not yet read, then returns the
+    /// next complete message, or `None` when more bytes are needed.
     ///
     /// Errors on an invalid or refused kind byte and on an oversize length prefix.
     pub fn next_frame(&mut self) -> Result<Option<(u8, Vec<u8>)>, FrameError> {
-        if self.buf.len() < 5 {
-            // A kind byte alone is enough to reject it without waiting for the header.
-            if let Some(&kind) = self.buf.first() {
-                validate_kind(kind)?;
+        if self.kind.is_none() {
+            if self.buf.is_empty() {
+                return Ok(None);
             }
+            let kind = self.buf[0];
+            validate_kind(kind)?;
+            self.kind = Some(kind);
+            self.buf.drain(0..1);
+        }
+        let kind = self.kind.unwrap();
+        if self.buf.len() < 4 {
             return Ok(None);
         }
-        let kind = self.buf[0];
-        validate_kind(kind)?;
-        let len = u32::from_le_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
+        let len = u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
         if len > MAX_FRAME_SIZE {
             return Err(FrameError::Oversize);
         }
-        if self.buf.len() < 5 + len {
+        if self.buf.len() < 4 + len {
             return Ok(None);
         }
-        let content = self.buf[5..5 + len].to_vec();
-        self.buf.drain(0..5 + len);
+        let content = self.buf[4..4 + len].to_vec();
+        self.buf.drain(0..4 + len);
         Ok(Some((kind, content)))
     }
 
     /// Signals end-of-stream: succeeds only when no bytes remain after the last
-    /// complete frame.
+    /// complete message.
     ///
-    /// Reports [`FrameError::TrailingBytes`] when complete frame(s) were left
-    /// unconsumed and [`FrameError::Truncated`] when a frame's declared length was
-    /// never satisfied.
+    /// Reports [`FrameError::TrailingBytes`] when complete message(s) were left
+    /// unconsumed and [`FrameError::Truncated`] when a message's declared length
+    /// was never satisfied.
     pub fn finish(&mut self) -> Result<(), FrameError> {
         if self.buf.is_empty() {
             return Ok(());
         }
-        if self.buf.len() < 5 {
-            // Dangling partial header: at least a kind byte, but no length prefix.
-            return Err(FrameError::Truncated);
-        }
-        let kind = self.buf[0];
-        let len = u32::from_le_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
-        match validate_kind(kind) {
-            Ok(()) if len <= MAX_FRAME_SIZE => {
-                if self.buf.len() >= 5 + len {
-                    Err(FrameError::TrailingBytes)
+        let complete = match self.kind {
+            None => {
+                // The leftover starts with the stream-opening kind byte.
+                if self.buf.len() < 5 {
+                    false
                 } else {
-                    Err(FrameError::Truncated)
+                    let kind = self.buf[0];
+                    if validate_kind(kind).is_err() {
+                        return Err(FrameError::TrailingBytes);
+                    }
+                    let len =
+                        u32::from_le_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]])
+                            as usize;
+                    len <= MAX_FRAME_SIZE && self.buf.len() >= 5 + len
                 }
             }
-            // Not a valid frame start: the leftover is trailing bytes.
-            _ => Err(FrameError::TrailingBytes),
+            Some(_) => {
+                if self.buf.len() < 4 {
+                    false
+                } else {
+                    let len =
+                        u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])
+                            as usize;
+                    len <= MAX_FRAME_SIZE && self.buf.len() >= 4 + len
+                }
+            }
+        };
+        if complete {
+            Err(FrameError::TrailingBytes)
+        } else {
+            Err(FrameError::Truncated)
         }
     }
 }
@@ -214,6 +251,18 @@ mod tests {
     }
 
     #[test]
+    fn frame_message_roundtrip_lengths() {
+        for len in LENS {
+            let content: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let wire = frame_message(&content);
+            assert_eq!(wire.len(), 4 + len);
+            let declared = u32::from_le_bytes([wire[0], wire[1], wire[2], wire[3]]) as usize;
+            assert_eq!(declared, len);
+            assert_eq!(&wire[4..], &content[..]);
+        }
+    }
+
+    #[test]
     fn reader_accumulates_split_pushes() {
         let content = vec![7u8; 300];
         let wire = frame(CE135, &content);
@@ -230,15 +279,16 @@ mod tests {
     }
 
     #[test]
-    fn multiple_frames_in_one_push() {
+    fn multiple_messages_in_one_push() {
         let mut r = FrameReader::new();
         let mut wire = frame(UP, b"a");
-        wire.extend_from_slice(&frame(CE141, b"bb"));
-        wire.extend_from_slice(&frame(CE143, &[0u8; 64]));
+        wire.extend_from_slice(&frame_message(b"bb"));
+        wire.extend_from_slice(&frame_message(&[0u8; 64]));
         r.push(&wire);
+        // The kind byte is sent once; every message comes back under it.
         assert_eq!(r.next_frame().unwrap(), Some((UP, b"a".to_vec())));
-        assert_eq!(r.next_frame().unwrap(), Some((CE141, b"bb".to_vec())));
-        assert_eq!(r.next_frame().unwrap(), Some((CE143, vec![0u8; 64])));
+        assert_eq!(r.next_frame().unwrap(), Some((UP, b"bb".to_vec())));
+        assert_eq!(r.next_frame().unwrap(), Some((UP, vec![0u8; 64])));
         assert_eq!(r.next_frame().unwrap(), None);
         assert_eq!(r.finish(), Ok(()));
     }
@@ -295,11 +345,11 @@ mod tests {
     }
 
     #[test]
-    fn trailing_bytes_after_complete_frame() {
+    fn trailing_bytes_after_complete_message() {
         let mut r = FrameReader::new();
-        let wire = frame(CE129, b"hello");
+        let mut wire = frame(CE129, b"hello");
+        wire.extend_from_slice(&frame_message(b"extra"));
         r.push(&wire);
-        r.push(b"extra");
         assert_eq!(r.next_frame().unwrap(), Some((CE129, b"hello".to_vec())));
         assert_eq!(r.finish(), Err(FrameError::TrailingBytes));
     }

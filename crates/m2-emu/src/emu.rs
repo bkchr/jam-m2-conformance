@@ -17,7 +17,7 @@ use jamnp_s::{
     codec::ce128_129::{BlockRequest, BlockResponse, Direction, StateRequest, StateResponse},
     codec::up0::{Announcement, Final, Handshake},
     endpoint::{Endpoint, EndpointConfig, EndpointError},
-    framing::{frame, FrameReader, CE128, CE129, UP},
+    framing::{frame, frame_message, FrameReader, CE128, CE129, UP},
     trace::{mono_ts, wall_ts, Direction as TraceDir, Trace, TraceRecord},
 };
 use m2_reference::chain::RefChain;
@@ -207,13 +207,14 @@ pub async fn dial_nut(
             header: (**block.header).clone(),
             final_block,
         };
-        let wire = frame(UP, &ann.encode());
+        let wire = frame_message(&ann.encode());
         trace_record(peer, UP, u64::from(send.id()), &wire, &trace, TraceDir::Tx);
         let _ = send.write_all(&wire).await;
     }
-    let _ = send.finish();
+    // UP 0 is a persistent stream: keep the send half open for future
+    // announcements rather than finishing it (simple.md:108-111).
 
-    // Serve the NUT's CE 128 / CE 129 requests on the dialed connection.
+    // Serve the NUT.s CE 128 / CE 129 requests on the dialed connection.
     handle_connection(connection, peer, genesis_hash, &ref_chain, &trace, &obs).await;
     Ok(())
 }
@@ -383,10 +384,10 @@ async fn respond_up0(
         },
         leaves: vec![],
     };
-    let wire = frame(UP, &handshake.encode());
+    let wire = frame_message(&handshake.encode());
     trace_record(peer_index, UP, stream_id, &wire, trace, TraceDir::Rx);
     let _ = send.write_all(&wire).await;
-    let _ = send.finish();
+    // UP 0 is persistent: keep the send half open (simple.md:108-111).
 }
 
 /// Serve a NUT CE 128 block request from the reference chain.
@@ -417,7 +418,7 @@ async fn serve_block_request(
     };
     record(obs, peer_index, ObsKind::Other(l0::CE128_FIN_BOTH));
     record(obs, peer_index, ObsKind::Other(l0::CE128_MAX_RESPECTED));
-    let wire = frame(CE128, &response.encode());
+    let wire = frame_message(&response.encode());
     trace_record(peer_index, CE128, stream_id, &wire, trace, TraceDir::Rx);
     let _ = send.write_all(&wire).await;
     let _ = send.finish();
@@ -451,7 +452,7 @@ async fn serve_state_request(
     record(obs, peer_index, ObsKind::Other(l0::CE129_BOUNDARY_ORDER));
     record(obs, peer_index, ObsKind::Other(l0::CE129_SIZE_CAP));
     record(obs, peer_index, ObsKind::Other(l0::CE129_LEN_PREFIXED));
-    let wire = frame(CE129, &response.encode());
+    let wire = frame_message(&response.encode());
     trace_record(peer_index, CE129, stream_id, &wire, trace, TraceDir::Rx);
     let _ = send.write_all(&wire).await;
     let _ = send.finish();
