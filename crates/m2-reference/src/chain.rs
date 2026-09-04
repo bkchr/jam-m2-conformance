@@ -26,6 +26,9 @@ pub enum ChainError {
     /// A block could not be imported into the reference chain.
     #[error("import error: {0}")]
     Import(String),
+    /// A safrole ticket operation failed.
+    #[error("tickets error: {0}")]
+    Tickets(String),
 }
 
 /// Reference chain over the polkajam hazmat authoring harness.
@@ -75,6 +78,14 @@ impl RefChain {
     /// Hash of the genesis header.
     pub fn genesis_hash(&self) -> [u8; 32] {
         self.genesis_hash
+    }
+
+    /// The underlying hazmat authoring harness.
+    ///
+    /// `pub(crate)`: the tickets/guarantees/etc. oracles need harness access
+    /// (storage, keystore) but the field stays private to this module.
+    pub(crate) fn harness(&self) -> &jam_node::hazmat::AuthoringHarness {
+        &self.harness
     }
 
     /// Current wall-clock slot (`(now - JAM_COMMON_ERA) / 6`).

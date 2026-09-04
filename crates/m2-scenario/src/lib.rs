@@ -6,5 +6,6 @@
 //! matches expectations as a subsequence with event-relative timing windows.
 #![deny(unsafe_code)]
 
+pub mod ctx;
 pub mod dsl;
 pub mod scenarios;

@@ -7,6 +7,8 @@ description = "Scenario model and scheduler: hard-coded Rust check DSL with expe
 
 [dependencies]
 jam-types = { workspace = true }
+jam-std-common = { workspace = true }
+jamnp-s = { path = "../../crates/jamnp-s" }
 
 [dev-dependencies]
 m2-reference = { path = "../m2-reference" }
