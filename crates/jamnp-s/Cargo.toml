@@ -1,0 +1,22 @@
+[package]
+name = "jamnp-s"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Independent JAMNP-S protocol implementation (QUIC/TLS, cert/SAN, ALPN, framing, codecs, trace)"
+
+[dependencies]
+jam-types = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+rcgen = { workspace = true }
+ed25519-consensus = { workspace = true }
+x509-parser = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+blake2b_simd = { workspace = true }

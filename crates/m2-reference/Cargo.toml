@@ -1,0 +1,9 @@
+[package]
+name = "m2-reference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reference oracle over polkajam's hazmat engine: chain state, authoring, signing for emulated keysets"
+
+[dependencies]
+jam-types = { workspace = true }

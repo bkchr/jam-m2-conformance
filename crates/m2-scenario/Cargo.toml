@@ -1,0 +1,9 @@
+[package]
+name = "m2-scenario"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Scenario model and scheduler: hard-coded Rust check DSL with expected-answer sequences"
+
+[dependencies]
+jam-types = { workspace = true }

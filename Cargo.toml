@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/jamnp-s",
+    "crates/m2-reference",
+    "crates/m2-emu",
+    "crates/m2-scenario",
+    "crates/m2-runner",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/paritytech/jam-m2-conformance"
+
+# Polkajam reference-engine crates are sourced from a LOCAL git repo under
+# `third_party/polkajam-local.git` (snapshot of commit `44cc3ec20` plus the
+# `jamnp-s/1` ALPN patch, see `patches/polkajam-alpn-v1.patch`). A git source
+# (not a path dependency) is required: cargo resolves workspace inheritance of
+# git-sourced crates against their own `[workspace]`, which a path dependency
+# inside this workspace tree would not.
+[workspace.dependencies]
+jam-types = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "44cc3ec20ea4bbfd75df6b56e3b7798eab1b15b2" }
+jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "44cc3ec20ea4bbfd75df6b56e3b7798eab1b15b2" }
+jam-node = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "44cc3ec20ea4bbfd75df6b56e3b7798eab1b15b2", features = ["hazmat"] }
+polkajam-fuzz = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "44cc3ec20ea4bbfd75df6b56e3b7798eab1b15b2" }
+
+quinn = { version = "0.11", features = ["rustls", "runtime-tokio", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+rcgen = { version = "0.14", features = ["ring"] }
+ed25519-consensus = { version = "2.1.0" }
+x509-parser = "0.17"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+clap = { version = "4.5.13", features = ["derive", "string"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hex = "0.4"
+thiserror = "2.0"
+blake2b_simd = "1"
+rand = "0.8"
+
+[profile.release]
+opt-level = 2

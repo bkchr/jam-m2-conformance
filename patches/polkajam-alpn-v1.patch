@@ -1,0 +1,9 @@
+--- a/crates/node/src/net/mod.rs
++++ b/crates/node/src/net/mod.rs
+@@ -100,7 +100,7 @@
+ 	);
+ 	EnumMap::from_fn(|claimed_role: ClaimedRole| {
+-		format!("jamnp-s/0/{genesis_hash_prefix:08x}{}", claimed_role.app_protocol_suffix())
++		format!("jamnp-s/1/{genesis_hash_prefix:08x}{}", claimed_role.app_protocol_suffix())
+ 	})
+ }
