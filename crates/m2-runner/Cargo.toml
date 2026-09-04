@@ -17,3 +17,7 @@ hex = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 jam-types = { workspace = true }
+jam-std-common = { workspace = true }
+ed25519-consensus = { workspace = true }
+m2-scenario = { path = "../../crates/m2-scenario" }
+jamnp-s = { path = "../../crates/jamnp-s" }

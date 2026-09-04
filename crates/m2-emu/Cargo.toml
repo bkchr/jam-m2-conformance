@@ -7,3 +7,12 @@ description = "The five emulated validators: JAMNP-S reactive skeletons, no core
 
 [dependencies]
 jam-types = { workspace = true }
+jam-std-common = { workspace = true }
+jamnp-s = { path = "../../crates/jamnp-s" }
+m2-reference = { path = "../../crates/m2-reference" }
+m2-scenario = { path = "../../crates/m2-scenario" }
+ed25519-consensus = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+quinn = { workspace = true }

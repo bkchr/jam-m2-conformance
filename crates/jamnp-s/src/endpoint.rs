@@ -144,11 +144,13 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// client and server certificate resolvers.
 fn certified_key(secret: SigningKey) -> Result<rustls::sign::SingleCertAndKey, EndpointError> {
     let (cert, _vk) = cert::build_cert(&secret).map_err(EndpointError::Cert)?;
-    Ok(rustls::sign::SingleCertAndKey::from(rustls::sign::CertifiedKey {
-        cert: vec![cert],
-        key: Arc::new(Ed25519SigningKey(secret)),
-        ocsp: None,
-    }))
+    Ok(rustls::sign::SingleCertAndKey::from(
+        rustls::sign::CertifiedKey {
+            cert: vec![cert],
+            key: Arc::new(Ed25519SigningKey(secret)),
+            ocsp: None,
+        },
+    ))
 }
 
 /// A `rustls::sign::SigningKey` backed by an Ed25519 secret key.

@@ -1951,7 +1951,16 @@ dependencies = [
 name = "m2-emu"
 version = "0.1.0"
 dependencies = [
+ "ed25519-consensus",
+ "futures",
+ "jam-std-common",
  "jam-types",
+ "jamnp-s",
+ "m2-reference",
+ "m2-scenario",
+ "quinn 0.11.11",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
@@ -1969,8 +1978,12 @@ name = "m2-runner"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "ed25519-consensus",
  "hex",
+ "jam-std-common",
  "jam-types",
+ "jamnp-s",
+ "m2-scenario",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
