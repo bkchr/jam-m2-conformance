@@ -26,22 +26,24 @@ pub struct GeneratedKeys {
 }
 
 /// Deterministically generates keysets for `validator_count` validators and the NUT secret
-/// handover (DESIGN.md §4, §7). Validator `i` gets `SecretKeyset::trivial(i)`; validator 0 is
-/// the NUT.
-pub fn generate(seed: u64, validator_count: usize) -> GeneratedKeys {
-    // A run always has the NUT, so `validator_count >= 1` and `keysets[0]` is the NUT.
+/// handover (DESIGN.md §4, §7). Validator `i` gets `SecretKeyset::trivial(i)`; the NUT is
+/// validator `nut_index`.
+///
+/// The default NUT index is 5 (not 0): the preferred-initiator rule
+/// (`simple.md:70-80`) is degenerate for trivial keys at index 0 — the NUT is
+/// never the preferred initiator, so NUT-initiated L0 checks can never fire.
+pub fn generate(seed: u64, nut_index: usize, validator_count: usize) -> GeneratedKeys {
+    // A run always has the NUT, so `validator_count > nut_index`.
     let keysets: Vec<SecretKeyset> = (0..validator_count)
         .map(|i| SecretKeyset::trivial(i as u32))
         .collect();
 
-    // The NUT's Ed25519 secret must match the on-chain genesis key of validator 0.
-    let nut_ed25519_secret_hex = hex::encode(keysets[0].ed25519.to_bytes());
+    // The NUT's Ed25519 secret must match the on-chain genesis key of validator `nut_index`.
+    let nut_ed25519_secret_hex = hex::encode(keysets[nut_index].ed25519.to_bytes());
     // `bandersnatch::Secret` at the pinned rev exposes no raw-byte accessor, so the raw 32-byte
-    // seed for validator 0 is handed over instead: a NUT feeds it straight to
+    // seed for the NUT's validator index is handed over instead: a NUT feeds it straight to
     // `bandersnatch::Secret::from_seed` and it derives the same keyset as the genesis entry.
-    // The NUT's on-chain identity is fixed (validator index 0), so the seed file does not depend
-    // on the run `seed`; the run seed is recorded for scenario reproducibility instead.
-    let nut_seed = SecretKeyset::trivial_seed(0);
+    let nut_seed = SecretKeyset::trivial_seed(nut_index as u32);
     let nut_bandersnatch_secret_hex = hex::encode(nut_seed);
 
     GeneratedKeys {
@@ -97,8 +99,8 @@ mod tests {
 
     #[test]
     fn deterministic_same_seed_same_keys() {
-        let a = generate(7, 6);
-        let b = generate(7, 6);
+        let a = generate(7, 5, 6);
+        let b = generate(7, 5, 6);
         assert_eq!(a.nut_seed, b.nut_seed);
         assert_eq!(a.nut_ed25519_secret_hex, b.nut_ed25519_secret_hex);
         assert_eq!(a.nut_bandersnatch_secret_hex, b.nut_bandersnatch_secret_hex);
@@ -106,13 +108,13 @@ mod tests {
 
     #[test]
     fn validator_count_keysets() {
-        assert_eq!(generate(7, 6).keysets.len(), 6);
-        assert_eq!(generate(7, 5).keysets.len(), 5);
+        assert_eq!(generate(7, 5, 6).keysets.len(), 6);
+        assert_eq!(generate(7, 4, 5).keysets.len(), 5);
     }
 
     #[test]
     fn nut_secrets_are_32_bytes_hex() {
-        let keys = generate(7, 6);
+        let keys = generate(7, 5, 6);
         assert_eq!(hex::decode(&keys.nut_ed25519_secret_hex).unwrap().len(), 32);
         assert_eq!(
             hex::decode(&keys.nut_bandersnatch_secret_hex)
@@ -134,7 +136,7 @@ mod tests {
     #[test]
     fn seed_files_written() {
         let dir = std::env::temp_dir().join(format!("m2-keygen-test-{}", std::process::id()));
-        let keys = generate(7, 6);
+        let keys = generate(7, 5, 6);
         write_seed_files(&dir, &keys).unwrap();
 
         let seed = std::fs::read(dir.join("seed.seed")).unwrap();

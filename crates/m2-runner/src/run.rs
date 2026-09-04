@@ -2,6 +2,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use jamnp_s::cert::san_for_key;
@@ -38,7 +39,8 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     report::ensure_layout(session_dir).map_err(internal)?;
 
     // §4.1 keys + spec.
-    let keys = keygen::generate(cli.seed, 6);
+    let nut_index = cli.validator_index;
+    let keys = keygen::generate(cli.seed, nut_index, 6);
     keygen::write_seed_files(session_dir, &keys).map_err(internal)?;
 
     let ips = loopback_ips();
@@ -50,14 +52,18 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     spec::write_m2_spec(session_dir, &spec_id, &m2_spec).map_err(internal)?;
     let spec_path = spec::write_polkajam_spec(session_dir, &chain_spec).map_err(internal)?;
 
-    let nut_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, cli.base_port));
-    let nut_san = san_for_key(&keys.keysets[0].ed25519.0.verification_key());
+    let nut_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, cli.base_port + nut_index as u16));
+    let nut_san = san_for_key(&keys.keysets[nut_index].ed25519.0.verification_key());
 
     // §4.2 launch + startup probe, §4.3 connectivity (both skipped in dry-run).
-    let emu_keys: Vec<[u8; 32]> = (1..=5)
+    // Emulated validators are the other five indices; with the default NUT index 5 that is the
+    // contiguous range 0..5 (with index 0 it is 1..6), so the emulator and reference use a Range.
+    let emu_range: Range<usize> = if nut_index == 0 { 1..6 } else { 0..nut_index };
+    let emu_keys: Vec<[u8; 32]> = emu_range
+        .clone()
         .map(|i| keys.keysets[i].ed25519.0.verification_key().to_bytes())
         .collect();
-    let nut_key = keys.keysets[0].ed25519.0.verification_key().to_bytes();
+    let nut_key = keys.keysets[nut_index].ed25519.0.verification_key().to_bytes();
     let plan = connectivity::plan_connectivity(&emu_keys, &nut_key);
     let mut nut: Option<NutProcess> = None;
     let mut conn_findings: Vec<Finding> = Vec::new();
@@ -83,7 +89,8 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             )));
         }
 
-        let emu_addrs: Vec<SocketAddr> = (1..=5)
+        let emu_addrs: Vec<SocketAddr> = emu_range
+            .clone()
             .map(|i| SocketAddr::from((Ipv4Addr::LOCALHOST, cli.base_port + i as u16)))
             .collect();
         let outcomes =
@@ -102,10 +109,10 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             Vec::new(),
         )
     } else {
-        let mut ref_chain = RefChain::tiny(1..6).map_err(internal)?;
+        let mut ref_chain = RefChain::tiny(emu_range.clone()).map_err(internal)?;
         let count = author_emulated_slots(&mut ref_chain).map_err(internal)?;
         let ref_chain = Arc::new(ref_chain);
-        let emu = Emulator::l0(1..6, genesis_hash, cli.base_port)
+        let emu = Emulator::l0(emu_range.clone(), genesis_hash, cli.base_port)
             .await
             .map_err(internal)?;
         let obs = emu.obs();
@@ -122,7 +129,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             let nut_san = nut_san.clone();
             dial_tasks.push(tokio::spawn(async move {
                 let _ = m2_emu::emu::dial_nut(
-                    1,
+                    emu_range.start,
                     i,
                     genesis_hash,
                     nut_addr,
@@ -142,7 +149,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             dial_tasks.push(tokio::spawn(async move {
                 tokio::time::sleep(connectivity::INITIATOR_GRACE).await;
                 let _ = m2_emu::emu::dial_nut(
-                    1,
+                    emu_range.start,
                     i,
                     genesis_hash,
                     nut_addr,
@@ -271,7 +278,7 @@ fn push_connectivity_finding(findings: &mut Vec<Finding>, emu_index: usize, o: &
     });
 }
 
-/// §7 `LaunchConfig` for a run: NUT on `base_port`, IPv4-mapped loopback
+/// §7 `LaunchConfig` for a run: NUT on `base_port + validator_index`, IPv4-mapped loopback
 /// public address, session dir as data path.
 fn launch_config(
     keys: &keygen::GeneratedKeys,
@@ -282,8 +289,8 @@ fn launch_config(
         spec_path,
         ed25519_secret_hex: keys.nut_ed25519_secret_hex.clone(),
         bandersnatch_secret_hex: keys.nut_bandersnatch_secret_hex.clone(),
-        listen: format!("[::]:{}", cli.base_port),
-        public_addr: format!("::ffff:127.0.0.1:{}", cli.base_port),
+        listen: format!("[::]:{}", cli.base_port + cli.validator_index as u16),
+        public_addr: format!("::ffff:127.0.0.1:{}", cli.base_port + cli.validator_index as u16),
         data_path: cli.session_dir.clone(),
         log_level: "info".to_string(),
     }

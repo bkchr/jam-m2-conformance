@@ -194,6 +194,23 @@ pub async fn dial_nut(
     let wire = frame(UP, &handshake.encode());
     trace_record(peer, UP, u64::from(send.id()), &wire, &trace, TraceDir::Tx);
     let _ = send.write_all(&wire).await;
+
+    // Announce the reference blocks (skip genesis) so the NUT has something to
+    // sync and re-announce (L1 authoring is announced like a real author).
+    let final_block = Final {
+        header_hash: HeaderHash::from(genesis_hash),
+        slot: 0,
+    };
+    for block in ref_chain.chain_blocks().iter().skip(1) {
+        record(&obs, peer, ObsKind::Up0Announce);
+        let ann = Announcement {
+            header: (**block.header).clone(),
+            final_block,
+        };
+        let wire = frame(UP, &ann.encode());
+        trace_record(peer, UP, u64::from(send.id()), &wire, &trace, TraceDir::Tx);
+        let _ = send.write_all(&wire).await;
+    }
     let _ = send.finish();
 
     // Serve the NUT's CE 128 / CE 129 requests on the dialed connection.

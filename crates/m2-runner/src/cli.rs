@@ -12,9 +12,10 @@ pub struct Cli {
     /// Run seed: deterministic key/spec derivation (§4 step 1).
     #[arg(long, default_value_t = 1)]
     pub seed: u64,
-    /// NUT validator index. P0 runs use 0 (the on-chain key derivation in
-    /// `spec::tiny_spec` hard-codes the trivial keysets); L7 rotates this.
-    #[arg(long, default_value_t = 0)]
+    /// NUT validator index. Defaults to 5, not 0: the preferred-initiator rule
+    /// is degenerate for trivial keys at index 0 (the NUT is never preferred,
+    /// so NUT-initiated L0 checks can never fire). L7 rotates this.
+    #[arg(long, default_value_t = 5)]
     pub validator_index: usize,
     /// Base port: the NUT listens on this port, the five emulated validators
     /// on `base+1 ..= base+5`.
@@ -120,7 +121,7 @@ mod tests {
         assert_eq!(cli.seed, 7);
         assert_eq!(cli.base_port, 41000);
         assert_eq!(cli.session_dir, PathBuf::from("/tmp/x"));
-        assert_eq!(cli.validator_index, 0);
+        assert_eq!(cli.validator_index, 5);
         assert_eq!(cli.startup_timeout, 30);
         assert!(!cli.dry_run);
         assert_eq!(cli.preset, Preset::Polkajam);
