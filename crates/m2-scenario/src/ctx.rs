@@ -44,6 +44,10 @@ pub struct DeliveredTicket {
 }
 
 /// Facts the L1 (block authoring) lane reads.
+///
+/// `Clone` lets a `dsl::Check` closure (which must be `'static`) capture an
+/// owned snapshot of the facts it reads.
+#[derive(Clone)]
 pub struct L1Ctx {
     pub reference_best: [u8; 32],
     pub reference_block_hashes: Vec<[u8; 32]>,
@@ -106,11 +110,19 @@ pub struct NutTicketFacts {
 }
 
 /// Facts the L2 (Safrole tickets) lane reads.
+///
+/// `Clone` lets a `dsl::Check` closure (which must be `'static`) capture an
+/// owned snapshot of the facts it reads.
+#[derive(Clone)]
 pub struct L2Ctx {
     pub target_epoch: u32,
     pub epoch_start_slot: u32,
     pub emu_plan: Vec<EmuTicket>,
     pub nut_tickets: Vec<NutTicketFacts>,
+    /// Ticket ids in the NUT's authored block's ticket extrinsic.
+    pub nut_block_ticket_ids: Vec<[u8; 32]>,
+    /// Slot of the NUT's authored block (epoch-tail inclusion rule).
+    pub nut_block_slot: u32,
 }
 
 impl L2Ctx {
@@ -234,6 +246,8 @@ mod tests {
                 verified: true,
                 received_at_ms: 2000,
             }],
+            nut_block_ticket_ids: vec![[6u8; 32]],
+            nut_block_slot: 12,
         };
         assert_eq!(l2.target_epoch, 3);
         assert_eq!(l2.epoch_start_slot, 10);
@@ -251,6 +265,8 @@ mod tests {
         assert_eq!(l2.nut_tickets[0].peer, 1);
         assert!(l2.nut_tickets[0].verified);
         assert_eq!(l2.nut_tickets[0].received_at_ms, 2000);
+        assert_eq!(l2.nut_block_ticket_ids, vec![[6u8; 32]]);
+        assert_eq!(l2.nut_block_slot, 12);
 
         assert!(l2.proxy_is_nut(&emu), "proxy == NUT index is the NUT");
         assert!(
