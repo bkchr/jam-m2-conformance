@@ -6,6 +6,7 @@ pub mod cli;
 pub mod connectivity;
 pub mod keygen;
 pub mod launch;
+pub mod real;
 pub mod report;
 pub mod run;
 pub mod scenario;

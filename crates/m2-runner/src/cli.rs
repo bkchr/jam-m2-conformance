@@ -30,6 +30,13 @@ pub struct Cli {
     /// Seconds to wait for the NUT's QUIC port to come up (§4 step 2).
     #[arg(long, default_value_t = 30)]
     pub startup_timeout: u64,
+    /// Seconds of JAMNP observation before evaluation (§4 step 4).
+    #[arg(long, default_value_t = 60)]
+    pub observe_secs: u64,
+    /// Comma-separated lane set to run (parsed for this pass; selection wiring
+    /// is iterative).
+    #[arg(long, default_value = "l0,l1,l2")]
+    pub lanes: String,
     /// Skip NUT launch and connectivity; fabricate a conforming observation
     /// log so the scenario checks pass and the report renders. The
     /// deterministic S4 baseline (no network, no processes).
@@ -123,11 +130,32 @@ mod tests {
         assert_eq!(cli.session_dir, PathBuf::from("/tmp/x"));
         assert_eq!(cli.validator_index, 5);
         assert_eq!(cli.startup_timeout, 30);
+        assert_eq!(cli.observe_secs, 60);
+        assert_eq!(cli.lanes, "l0,l1,l2");
         assert!(!cli.dry_run);
         assert_eq!(cli.preset, Preset::Polkajam);
 
         let mock = Cli::parse_from(["m2-runner", "--preset", "mock", "--session-dir", "/tmp/x"]);
         assert_eq!(mock.preset, Preset::Mock);
+    }
+
+    #[test]
+    fn cli_lanes_and_observe_parse() {
+        let cli = Cli::parse_from([
+            "m2-runner",
+            "--observe-secs",
+            "45",
+            "--lanes",
+            "l1,l2",
+            "--session-dir",
+            "/tmp/x",
+        ]);
+        assert_eq!(cli.observe_secs, 45);
+        assert_eq!(cli.lanes, "l1,l2");
+
+        let defaults = Cli::parse_from(["m2-runner", "--session-dir", "/tmp/x"]);
+        assert_eq!(defaults.observe_secs, 60);
+        assert_eq!(defaults.lanes, "l0,l1,l2");
     }
 
     #[tokio::test]
@@ -140,6 +168,8 @@ mod tests {
             preset: Preset::Mock,
             session_dir: dir.path().clone(),
             startup_timeout: 30,
+            observe_secs: 60,
+            lanes: "l0,l1,l2".to_string(),
             dry_run: true,
         };
         let code = run(cli).await;
@@ -188,6 +218,8 @@ mod tests {
             preset: Preset::Mock,
             session_dir: dir.clone(),
             startup_timeout: 30,
+            observe_secs: 60,
+            lanes: "l0,l1,l2".to_string(),
             dry_run: true,
         };
         let cli = mk(dir.path());
@@ -234,6 +266,8 @@ mod tests {
             preset: Preset::Mock,
             session_dir: dir.path().clone(),
             startup_timeout: 1,
+            observe_secs: 60,
+            lanes: "l0,l1,l2".to_string(),
             dry_run: false,
         };
         let code = run(cli).await;
@@ -269,7 +303,10 @@ mod tests {
         // CERT_SAN_OK deliberately omitted.
         drop(push); // end the closure's borrows so `log` can be read
 
-        let eval = crate::scenario::evaluate(&log, 3);
+        let eval = crate::scenario::evaluate(
+            &log,
+            &crate::scenario::fabricated_run_ctx(3).expect("fabricated run ctx builds"),
+        );
         assert!(
             !eval.all_hard_passed,
             "missing HARD observation must fail the run"

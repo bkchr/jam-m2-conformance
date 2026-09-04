@@ -7,19 +7,19 @@ use std::time::{Duration, Instant};
 
 use jamnp_s::cert::san_for_key;
 use m2_emu::emu::Emulator;
+use m2_emu::ticket_io::plan_for_peer;
 use m2_reference::chain::RefChain;
 
 use crate::cli::{Cli, Preset};
 use crate::connectivity::{self, ConnectivityPlan, ProbeOutcome};
 use crate::keygen;
 use crate::launch::{self, LaunchConfig, NutProcess};
+use crate::real::{build_real_run_ctx, compute_ticket_plan, RealRunData};
 use crate::report::{self, Finding};
-use crate::scenario::{evaluate, fabricated_obs_log, Evaluation, ObsSource};
+use crate::scenario::{evaluate, fabricated_obs_log, fabricated_run_ctx, Evaluation, ObsSource};
 use crate::spec;
 
 /// How many emulated slots the dry-run baseline pretends were authored.
-/// Seconds to let JAMNP traffic accumulate before evaluating the scenario.
-const OBSERVATION_WINDOW: u64 = 30;
 const DRY_RUN_BLOCK_COUNT: usize = 3;
 
 /// Errors from a run, mapped to exit codes (startup = 1, internal = 2).
@@ -103,7 +103,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     }
 
     // §4.4 scenario: reference chain + emulator, or the fabricated dry-run log.
-    let (source, reference_block_count, dial_tasks) = if cli.dry_run {
+    let (source, reference_block_count, dial_tasks, real_run) = if cli.dry_run {
         (
             ObsSource::Fabricated {
                 log: fabricated_obs_log(DRY_RUN_BLOCK_COUNT),
@@ -111,6 +111,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             },
             DRY_RUN_BLOCK_COUNT,
             Vec::new(),
+            None,
         )
     } else {
         let mut ref_chain = RefChain::tiny(emu_range.clone()).map_err(internal)?;
@@ -121,7 +122,12 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             .map_err(internal)?;
         let obs = emu.obs();
         let trace = emu.trace();
+        let nut_blocks = emu.nut_blocks();
         let _accept = emu.accept_loop(ref_chain.clone());
+        // L2: compute the emulated ticket plan for the target epoch so each
+        // dialed connection can deliver its own tickets to the NUT.
+        let (ticket_ctx, ticket_plan, target_epoch) =
+            compute_ticket_plan(&ref_chain, nut_index).map_err(internal)?;
         // Drive the preferred-initiator connectivity: emulated validators that
         // are the preferred initiator dial the NUT now; the rest wait the 5 s
         // grace then dial anyway (a soft finding).
@@ -129,8 +135,10 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         for i in plan.initiate_now {
             let trace = trace.clone();
             let obs = obs.clone();
+            let nut_blocks = nut_blocks.clone();
             let ref_chain = ref_chain.clone();
             let nut_san = nut_san.clone();
+            let peer_plan = plan_for_peer(&ticket_plan, emu_range.start + i);
             dial_tasks.push(tokio::spawn(async move {
                 let _ = m2_emu::emu::dial_nut(
                     emu_range.start,
@@ -141,6 +149,8 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                     ref_chain,
                     trace,
                     obs,
+                    nut_blocks,
+                    peer_plan,
                 )
                 .await;
             }));
@@ -148,8 +158,10 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         for i in plan.wait_then_connect {
             let trace = trace.clone();
             let obs = obs.clone();
+            let nut_blocks = nut_blocks.clone();
             let ref_chain = ref_chain.clone();
             let nut_san = nut_san.clone();
+            let peer_plan = plan_for_peer(&ticket_plan, emu_range.start + i);
             dial_tasks.push(tokio::spawn(async move {
                 tokio::time::sleep(connectivity::INITIATOR_GRACE).await;
                 let _ = m2_emu::emu::dial_nut(
@@ -161,10 +173,19 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                     ref_chain,
                     trace,
                     obs,
+                    nut_blocks,
+                    peer_plan,
                 )
                 .await;
             }));
         }
+        let real_run = RealRunData {
+            ref_chain,
+            nut_blocks,
+            ticket_ctx,
+            plan: ticket_plan,
+            target_epoch,
+        };
         (
             ObsSource::Emulator {
                 obs,
@@ -173,17 +194,30 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             },
             count,
             dial_tasks,
+            Some(real_run),
         )
     };
 
     if !dial_tasks.is_empty() {
-        tokio::time::sleep(Duration::from_secs(OBSERVATION_WINDOW)).await;
+        tokio::time::sleep(Duration::from_secs(cli.observe_secs)).await;
     }
     drop(dial_tasks);
 
+    let run_ctx = match &source {
+        ObsSource::Emulator { obs, trace, .. } => {
+            let data = real_run.as_ref().ok_or_else(|| {
+                RunError::Internal("emulator run missing reference run data".into())
+            })?;
+            build_real_run_ctx(data, &lock(obs), &lock(trace), reference_block_count)
+        }
+        ObsSource::Fabricated { .. } => {
+            fabricated_run_ctx(reference_block_count).map_err(internal)?
+        }
+    };
+
     let evaluation = match &source {
-        ObsSource::Emulator { obs, .. } => evaluate(&lock(obs), reference_block_count),
-        ObsSource::Fabricated { log, .. } => evaluate(log, reference_block_count),
+        ObsSource::Emulator { obs, .. } => evaluate(&lock(obs), &run_ctx),
+        ObsSource::Fabricated { log, .. } => evaluate(log, &run_ctx),
     };
 
     // §4.6 teardown: kill the NUT (stdout/stderr already collected by `spawn`).

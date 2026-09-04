@@ -21,12 +21,14 @@ use jamnp_s::{
     trace::{mono_ts, wall_ts, Direction as TraceDir, Trace, TraceRecord},
 };
 use m2_reference::chain::RefChain;
+use m2_reference::tickets::ScheduledTicket;
 use m2_scenario::ctx::NutBlock;
 use m2_scenario::dsl::{Obs, ObsKind, ObsLog};
 use m2_scenario::scenarios::l0;
 use tokio::task::JoinHandle;
 
 use crate::nut_block::{fetch_block, should_fetch};
+use crate::ticket_io::spawn_ticket_sender;
 
 /// Errors raised while building or running the emulated validators.
 #[derive(Debug, thiserror::Error)]
@@ -179,6 +181,7 @@ pub async fn dial_nut(
     trace: Arc<Mutex<Trace>>,
     obs: Arc<Mutex<ObsLog>>,
     nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
+    plan: Vec<ScheduledTicket>,
 ) -> Result<(), EmuError> {
     let index = emu_start + peer_index;
     let secret = SecretKeyset::trivial(index as u32).ed25519;
@@ -237,6 +240,15 @@ pub async fn dial_nut(
     }
     // UP 0 is a persistent stream: keep the send half open for future
     // announcements rather than finishing it (simple.md:108-111).
+
+    // Deliver the peer's L2 tickets on their own streams, concurrently with the handler.
+    tokio::spawn(spawn_ticket_sender(
+        connection.clone(),
+        plan,
+        trace.clone(),
+        obs.clone(),
+        peer,
+    ));
 
     // Serve the NUT.s CE 128 / CE 129 requests on the dialed connection.
     handle_connection(
