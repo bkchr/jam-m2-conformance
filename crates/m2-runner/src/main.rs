@@ -1,4 +1,7 @@
-fn main() {
-    // Placeholder entry point (implemented in T20). Intentionally minimal.
-    println!("m2-runner scaffold");
+use clap::Parser;
+
+#[tokio::main]
+async fn main() {
+    let cli = m2_runner::cli::Cli::parse();
+    std::process::exit(m2_runner::cli::run(cli).await);
 }

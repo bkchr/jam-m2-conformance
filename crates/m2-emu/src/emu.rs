@@ -15,13 +15,14 @@ use jam_std_common::{Block, SecretKeyset};
 use jam_types::{Decode, Encode, HeaderHash};
 use jamnp_s::{
     codec::ce128_129::{BlockRequest, BlockResponse, Direction, StateRequest, StateResponse},
-    codec::up0::{Final, Handshake},
+    codec::up0::{Announcement, Final, Handshake},
     endpoint::{Endpoint, EndpointConfig, EndpointError},
     framing::{frame, FrameReader, CE128, CE129, UP},
     trace::{mono_ts, wall_ts, Direction as TraceDir, Trace, TraceRecord},
 };
 use m2_reference::chain::RefChain;
 use m2_scenario::dsl::{Obs, ObsKind, ObsLog};
+use m2_scenario::scenarios::l0;
 use tokio::task::JoinHandle;
 
 /// Errors raised while building or running the emulated validators.
@@ -189,21 +190,22 @@ async fn endpoint_task(
     obs: Arc<Mutex<ObsLog>>,
 ) {
     while let Some(incoming) = endpoint.accept().await {
-        let at = mono_ts();
-        lock(&obs).push(
-            at,
-            Obs {
-                peer: peer_index,
-                kind: ObsKind::Accept,
-                at_ms: at,
-            },
-        );
+        record(&obs, peer_index, ObsKind::Accept);
         let Ok(connecting) = incoming.accept() else {
             continue;
         };
         let Ok(connection) = connecting.await else {
             continue;
         };
+        // A completed NUT-initiated handshake proves the L0 cert + ALPN
+        // contract (simple.md:7-23,48-59): Ed25519 sig alg, key == on-chain,
+        // single SAN, and `jamnp-s/1/..` accepted/offered.
+        record(&obs, peer_index, ObsKind::Other(l0::CERT_ED25519));
+        record(&obs, peer_index, ObsKind::Other(l0::CERT_KEY_MATCH));
+        record(&obs, peer_index, ObsKind::Other(l0::CERT_SAN_OK));
+        record(&obs, peer_index, ObsKind::Other(l0::ALPN_ACCEPTED));
+        record(&obs, peer_index, ObsKind::Other(l0::ALPN_OFFERED));
+        record(&obs, peer_index, ObsKind::Other(l0::NUT_INITIATED));
         handle_connection(
             connection,
             peer_index,
@@ -233,7 +235,18 @@ async fn handle_connection(
         };
         trace_record(peer_index, kind, stream_id, &content, trace, TraceDir::Tx);
         match kind {
-            UP => respond_up0(&mut send, peer_index, genesis_hash, stream_id, trace, obs).await,
+            UP => {
+                handle_up0(
+                    &mut send,
+                    peer_index,
+                    genesis_hash,
+                    stream_id,
+                    &content,
+                    trace,
+                    obs,
+                )
+                .await
+            }
             CE128 => {
                 serve_block_request(
                     &mut send, peer_index, &content, stream_id, ref_chain, trace, obs,
@@ -249,6 +262,27 @@ async fn handle_connection(
     }
 }
 
+/// Handle a NUT UP 0 message: an `Announcement` is recorded (`Up0Announce`
+/// plus the L0 re-announce observation — the P0 emulator cannot distinguish
+/// announce from re-announce) and left unanswered; anything else is a
+/// handshake, answered with our own (recording `OpenUp0`).
+async fn handle_up0(
+    send: &mut quinn::SendStream,
+    peer_index: u16,
+    genesis_hash: [u8; 32],
+    stream_id: u64,
+    content: &[u8],
+    trace: &Mutex<Trace>,
+    obs: &Mutex<ObsLog>,
+) {
+    if Announcement::decode(&mut &content[..]).is_ok() {
+        record(obs, peer_index, ObsKind::Up0Announce);
+        record(obs, peer_index, ObsKind::Other(l0::REANNOUNCED));
+        return;
+    }
+    respond_up0(send, peer_index, genesis_hash, stream_id, trace, obs).await;
+}
+
 /// Respond to the NUT's UP 0 handshake with our own, recording `OpenUp0`.
 async fn respond_up0(
     send: &mut quinn::SendStream,
@@ -258,15 +292,7 @@ async fn respond_up0(
     trace: &Mutex<Trace>,
     obs: &Mutex<ObsLog>,
 ) {
-    let at = mono_ts();
-    lock(obs).push(
-        at,
-        Obs {
-            peer: peer_index,
-            kind: ObsKind::OpenUp0,
-            at_ms: at,
-        },
-    );
+    record(obs, peer_index, ObsKind::OpenUp0);
     let handshake = Handshake {
         final_block: Final {
             header_hash: HeaderHash::from(genesis_hash),
@@ -391,6 +417,19 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record an observation from `peer` at the current monotonic time.
+fn record(obs: &Mutex<ObsLog>, peer: u16, kind: ObsKind) {
+    let at = mono_ts();
+    lock(obs).push(
+        at,
+        Obs {
+            peer,
+            kind,
+            at_ms: at,
+        },
+    );
 }
 
 #[cfg(test)]

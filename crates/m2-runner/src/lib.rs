@@ -7,6 +7,8 @@ pub mod connectivity;
 pub mod keygen;
 pub mod launch;
 pub mod report;
+pub mod run;
+pub mod scenario;
 pub mod spec;
 
 /// Session directory layout as in `scripts/fuzz-workflow.py`:
