@@ -1,6 +1,6 @@
 /target
 **/target
-/third_party/polkajam/target
+/third_party
 /sessions
 *.rs.bk
 Cargo.lock.orig
