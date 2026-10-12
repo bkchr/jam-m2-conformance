@@ -6,8 +6,6 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use ed25519_consensus::SigningKey;
-use jam_std_common::SecretKeyset;
-use jamnp_s::cert::san_for_key;
 use jamnp_s::endpoint::{Endpoint, EndpointConfig, EndpointError};
 use jamnp_s::preferred::preferred_initiator;
 
@@ -109,18 +107,22 @@ pub async fn run_connectivity(
     nut_addr: SocketAddr,
     emu_addrs: &[SocketAddr],
     genesis_hash: [u8; 32],
+    nut_san: &str,
 ) -> Vec<ProbeOutcome> {
-    // The NUT is validator 0 with a deterministic keyset (DESIGN.md §4 step 1),
-    // so its cert SAN is re-derivable for the probe. `emu_addrs` is reserved
-    // for T20, when the runner spawns the emulator connections themselves.
-    let nut_san = san_for_key(&SecretKeyset::trivial(0).ed25519.0.verification_key());
+    // The NUT's SAN is derived from its *configured* validator index by the
+    // caller. Deriving it here from `trivial(0)` — as this did until the CLI
+    // default moved to index 5 — makes every probe demand validator 0's
+    // certificate, so each one fails `NotValidForName` and the run reports a
+    // spurious "could not handshake" finding per emulated validator.
+    // `emu_addrs` is reserved for when the runner spawns the emulator
+    // connections themselves.
     let mut outcomes = Vec::with_capacity(plan.initiate_now.len() + plan.wait_then_connect.len());
     for _ in &plan.initiate_now {
-        outcomes.push(probe_nut(nut_addr, &nut_san, genesis_hash, STARTUP_TIMEOUT).await);
+        outcomes.push(probe_nut(nut_addr, nut_san, genesis_hash, STARTUP_TIMEOUT).await);
     }
     tokio::time::sleep(INITIATOR_GRACE).await;
     for _ in &plan.wait_then_connect {
-        outcomes.push(probe_nut(nut_addr, &nut_san, genesis_hash, STARTUP_TIMEOUT).await);
+        outcomes.push(probe_nut(nut_addr, nut_san, genesis_hash, STARTUP_TIMEOUT).await);
     }
     let _ = emu_addrs;
     outcomes
@@ -129,6 +131,7 @@ pub async fn run_connectivity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jamnp_s::cert::san_for_key;
 
     const GENESIS: [u8; 32] = [
         0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,

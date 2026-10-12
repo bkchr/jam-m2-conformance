@@ -249,10 +249,10 @@ pub async fn dial_nut(
         connection,
         peer,
         genesis_hash,
-        &ref_chain,
-        &trace,
-        &obs,
-        &nut_blocks,
+        ref_chain,
+        trace,
+        obs,
+        nut_blocks,
     )
     .await;
     Ok(())
@@ -322,23 +322,85 @@ async fn endpoint_task(
         record(&obs, peer_index, ObsKind::Other(l0::ALPN_ACCEPTED));
         record(&obs, peer_index, ObsKind::Other(l0::ALPN_OFFERED));
         record(&obs, peer_index, ObsKind::Other(l0::NUT_INITIATED));
-        handle_connection(
-            connection,
-            peer_index,
-            genesis_hash,
-            &ref_chain,
-            &trace,
-            &obs,
-            &nut_blocks,
-        )
-        .await;
+        // One task per connection: with UP 0 persistent the handler runs for
+        // the lifetime of the connection, so awaiting it here would stall the
+        // accept loop and the peer's redials would never be answered.
+        let ref_chain = Arc::clone(&ref_chain);
+        let trace = Arc::clone(&trace);
+        let obs = Arc::clone(&obs);
+        let nut_blocks = Arc::clone(&nut_blocks);
+        tokio::spawn(async move {
+            handle_connection(
+                connection,
+                peer_index,
+                genesis_hash,
+                ref_chain,
+                trace,
+                obs,
+                nut_blocks,
+            )
+            .await;
+        });
     }
 }
 
-/// Run the L0 reactive handler on one accepted connection: respond to the NUT's
-/// UP 0 handshake and serve CE 128 / CE 129 requests.
+/// Application error code used when the emulator refuses a stream: an unknown
+/// or refused stream kind, a malformed frame, or a kind outside this subset.
+/// The stream is reset; the connection stays up (DESIGN.md `:477`).
+const STREAM_REFUSED: u32 = 1;
+
+/// Run the L0 reactive handler on one connection, one task per accepted stream.
+///
+/// Streams on a JAMNP-S connection are concurrent and independent, and UP 0 is
+/// *static*: it stays open for the lifetime of the connection, and closing a
+/// peer's incoming static stream is misbehaviour (`simple.md:108-111`). So the
+/// accept loop must neither serve streams one at a time — a persistent stream
+/// would block every later one — nor drop a stream's halves once its first
+/// message is handled. Each accepted stream gets its own task instead, living
+/// exactly as long as the peer keeps the stream open.
 async fn handle_connection(
     connection: quinn::Connection,
+    peer_index: u16,
+    genesis_hash: [u8; 32],
+    ref_chain: Arc<RefChain>,
+    trace: Arc<Mutex<Trace>>,
+    obs: Arc<Mutex<ObsLog>>,
+    nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
+) {
+    while let Ok((send, recv)) = connection.accept_bi().await {
+        let connection = connection.clone();
+        let ref_chain = Arc::clone(&ref_chain);
+        let trace = Arc::clone(&trace);
+        let obs = Arc::clone(&obs);
+        let nut_blocks = Arc::clone(&nut_blocks);
+        tokio::spawn(async move {
+            handle_stream(
+                connection,
+                send,
+                recv,
+                peer_index,
+                genesis_hash,
+                &ref_chain,
+                &trace,
+                &obs,
+                &nut_blocks,
+            )
+            .await;
+        });
+    }
+}
+
+/// Serve one accepted stream for its whole lifetime.
+///
+/// The stream-kind byte arrives once, on the opening frame
+/// (`simple.md:122-124`), and selects the handler. CE streams are ephemeral:
+/// one request, one response, FIN. UP 0 is persistent: keep reading messages
+/// until the peer closes it, and never drop the halves first.
+#[allow(clippy::too_many_arguments)]
+async fn handle_stream(
+    connection: quinn::Connection,
+    mut send: quinn::SendStream,
+    recv: quinn::RecvStream,
     peer_index: u16,
     genesis_hash: [u8; 32],
     ref_chain: &RefChain,
@@ -346,44 +408,84 @@ async fn handle_connection(
     obs: &Mutex<ObsLog>,
     nut_blocks: &Mutex<Vec<NutBlock>>,
 ) {
-    while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-        let stream_id = u64::from(send.id());
-        let Ok(Some((kind, content))) = read_frame(&mut recv).await else {
-            continue;
-        };
-        trace_record(peer_index, kind, stream_id, &content, trace, TraceDir::Tx);
-        match kind {
-            UP => {
-                handle_up0(
-                    &connection,
-                    &mut send,
-                    peer_index,
-                    genesis_hash,
-                    ref_chain,
-                    stream_id,
-                    &content,
-                    trace,
-                    obs,
-                    nut_blocks,
-                )
-                .await
+    let stream_id = u64::from(send.id());
+    let mut reader = StreamReader::new(recv);
+    let (kind, content) = match reader.next().await {
+        Ok(Some(frame)) => frame,
+        // A clean close before any message: nothing to serve, nothing to refuse.
+        Ok(None) => return,
+        // An unknown or refused kind byte, or a malformed length prefix.
+        Err(_) => return refuse(&mut send, &mut reader),
+    };
+    trace_record(peer_index, kind, stream_id, &content, trace, TraceDir::Tx);
+    match kind {
+        UP => {
+            handle_up0(
+                &connection,
+                &mut send,
+                peer_index,
+                genesis_hash,
+                ref_chain,
+                stream_id,
+                &content,
+                trace,
+                obs,
+                nut_blocks,
+            )
+            .await;
+            // UP 0 is static for the lifetime of the connection: serve every
+            // further message until the peer closes the stream. Returning here
+            // would drop both halves, which the peer reads as its incoming
+            // static stream being closed — misbehaviour, and it disconnects.
+            loop {
+                match reader.next().await {
+                    Ok(Some((_, content))) => {
+                        trace_record(peer_index, UP, stream_id, &content, trace, TraceDir::Tx);
+                        handle_up0(
+                            &connection,
+                            &mut send,
+                            peer_index,
+                            genesis_hash,
+                            ref_chain,
+                            stream_id,
+                            &content,
+                            trace,
+                            obs,
+                            nut_blocks,
+                        )
+                        .await;
+                    }
+                    // The peer closed its half: the stream is done, not refused.
+                    Ok(None) => break,
+                    Err(_) => {
+                        refuse(&mut send, &mut reader);
+                        break;
+                    }
+                }
             }
-            CE128 => {
-                serve_block_request(
-                    &mut send, peer_index, &content, stream_id, ref_chain, trace, obs,
-                )
-                .await
-            }
-            CE129 => {
-                serve_state_request(&mut send, peer_index, &content, stream_id, trace, obs).await
-            }
-            CE131 | CE132 => {
-                crate::ticket_io::handle_inbound_ticket(kind, &content, peer_index, obs).await;
-            }
-            // Spec-known-but-refused and unknown kinds: reset the stream.
-            _ => {}
         }
+        CE128 => {
+            serve_block_request(
+                &mut send, peer_index, &content, stream_id, ref_chain, trace, obs,
+            )
+            .await
+        }
+        CE129 => serve_state_request(&mut send, peer_index, &content, stream_id, trace, obs).await,
+        CE131 | CE132 => {
+            crate::ticket_io::handle_inbound_ticket(kind, &content, peer_index, obs).await;
+        }
+        // Spec-known kinds outside this subset: reset rather than drop, so the
+        // refusal is observable to the NUT (DESIGN.md `:477`).
+        _ => refuse(&mut send, &mut reader),
     }
+}
+
+/// Reset both halves of a stream the emulator will not serve, leaving the
+/// connection up.
+fn refuse(send: &mut quinn::SendStream, reader: &mut StreamReader) {
+    let code = quinn::VarInt::from_u32(STREAM_REFUSED);
+    let _ = send.reset(code);
+    reader.stop(code);
 }
 
 /// Handle a NUT UP 0 message: an `Announcement` is recorded (`Up0Announce`
@@ -544,36 +646,75 @@ async fn serve_state_request(
     record(obs, peer_index, ObsKind::Other(l0::CE129_BOUNDARY_ORDER));
     record(obs, peer_index, ObsKind::Other(l0::CE129_SIZE_CAP));
     record(obs, peer_index, ObsKind::Other(l0::CE129_LEN_PREFIXED));
-    let wire = frame_message(&response.encode());
-    trace_record(peer_index, CE129, stream_id, &wire, trace, TraceDir::Rx);
-    let _ = send.write_all(&wire).await;
+    // Two messages, then FIN (`simple.md:300-302`): the boundary nodes first,
+    // the key/value pairs second. Both are size-implied sequences, so an empty
+    // reply is two *empty* messages — packing them into one, or prefixing
+    // either with its length, makes a conforming requester read the prefix as
+    // the first item and reject the responder.
+    let (nodes, entries) = response.messages();
+    for payload in [nodes, entries] {
+        let wire = frame_message(&payload);
+        trace_record(peer_index, CE129, stream_id, &wire, trace, TraceDir::Rx);
+        if send.write_all(&wire).await.is_err() {
+            return;
+        }
+    }
     let _ = send.finish();
 }
 
-/// Read the next complete frame from `recv`, or `None` at end of stream.
-pub(crate) async fn read_frame(
-    recv: &mut quinn::RecvStream,
-) -> Result<Option<(u8, Vec<u8>)>, EmuError> {
-    let mut reader = FrameReader::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        match recv.read(&mut buf).await {
-            Ok(Some(n)) => {
-                reader.push(&buf[..n]);
-                match reader.next_frame() {
-                    Ok(Some(item)) => return Ok(Some(item)),
-                    Ok(None) => continue,
-                    Err(e) => return Err(EmuError::Protocol(format!("{e:?}"))),
-                }
-            }
-            Ok(None) => {
-                reader
-                    .finish()
-                    .map_err(|e| EmuError::Protocol(format!("{e:?}")))?;
-                return Ok(None);
-            }
-            Err(e) => return Err(EmuError::Protocol(format!("{e:?}"))),
+/// Incremental frame reader over one QUIC receive stream.
+///
+/// The [`FrameReader`] is kept across reads rather than rebuilt per message: a
+/// single `read` routinely delivers the opening frame together with the bytes
+/// of the frames behind it, so a reader recreated per message silently drops
+/// everything that arrived alongside the first one. On a persistent stream that
+/// loses messages; on an ephemeral one it is invisible.
+pub(crate) struct StreamReader {
+    recv: quinn::RecvStream,
+    reader: FrameReader,
+    buf: [u8; 4096],
+}
+
+impl StreamReader {
+    /// Wrap a freshly accepted or opened receive stream.
+    pub(crate) fn new(recv: quinn::RecvStream) -> Self {
+        Self {
+            recv,
+            reader: FrameReader::new(),
+            buf: [0u8; 4096],
         }
+    }
+
+    /// The next complete message as `(kind, content)`, or `None` at a clean end
+    /// of stream. The kind byte is carried by the first frame only
+    /// (`simple.md:122-124`); later frames report the same kind.
+    pub(crate) async fn next(&mut self) -> Result<Option<(u8, Vec<u8>)>, EmuError> {
+        loop {
+            // Drain what is already buffered before waiting on the wire.
+            match self.reader.next_frame() {
+                Ok(Some(item)) => return Ok(Some(item)),
+                Ok(None) => {}
+                Err(e) => return Err(EmuError::Protocol(format!("{e:?}"))),
+            }
+            match self.recv.read(&mut self.buf).await {
+                Ok(Some(n)) => {
+                    let (buf, reader) = (&self.buf, &mut self.reader);
+                    reader.push(&buf[..n]);
+                }
+                Ok(None) => {
+                    self.reader
+                        .finish()
+                        .map_err(|e| EmuError::Protocol(format!("{e:?}")))?;
+                    return Ok(None);
+                }
+                Err(e) => return Err(EmuError::Protocol(format!("{e:?}"))),
+            }
+        }
+    }
+
+    /// Ask the peer to stop sending on this stream.
+    pub(crate) fn stop(&mut self, code: quinn::VarInt) {
+        let _ = self.recv.stop(code);
     }
 }
 

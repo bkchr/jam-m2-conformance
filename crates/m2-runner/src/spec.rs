@@ -12,9 +12,10 @@
 
 use std::path::Path;
 
-use codec::Encode;
+use codec::{DecodeAll, Encode};
 use jam_node::ChainSpec;
 use jam_std_common::{StorageKey, SystemKey, ValKeysets};
+use jam_types::BoundedFromFn;
 use serde::Serialize;
 
 /// Errors raised while building or writing chain specs.
@@ -56,7 +57,7 @@ pub fn tiny_spec(validator_ips: &[[u8; 16]], ports: &[u16]) -> Result<ChainSpec,
 
     // Rebuild the validator keysets with the requested metadata and patch the
     // three system keys that each carry a full `ValKeysets` copy.
-    let validators = ValKeysets::from_fn(|i| {
+    let validators = ValKeysets::from_fn_fill(|i| {
         let metadata = crate::keygen::metadata_for(i, validator_ips[i], ports[i]);
         jam_std_common::SecretKeyset::trivial(i as u32).public(metadata)
     });
@@ -66,9 +67,20 @@ pub fn tiny_spec(validator_ips: &[[u8; 16]], ports: &[u16]) -> Result<ChainSpec,
         StorageKey::from(SystemKey::Designates).0,
         StorageKey::from(SystemKey::PrevValidators).0,
     ];
+    // The Safrole state carries a *fourth* copy of the keyset (gamma_k, the
+    // next-epoch validators). polkajam resolves upcoming-epoch peer addresses
+    // from it, so leaving it unpatched makes the node dial the dev-spec
+    // addresses instead of ours and never connect to any emulated validator.
+    let safrole_key = StorageKey::from(SystemKey::Safrole).0;
     for (k, v) in state.iter_mut() {
         if keys.contains(k) {
             *v = Some(encoded.clone());
+        } else if *k == safrole_key {
+            let Some(bytes) = v.as_ref() else { continue };
+            let mut safrole = jam_std_common::SafroleState::decode_all(&mut bytes.as_slice())
+                .map_err(|e| SpecError::Storage(format!("decode safrole state: {e}")))?;
+            safrole.waiting_validators = validators.clone();
+            *v = Some(safrole.encode());
         }
     }
 

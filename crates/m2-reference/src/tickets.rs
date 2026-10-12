@@ -69,7 +69,7 @@ impl RefChain {
     }
 
     /// Generate tickets for every keystore-backed author (the emulated set,
-    /// excluding the NUT), one per attempt up to `tickets_attempts_number()`.
+    /// excluding the NUT), one per attempt up to `tickets_per_validator(max_val_count())`.
     pub fn generate_tickets(&self, ctx: &TicketCtx) -> Result<Vec<EmulatedTicket>, ChainError> {
         let pks: Vec<bandersnatch::Public> =
             ctx.pks.iter().map(|p| bandersnatch::Public(*p)).collect();
@@ -80,7 +80,7 @@ impl RefChain {
                 continue;
             }
             let prover = ring_vrf::RingContext::prover(&pks, author);
-            for attempt in 0..jam_types::tickets_attempts_number() {
+            for attempt in 0..jam_types::tickets_per_validator(jam_types::max_val_count()) {
                 let message = bandersnatch::Message::TicketSeal(Entropy(ctx.entropy), attempt);
                 let signature = keystore
                     .bandersnatch_ring_sign(pk, &message, &[], &prover)
@@ -184,7 +184,7 @@ mod tests {
         assert!(!tickets.is_empty(), "expected emulated tickets");
         assert_eq!(
             tickets.len(),
-            5 * jam_types::tickets_attempts_number() as usize
+            5 * jam_types::tickets_per_validator(jam_types::max_val_count()) as usize
         );
         for t in &tickets {
             assert!(

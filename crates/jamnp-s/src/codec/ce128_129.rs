@@ -4,7 +4,7 @@
 //! CE 128: BlockRequest  = Header Hash ++ Direction(1 byte) ++ Maximum Blocks(u32)
 //!         BlockResponse = [Block]
 //! CE 129: StateRequest  = Header Hash ++ Key(start,31) ++ Key(end,31) ++ Maximum Size(u32)
-//!         StateResponse = [Boundary Node] ++ [Key ++ Value]
+//!         StateResponse = [Boundary Node] then [Key ++ Value]  (two messages)
 //! ```
 //!
 //! GP types (`Block`, `HeaderHash`) are encoded with the SCALE (`jam-codec`)
@@ -67,12 +67,45 @@ impl Decode for BlockResponse {
 /// A state-trie boundary node returned by CE 129, covering the path from the
 /// root to the start key or to a returned entry (`simple.md:275-281`).
 ///
-/// Wire format is a length-prefixed byte sequence (`len ++ [u8]`), matching the
-/// `Boundary Node = As returned by B/L` encoding (`simple.md:293`).
-// TODO(P2): typed boundary node — model the GP B/L node (64-byte leaf or branch)
-// once jam-std-common exposes a state-trie node type.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
-pub struct BoundaryNode(pub Vec<u8>);
+/// `Boundary Node = As returned by B/L` (`simple.md:293`) — the GP state
+/// Merklization node, a **fixed 64-byte** leaf or branch. It carries no length
+/// prefix of its own: within [`BoundaryNodes`] the count follows from the
+/// message size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct BoundaryNode(pub [u8; 64]);
+
+impl Default for BoundaryNode {
+    fn default() -> Self {
+        Self([0u8; 64])
+    }
+}
+
+/// CE 129 response message 1: `[Boundary Node]` (`simple.md:300`).
+///
+/// Size-implied like CE 128's `[Block]` (`simple.md:148-153`): the nodes are
+/// concatenated with no collection length prefix, and the count follows from
+/// the message length. A response with no boundary nodes is an **empty
+/// message**, not a zero-length prefix.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BoundaryNodes(pub Vec<BoundaryNode>);
+
+impl Encode for BoundaryNodes {
+    fn encode_to<T: Output + ?Sized>(&self, dest: &mut T) {
+        for node in &self.0 {
+            node.encode_to(dest);
+        }
+    }
+}
+
+impl Decode for BoundaryNodes {
+    fn decode<I: Input>(input: &mut I) -> Result<Self, codec::Error> {
+        let mut nodes = Vec::new();
+        while input.remaining_len()?.is_some_and(|n| n > 0) {
+            nodes.push(BoundaryNode::decode(input)?);
+        }
+        Ok(Self(nodes))
+    }
+}
 
 /// CE 129 key/value pair: `Key ++ Value`, `Value = len++[u8]` (`simple.md:291,294`).
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -81,6 +114,31 @@ pub struct KeyValue {
     /// Merklization function (`simple.md:287-288`).
     pub key: [u8; 31],
     pub value: Vec<u8>,
+}
+
+/// CE 129 response message 2: `[Key ++ Value]` (`simple.md:301`).
+///
+/// Size-implied in the same way as [`BoundaryNodes`]; each pair carries its own
+/// value length prefix, the sequence does not.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeyValues(pub Vec<KeyValue>);
+
+impl Encode for KeyValues {
+    fn encode_to<T: Output + ?Sized>(&self, dest: &mut T) {
+        for entry in &self.0 {
+            entry.encode_to(dest);
+        }
+    }
+}
+
+impl Decode for KeyValues {
+    fn decode<I: Input>(input: &mut I) -> Result<Self, codec::Error> {
+        let mut entries = Vec::new();
+        while input.remaining_len()?.is_some_and(|n| n > 0) {
+            entries.push(KeyValue::decode(input)?);
+        }
+        Ok(Self(entries))
+    }
 }
 
 /// CE 129 request: `Header Hash ++ Key (Start) ++ Key (End) ++ Maximum Size`
@@ -93,18 +151,43 @@ pub struct StateRequest {
     pub max_size: u32,
 }
 
-/// CE 129 response: `[Boundary Node] ++ [Key ++ Value]` (`simple.md:300-301`).
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+/// A CE 129 response.
+///
+/// It is **two messages on the stream, then FIN** (`simple.md:300-302`):
+///
+/// ```text
+/// <-- [Boundary Node]
+/// <-- [Key ++ Value]
+/// <-- FIN
+/// ```
+///
+/// so this is not a single encodable struct — there is no `Encode` for it on
+/// purpose. [`StateResponse::messages`] produces the two payloads in order.
+/// Packing both into one message, or prefixing either sequence with its length,
+/// makes the responder look malformed to a conforming requester, which reads
+/// each sequence as items-until-end-of-message.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StateResponse {
     pub boundary_nodes: Vec<BoundaryNode>,
     /// Sorted by key (`simple.md:273`).
     pub entries: Vec<KeyValue>,
 }
 
+impl StateResponse {
+    /// The two response payloads, in the order they go on the stream.
+    pub fn messages(&self) -> (Vec<u8>, Vec<u8>) {
+        (
+            BoundaryNodes(self.boundary_nodes.clone()).encode(),
+            KeyValues(self.entries.clone()).encode(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockRequest, BlockResponse, BoundaryNode, Direction, KeyValue, StateRequest, StateResponse,
+        BlockRequest, BlockResponse, BoundaryNode, BoundaryNodes, Direction, KeyValue, KeyValues,
+        StateRequest, StateResponse,
     };
     use codec::{Decode, Encode};
     use jam_std_common::{Block, Extrinsic, Header, ImmutableHeader};
@@ -273,33 +356,74 @@ mod tests {
     }
 
     #[test]
-    fn state_response_boundary_nodes_before_entries() {
-        let node = BoundaryNode(vec![0x44; 64]);
+    fn state_response_is_two_size_implied_messages() {
         let entry = KeyValue {
             key: [0x55; 31],
             value: vec![0x66],
         };
         let resp = StateResponse {
-            boundary_nodes: vec![node.clone()],
+            boundary_nodes: vec![BoundaryNode([0x44; 64]), BoundaryNode([0x77; 64])],
             entries: vec![entry.clone()],
         };
-        let mut expected = vec![0x01]; // compact len 1: one boundary node
-        expected.extend_from_slice(&node.encode()); // compact(64) ++ [0x44; 64]
-        expected.push(0x01); // compact len 1: one entry
-        expected.extend_from_slice(&entry.encode()); // [0x55; 31] ++ compact(1) ++ [0x66]
-        assert_eq!(resp.encode(), expected);
+        let (nodes, entries) = resp.messages();
+
+        // Message 1 is exactly the nodes, back to back: no collection length
+        // prefix, and no per-node length prefix either (`simple.md:300`).
+        let mut expected_nodes = vec![0x44; 64];
+        expected_nodes.extend_from_slice(&[0x77; 64]);
+        assert_eq!(nodes, expected_nodes);
+        assert_eq!(nodes.len(), 128);
+
+        // Message 2 is the pairs back to back; each keeps its own value length
+        // prefix, the sequence does not (`simple.md:301`).
+        assert_eq!(entries, entry.encode());
+        assert_eq!(entries[..31], [0x55; 31]);
     }
 
     #[test]
-    fn state_response_roundtrip() {
+    fn empty_state_response_is_two_empty_messages() {
+        // The regression that kept a node from syncing: an empty reply used to
+        // go out as one 2-byte message of compact zeroes, which a conforming
+        // requester reads as the start of a 64-byte boundary node and rejects.
+        let (nodes, entries) = StateResponse::default().messages();
+        assert!(nodes.is_empty(), "no boundary nodes means an empty message");
+        assert!(entries.is_empty(), "no entries means an empty message");
+    }
+
+    #[test]
+    fn state_response_messages_roundtrip() {
         let resp = StateResponse {
-            boundary_nodes: vec![BoundaryNode(vec![7; 64]), BoundaryNode(vec![])],
-            entries: vec![KeyValue {
-                key: [1; 31],
-                value: vec![2, 3],
-            }],
+            boundary_nodes: vec![BoundaryNode([7; 64]), BoundaryNode([9; 64])],
+            entries: vec![
+                KeyValue {
+                    key: [1; 31],
+                    value: vec![2, 3],
+                },
+                KeyValue {
+                    key: [4; 31],
+                    value: vec![],
+                },
+            ],
         };
-        assert_eq!(decode::<StateResponse>(&resp.encode()), Ok(resp));
+        let (nodes, entries) = resp.messages();
+        assert_eq!(
+            decode::<BoundaryNodes>(&nodes),
+            Ok(BoundaryNodes(resp.boundary_nodes.clone()))
+        );
+        assert_eq!(decode::<KeyValues>(&entries), Ok(KeyValues(resp.entries)));
+    }
+
+    #[test]
+    fn boundary_nodes_reject_a_partial_node() {
+        // 64-byte items: anything that is not a whole number of them is a
+        // truncated message, not a short last node.
+        assert!(decode::<BoundaryNodes>(&[0u8; 63]).is_err());
+        assert!(decode::<BoundaryNodes>(&[0u8; 65]).is_err());
+        assert_eq!(
+            decode::<BoundaryNodes>(&[0u8; 128]),
+            Ok(BoundaryNodes(vec![BoundaryNode([0; 64]); 2]))
+        );
+        assert_eq!(decode::<BoundaryNodes>(&[]), Ok(BoundaryNodes(vec![])));
     }
 
     #[test]
@@ -329,7 +453,7 @@ mod tests {
         assert!(decode::<KeyValue>(&[0x33; 31]).is_err());
         // BlockResponse: length prefix claims a block that isn't there.
         assert!(decode::<BlockResponse>(&[0x01]).is_err());
-        // StateResponse: length prefix claims an entry that isn't there.
-        assert!(decode::<StateResponse>(&[0x00, 0x01]).is_err());
+        // KeyValues: a trailing key with no value length prefix.
+        assert!(decode::<KeyValues>(&[0x33; 31]).is_err());
     }
 }

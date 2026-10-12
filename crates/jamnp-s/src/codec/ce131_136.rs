@@ -186,22 +186,25 @@ mod tests {
         core::array::from_fn(|i| (i as u8).wrapping_add(offset))
     }
 
-    /// Minimal all-zero `WorkReport`. Encodes to `[0u8; 272]` (pinned below).
+    /// Minimal all-zero `WorkReport`. Encodes to `[0u8; 310]` (pinned below).
     fn sample_work_report() -> WorkReport {
         WorkReport {
             package_spec: WorkPackageSpec {
                 hash: [0u8; 32].into(),
                 len: 0,
                 erasure_root: [0u8; 32].into(),
+                erasure_shards: 0,
                 exports_root: [0u8; 32].into(),
                 exports_count: 0,
             },
             context: RefineContext {
                 anchor: [0u8; 32].into(),
+                anchor_slot: 0,
                 state_root: [0u8; 32].into(),
                 beefy_root: [0u8; 32].into(),
                 lookup_anchor: [0u8; 32].into(),
                 lookup_anchor_slot: 0,
+                lookup_anchor_state_root: [0u8; 32].into(),
                 prerequisites: Default::default(),
             },
             core_index: 0,
@@ -463,7 +466,7 @@ mod tests {
         let report = sample_work_report();
         let report_bytes = report.encode();
         // Pins the GP Work-Report encoding of the minimal report.
-        assert_eq!(report_bytes, vec![0u8; 272]);
+        assert_eq!(report_bytes, vec![0u8; 310]);
 
         let gwr = GuaranteedWorkReport {
             report,
@@ -476,7 +479,7 @@ mod tests {
         };
         let bytes = gwr.encode();
         let mut expected = Vec::new();
-        expected.extend_from_slice(&[0u8; 272]); // Work-Report
+        expected.extend_from_slice(&[0u8; 310]); // Work-Report
         expected.extend_from_slice(&[0x04, 0x03, 0x02, 0x01]); // Slot u32 LE
         expected.push(0x03); // compact(3) signatures
         for (idx, off) in [(0x0102u16, 0x00u8), (0x0304, 0x40), (0x0506, 0x80)] {
@@ -515,7 +518,7 @@ mod tests {
         let reply = WorkReportReply {
             report: sample_work_report(),
         };
-        assert_eq!(reply.encode(), vec![0u8; 272]);
+        assert_eq!(reply.encode(), vec![0u8; 310]);
     }
 
     #[test]
@@ -543,7 +546,7 @@ mod tests {
         let mut input: &[u8] = &[0x13; 16];
         assert!(WorkReportRequest::decode(&mut input).is_err());
         // Reply report truncated.
-        let mut bytes = vec![0u8; 100];
+        let bytes = [0u8; 100];
         let mut input: &[u8] = &bytes[..];
         assert!(WorkReportReply::decode(&mut input).is_err());
     }

@@ -98,7 +98,8 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             .map(|i| SocketAddr::from((Ipv4Addr::LOCALHOST, cli.base_port + i as u16)))
             .collect();
         let outcomes =
-            connectivity::run_connectivity(&plan, nut_addr, &emu_addrs, genesis_hash).await;
+            connectivity::run_connectivity(&plan, nut_addr, &emu_addrs, genesis_hash, &nut_san)
+                .await;
         conn_findings = connectivity_findings(&plan, &outcomes);
     }
 
