@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn l1_extrinsic_pass_and_missing() -> Result<(), m2_reference::chain::ChainError> {
         // Real reference-generated tickets: distinct, valid ring-VRF ids.
-        let chain = m2_reference::chain::RefChain::tiny(1..6)?;
+        let chain = m2_reference::chain::RefChain::tiny(0)?;
         let tctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&tctx)?;
         let (t1, t2, t3) = (&tickets[0], &tickets[1], &tickets[2]);

@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn should_fetch_known_and_unknown() {
-        let ref_chain = RefChain::tiny(1..6).expect("tiny chain builds");
+        let ref_chain = RefChain::tiny(0).expect("tiny chain builds");
         let known = ref_chain.chain_blocks()[0].header.hash().0;
         assert!(!should_fetch(&known, &ref_chain));
         assert!(should_fetch(&[0xee; 32], &ref_chain));
@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn fetch_decodes_served_block() {
-        let ref_chain = RefChain::tiny(1..6).expect("tiny chain builds");
+        let ref_chain = RefChain::tiny(0).expect("tiny chain builds");
         let block = ref_chain.chain_blocks()[0].clone();
         let response = BlockResponse {
             blocks: vec![block.clone()],
@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn nut_blocks_store_records_authors() {
-        let ref_chain = RefChain::tiny(1..6).expect("tiny chain builds");
+        let ref_chain = RefChain::tiny(0).expect("tiny chain builds");
         let block = ref_chain.chain_blocks()[0].clone();
         let obs = Mutex::new(ObsLog::new());
         let nut_blocks = Mutex::new(Vec::new());

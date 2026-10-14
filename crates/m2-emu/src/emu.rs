@@ -6,7 +6,6 @@
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
-    ops::Range,
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -53,7 +52,7 @@ pub enum EmuError {
     Decode(String),
 }
 
-/// The five emulated validators (indices `1..=5` by default).
+/// The emulated validators: every validator index except the NUT's.
 ///
 /// Each validator is one [`Endpoint`] bound to `127.0.0.1:(base_port + i)` with
 /// the Ed25519 identity `SecretKeyset::trivial(i)`. The endpoints stay alive
@@ -61,7 +60,9 @@ pub enum EmuError {
 /// accept task per endpoint.
 pub struct Emulator {
     endpoints: Vec<Arc<Endpoint>>,
-    emu_start: usize,
+    /// Validator index of each endpoint, positionally. Not a range: the NUT can
+    /// sit anywhere in the keyset, so the emulated indices straddle it.
+    emu_indices: Vec<usize>,
     genesis_hash: [u8; 32],
     trace: Arc<Mutex<Trace>>,
     obs: Arc<Mutex<ObsLog>>,
@@ -69,13 +70,13 @@ pub struct Emulator {
 }
 
 impl Emulator {
-    /// Bind one endpoint per emulated validator in `emu_keyset_indices`.
+    /// Bind one endpoint per emulated validator in `emu_indices`.
     ///
-    /// Endpoint `i` listens on `127.0.0.1:(base_port + i)` with the Ed25519
-    /// secret `SecretKeyset::trivial(i)` and identifies as a non-builder peer
-    /// for `genesis_hash`.
+    /// The endpoint for validator `i` listens on `127.0.0.1:(base_port + i)`
+    /// with the Ed25519 secret `SecretKeyset::trivial(i)` and identifies as a
+    /// non-builder peer for `genesis_hash`.
     pub async fn l0(
-        emu_keyset_indices: Range<usize>,
+        emu_indices: Vec<usize>,
         genesis_hash: [u8; 32],
         base_port: u16,
     ) -> Result<Self, EmuError> {
@@ -84,8 +85,8 @@ impl Emulator {
             builder: false,
         };
         let endpoints = async {
-            let mut endpoints = Vec::with_capacity(emu_keyset_indices.len());
-            for i in emu_keyset_indices.clone() {
+            let mut endpoints = Vec::with_capacity(emu_indices.len());
+            for &i in &emu_indices {
                 let secret = SecretKeyset::trivial(i as u32).ed25519;
                 let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, base_port + i as u16));
                 let endpoint =
@@ -98,12 +99,17 @@ impl Emulator {
         .await?;
         Ok(Self {
             endpoints,
-            emu_start: emu_keyset_indices.start,
+            emu_indices,
             genesis_hash,
             trace: Arc::new(Mutex::new(Trace::default())),
             obs: Arc::new(Mutex::new(ObsLog::new())),
             nut_blocks: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    /// Validator index of each endpoint, positionally.
+    pub fn emu_indices(&self) -> &[usize] {
+        &self.emu_indices
     }
 
     /// The bound addresses of the five endpoints.
@@ -144,7 +150,7 @@ impl Emulator {
                 let trace = Arc::clone(&self.trace);
                 let obs = Arc::clone(&self.obs);
                 let nut_blocks = Arc::clone(&self.nut_blocks);
-                let peer_index = (self.emu_start + i) as u16;
+                let peer_index = self.emu_indices[i] as u16;
                 let genesis_hash = self.genesis_hash;
                 handle.spawn(async move {
                     endpoint_task(
@@ -166,14 +172,13 @@ impl Emulator {
     }
 }
 
-/// Dial the NUT as emulated validator `emu_start + peer_index` and run the L0
-/// reactive handler on the connection: verify the NUT's cert/ALPN (the
-/// handshake proves it), open UP 0 as the connection initiator, then serve the
-/// NUT's CE 128 / CE 129 requests. Used where the emulated validator is the
-/// preferred initiator (DESIGN.md §4.3).
+/// Dial the NUT as emulated validator `index` and run the L0 reactive handler
+/// on the connection: verify the NUT's cert/ALPN (the handshake proves it),
+/// open UP 0 as the connection initiator, then serve the NUT's CE 128 / CE 129
+/// requests. Used where the emulated validator is the preferred initiator
+/// (DESIGN.md §4.3).
 pub async fn dial_nut(
-    emu_start: usize,
-    peer_index: usize,
+    index: usize,
     genesis_hash: [u8; 32],
     nut_addr: SocketAddr,
     nut_san: String,
@@ -183,7 +188,6 @@ pub async fn dial_nut(
     nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
     plan: Vec<ScheduledTicket>,
 ) -> Result<(), EmuError> {
-    let index = emu_start + peer_index;
     let secret = SecretKeyset::trivial(index as u32).ed25519;
     let config = EndpointConfig {
         genesis_hash,
@@ -774,7 +778,7 @@ mod tests {
 
     #[tokio::test]
     async fn boots_five_endpoints() -> Result<(), EmuError> {
-        let emu = Emulator::l0(1..6, [0xaa; 32], 40000).await?;
+        let emu = Emulator::l0(vec![1, 2, 3, 4, 5], [0xaa; 32], 40000).await?;
         let addrs = emu.local_addrs();
         assert_eq!(addrs.len(), 5);
         let ports: HashSet<u16> = addrs.iter().map(|a| a.port()).collect();
@@ -788,7 +792,7 @@ mod tests {
 
     #[test]
     fn serves_ce128_ascending_from_genesis() -> Result<(), EmuError> {
-        let mut ref_chain = RefChain::tiny(1..6).map_err(chain_err)?;
+        let mut ref_chain = RefChain::tiny(0).map_err(chain_err)?;
         let start = ref_chain.next_slot();
         for slot in start..start + 12 {
             let _ = ref_chain.author_block(slot).map_err(chain_err)?;
@@ -885,7 +889,7 @@ mod tests {
     }
 
     fn chain_with_blocks() -> Result<RefChain, m2_reference::chain::ChainError> {
-        let mut chain = RefChain::tiny(1..6)?;
+        let mut chain = RefChain::tiny(0)?;
         let start = chain.next_slot();
         let mut authored = 0;
         for slot in start..start + 12 {

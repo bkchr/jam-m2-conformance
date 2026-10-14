@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn tickets_generate_and_verify() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(1..6)?;
+        let chain = RefChain::tiny(0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         assert!(!tickets.is_empty(), "expected emulated tickets");
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn ticket_wrong_attempt_fails_verify() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(1..6)?;
+        let chain = RefChain::tiny(0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         let t = &tickets[0];
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn plan_slots_within_window() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(1..6)?;
+        let chain = RefChain::tiny(0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         let nut_index = 0;
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn entropy_from_storage_index_1() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(1..6)?;
+        let chain = RefChain::tiny(0)?;
         let ctx = chain.ticket_ctx()?;
         assert_eq!(ctx.entropy.len(), 32);
         let storage = chain.harness().storage(None);

@@ -263,7 +263,7 @@ mod tests {
         let header = Header::decode(&mut &bytes[..]).expect("header decodes");
         let hash = header.hash().0;
 
-        let reference = m2_reference::chain::RefChain::tiny(1..6).expect("reference chain builds");
+        let reference = m2_reference::chain::RefChain::tiny(0).expect("reference chain builds");
         assert_eq!(hash, reference.genesis_hash());
     }
 

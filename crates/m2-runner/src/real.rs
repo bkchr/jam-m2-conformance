@@ -57,6 +57,7 @@ pub(crate) fn build_real_run_ctx(
     obs: &ObsLog,
     trace: &Trace,
     reference_block_count: usize,
+    first_emu_peer: u16,
 ) -> RunCtx {
     let nut_blocks = lock(&data.nut_blocks);
     let l1 = build_l1_ctx(&data.ref_chain, &nut_blocks, obs, &data.plan);
@@ -70,6 +71,7 @@ pub(crate) fn build_real_run_ctx(
     );
     RunCtx {
         l0_reference_block_count: reference_block_count,
+        l0_first_emu_peer: first_emu_peer,
         l1: Some(l1),
         l2: Some(l2),
     }
@@ -252,7 +254,7 @@ mod tests {
 
     #[test]
     fn run_collect_nut_tickets() -> Result<(), ChainError> {
-        let ref_chain = RefChain::tiny(1..6)?;
+        let ref_chain = RefChain::tiny(0)?;
         let ticket_ctx = ref_chain.ticket_ctx()?;
         let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
         let ticket = &tickets[0];
@@ -293,7 +295,7 @@ mod tests {
     /// sent (`Rx`) must never be counted as NUT behaviour.
     #[test]
     fn run_collect_nut_tickets_ignores_harness_sent_frames() -> Result<(), ChainError> {
-        let ref_chain = RefChain::tiny(1..6)?;
+        let ref_chain = RefChain::tiny(0)?;
         let ticket_ctx = ref_chain.ticket_ctx()?;
         let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
         let nut_ticket = &tickets[0];
@@ -337,7 +339,7 @@ mod tests {
 
     #[test]
     fn run_build_l1_from_nut_blocks() -> Result<(), ChainError> {
-        let mut ref_chain = RefChain::tiny(1..6)?;
+        let mut ref_chain = RefChain::tiny(0)?;
         let start = ref_chain.next_slot();
         let mut authored = None;
         for slot in start..start + 12 {
@@ -372,7 +374,7 @@ mod tests {
 
     #[test]
     fn run_plan_maps_to_emu_tickets() -> Result<(), ChainError> {
-        let ref_chain = RefChain::tiny(1..6)?;
+        let ref_chain = RefChain::tiny(0)?;
         let ticket_ctx = ref_chain.ticket_ctx()?;
         let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
         let nut_index = 5;

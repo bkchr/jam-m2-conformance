@@ -39,7 +39,11 @@
 
 use crate::dsl::{self, check, log, Check, CheckResult, ExpectedObs, ObsKind, Severity};
 
-/// The first emulated peer (the L0 reference server for CE 128/129).
+/// The first emulated peer when the NUT sits at validator index 0 — the
+/// fabricated dry-run log and the lane's own tests are built around it.
+///
+/// A real run passes its own first emulated index instead: the emulated set is
+/// every validator but the NUT's, so it starts at 1 only when the NUT is at 0.
 pub const PEER_1: u16 = 1;
 
 pub const CERT_ED25519: u8 = 20;
@@ -66,8 +70,8 @@ pub const REANNOUNCED: u8 = 40;
 
 /// TLS cert `simple.md:7-23`: Ed25519 cert, key == on-chain key, exactly one
 /// SAN `e`+base32; a bad cert closes the connection.
-pub fn tls_cert() -> Check {
-    check("tls_cert", Severity::Hard, |obs| {
+pub fn tls_cert(first_emu_peer: u16) -> Check {
+    check("tls_cert", Severity::Hard, move |obs| {
         let mut results = vec![
             log::check(
                 "tls_cert_ed25519_sig_alg",
@@ -88,7 +92,7 @@ pub fn tls_cert() -> Check {
         let seq = dsl::expect_subseq(
             obs,
             0,
-            &[ExpectedObs::new(PEER_1, ObsKind::OpenUp0).within(8000)],
+            &[ExpectedObs::new(first_emu_peer, ObsKind::OpenUp0).within(8000)],
             false,
         );
         results.push(CheckResult {
@@ -281,9 +285,12 @@ pub fn ce129_serve() -> Check {
 }
 
 /// All nine L0 checks in dependency order (L0 first; later lanes build on it).
-pub fn all(reference_block_count: usize) -> Vec<Check> {
+///
+/// `first_emu_peer` is the lowest emulated validator index of the run, which is
+/// the peer the connection-established check watches.
+pub fn all(reference_block_count: usize, first_emu_peer: u16) -> Vec<Check> {
     vec![
-        tls_cert(),
+        tls_cert(first_emu_peer),
         alpn(),
         preferred_initiator(),
         endpoint_decoding(),
@@ -311,6 +318,29 @@ mod tests {
         results.iter().all(|r| r.outcome == Outcome::Pass)
     }
 
+    /// Defect 2 follow-on: the emulated set is every validator but the NUT's,
+    /// so it starts at 1 only when the NUT is at index 0. The connection check
+    /// has to watch the run's own first emulated peer, not a fixed index 1.
+    #[test]
+    fn tls_cert_watches_the_configured_first_peer() {
+        // A run with the NUT at validator index 1: emulated peers are 0, 2..=5.
+        let mut obs = ObsLog::new();
+        obs.push(0, ev(0, ObsKind::Accept, 0));
+        obs.push(10, ev(0, ObsKind::Other(CERT_ED25519), 10));
+        obs.push(20, ev(0, ObsKind::Other(CERT_KEY_MATCH), 20));
+        obs.push(30, ev(0, ObsKind::Other(CERT_SAN_OK), 30));
+        obs.push(40, ev(0, ObsKind::OpenUp0, 40));
+
+        assert!(
+            all_pass(&run(&tls_cert(0), &obs)),
+            "the connection on peer 0 is what established it"
+        );
+        assert!(
+            !all_pass(&run(&tls_cert(PEER_1), &obs)),
+            "watching peer 1 would never see it, which is the bug this guards"
+        );
+    }
+
     #[test]
     fn tls_cert_pass_and_fail() {
         let mut obs = ObsLog::new();
@@ -319,14 +349,14 @@ mod tests {
         obs.push(20, ev(1, ObsKind::Other(CERT_KEY_MATCH), 20));
         obs.push(30, ev(1, ObsKind::Other(CERT_SAN_OK), 30));
         obs.push(40, ev(1, ObsKind::OpenUp0, 40));
-        assert!(all_pass(&run(&tls_cert(), &obs)), "conforming log passes");
+        assert!(all_pass(&run(&tls_cert(PEER_1), &obs)), "conforming log passes");
 
         let mut bad = ObsLog::new();
         bad.push(0, ev(1, ObsKind::Accept, 0));
         bad.push(10, ev(1, ObsKind::Other(CERT_ED25519), 10));
         bad.push(20, ev(1, ObsKind::Other(CERT_KEY_MATCH), 20));
         bad.push(40, ev(1, ObsKind::OpenUp0, 40)); // no CERT_SAN_OK
-        let results = run(&tls_cert(), &bad);
+        let results = run(&tls_cert(PEER_1), &bad);
         assert!(
             results
                 .iter()
@@ -415,7 +445,7 @@ mod tests {
     #[test]
     fn ce128_serve_reference_count() {
         use m2_reference::chain::RefChain;
-        let mut chain = RefChain::tiny(1..6).expect("tiny chain");
+        let mut chain = RefChain::tiny(0).expect("tiny chain");
         let mut authored = 0usize;
         for slot in chain.next_slot()..chain.next_slot() + 12 {
             if chain.author_block(slot).expect("authors").is_some() {
@@ -480,7 +510,7 @@ mod tests {
 
     #[test]
     fn all_l0_checks_distinct() {
-        let checks = all(2);
+        let checks = all(2, PEER_1);
         assert_eq!(checks.len(), 9);
         let mut ids: Vec<&str> = checks.iter().map(|c| c.id).collect();
         ids.sort();

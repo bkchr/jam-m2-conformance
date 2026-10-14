@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn import_nut_block_ok_for_chain_head() -> Result<(), ChainError> {
-        let mut chain = RefChain::tiny(1..6)?;
+        let mut chain = RefChain::tiny(0)?;
         let start = chain.next_slot();
         let mut authored = Vec::new();
         for slot in start..start + 60 {
@@ -100,7 +100,7 @@ mod tests {
 
     #[test]
     fn import_nut_block_rejects_bad_extrinsic() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(1..6)?;
+        let chain = RefChain::tiny(0)?;
         let start = chain.next_slot();
         // Author WITHOUT importing (author_block_no_import): a block produced by
         // author_block is already in the chain, and re-importing a known hash
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn import_nut_block_rejects_obsolete() -> Result<(), ChainError> {
-        let mut chain = RefChain::tiny(1..6)?;
+        let mut chain = RefChain::tiny(0)?;
         let block = authored_head(&mut chain)?;
 
         let first = chain.import_nut_block(&block);

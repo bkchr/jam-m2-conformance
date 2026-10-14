@@ -1,7 +1,6 @@
 //! The §4 run lifecycle, orchestrated by [`crate::cli::run`].
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,11 +39,13 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
 
     // §4.1 keys + spec.
     let nut_index = cli.validator_index;
-    let keys = keygen::generate(cli.seed, nut_index, 6);
+    let keys = keygen::generate(cli.seed, nut_index, VALIDATOR_COUNT);
     keygen::write_seed_files(session_dir, &keys).map_err(internal)?;
 
     let ips = loopback_ips();
-    let ports: Vec<u16> = (0..6).map(|i| cli.base_port + i as u16).collect();
+    let ports: Vec<u16> = (0..VALIDATOR_COUNT)
+        .map(|i| cli.base_port + i as u16)
+        .collect();
     let chain_spec = spec::tiny_spec(&ips, &ports).map_err(internal)?;
     let genesis_hash = chain_spec.genesis_header.hash().0;
     let spec_id = format!("m2-{}", cli.seed);
@@ -56,12 +57,10 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     let nut_san = san_for_key(&keys.keysets[nut_index].ed25519.0.verification_key());
 
     // §4.2 launch + startup probe, §4.3 connectivity (both skipped in dry-run).
-    // Emulated validators are the other five indices; with the default NUT index 5 that is the
-    // contiguous range 0..5 (with index 0 it is 1..6), so the emulator and reference use a Range.
-    let emu_range: Range<usize> = if nut_index == 0 { 1..6 } else { 0..nut_index };
-    let emu_keys: Vec<[u8; 32]> = emu_range
-        .clone()
-        .map(|i| keys.keysets[i].ed25519.0.verification_key().to_bytes())
+    let emu_indices = emulated_indices(nut_index);
+    let emu_keys: Vec<[u8; 32]> = emu_indices
+        .iter()
+        .map(|&i| keys.keysets[i].ed25519.0.verification_key().to_bytes())
         .collect();
     let nut_key = keys.keysets[nut_index]
         .ed25519
@@ -93,9 +92,9 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             )));
         }
 
-        let emu_addrs: Vec<SocketAddr> = emu_range
-            .clone()
-            .map(|i| SocketAddr::from((Ipv4Addr::LOCALHOST, cli.base_port + i as u16)))
+        let emu_addrs: Vec<SocketAddr> = emu_indices
+            .iter()
+            .map(|&i| SocketAddr::from((Ipv4Addr::LOCALHOST, cli.base_port + i as u16)))
             .collect();
         let outcomes =
             connectivity::run_connectivity(&plan, nut_addr, &emu_addrs, genesis_hash, &nut_san)
@@ -115,10 +114,10 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             None,
         )
     } else {
-        let mut ref_chain = RefChain::tiny(emu_range.clone()).map_err(internal)?;
+        let mut ref_chain = RefChain::tiny(nut_index).map_err(internal)?;
         let count = author_emulated_slots(&mut ref_chain).map_err(internal)?;
         let ref_chain = Arc::new(ref_chain);
-        let emu = Emulator::l0(emu_range.clone(), genesis_hash, cli.base_port)
+        let emu = Emulator::l0(emu_indices.clone(), genesis_hash, cli.base_port)
             .await
             .map_err(internal)?;
         let obs = emu.obs();
@@ -139,11 +138,11 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             let nut_blocks = nut_blocks.clone();
             let ref_chain = ref_chain.clone();
             let nut_san = nut_san.clone();
-            let peer_plan = plan_for_peer(&ticket_plan, emu_range.start + i);
+            let index = emu_indices[i];
+            let peer_plan = plan_for_peer(&ticket_plan, index);
             dial_tasks.push(tokio::spawn(async move {
                 let _ = m2_emu::emu::dial_nut(
-                    emu_range.start,
-                    i,
+                    index,
                     genesis_hash,
                     nut_addr,
                     nut_san,
@@ -162,12 +161,12 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             let nut_blocks = nut_blocks.clone();
             let ref_chain = ref_chain.clone();
             let nut_san = nut_san.clone();
-            let peer_plan = plan_for_peer(&ticket_plan, emu_range.start + i);
+            let index = emu_indices[i];
+            let peer_plan = plan_for_peer(&ticket_plan, index);
             dial_tasks.push(tokio::spawn(async move {
                 tokio::time::sleep(connectivity::INITIATOR_GRACE).await;
                 let _ = m2_emu::emu::dial_nut(
-                    emu_range.start,
-                    i,
+                    index,
                     genesis_hash,
                     nut_addr,
                     nut_san,
@@ -209,7 +208,13 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             let data = real_run.as_ref().ok_or_else(|| {
                 RunError::Internal("emulator run missing reference run data".into())
             })?;
-            build_real_run_ctx(data, &lock(obs), &lock(trace), reference_block_count)
+            build_real_run_ctx(
+                data,
+                &lock(obs),
+                &lock(trace),
+                reference_block_count,
+                emu_indices[0] as u16,
+            )
         }
         ObsSource::Fabricated { .. } => {
             fabricated_run_ctx(reference_block_count).map_err(internal)?
@@ -246,6 +251,21 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         findings,
         all_hard_passed,
     })
+}
+
+/// The tiny validator set: six validators, one of which is the NUT.
+const VALIDATOR_COUNT: usize = 6;
+
+/// Validator indices the harness emulates: every index except the NUT's.
+///
+/// The result is positional — position `i` of the returned list is the
+/// validator that position `i` of the [`ConnectivityPlan`], `emu_keys` and
+/// `emu_addrs` refers to. It is deliberately not a range: a NUT anywhere but
+/// the ends of the keyset splits the emulated set in two, and treating it as
+/// the range `0..nut_index` both dropped the validators above the NUT and left
+/// the NUT's own keyset loaded in the reference chain (defect 2).
+fn emulated_indices(nut_index: usize) -> Vec<usize> {
+    (0..VALIDATOR_COUNT).filter(|&i| i != nut_index).collect()
 }
 
 /// Author up to three emulated (non-NUT) slots into `chain`; returns how many
@@ -360,4 +380,31 @@ fn internal(e: impl std::fmt::Display) -> RunError {
 
 fn startup(e: impl std::fmt::Display) -> RunError {
     RunError::Startup(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Defect 2: at every NUT position the harness emulates the other five
+    /// validators and never the NUT itself. The old contiguous range gave
+    /// `0..nut_index`, which both lost the validators above the NUT and
+    /// included the NUT at index 0.
+    #[test]
+    fn emulated_indices_cover_every_validator_but_the_nut() {
+        for nut_index in 0..VALIDATOR_COUNT {
+            let emu = emulated_indices(nut_index);
+            assert_eq!(
+                emu.len(),
+                VALIDATOR_COUNT - 1,
+                "NUT index {nut_index}: every other validator must be emulated"
+            );
+            assert!(
+                !emu.contains(&nut_index),
+                "NUT index {nut_index}: the harness must not emulate the NUT"
+            );
+            let expected: Vec<usize> = (0..VALIDATOR_COUNT).filter(|&i| i != nut_index).collect();
+            assert_eq!(emu, expected, "NUT index {nut_index}: indices stay ordered");
+        }
+    }
 }

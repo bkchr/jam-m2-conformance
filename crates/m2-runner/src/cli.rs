@@ -17,8 +17,9 @@ pub struct Cli {
     /// so NUT-initiated L0 checks can never fire). L7 rotates this.
     #[arg(long, default_value_t = 5)]
     pub validator_index: usize,
-    /// Base port: the NUT listens on this port, the five emulated validators
-    /// on `base+1 ..= base+5`.
+    /// Base port: validator `i` listens on `base+i`, so the NUT is on
+    /// `base+validator_index` and the five emulated validators take the other
+    /// five ports in `base ..= base+5`.
     #[arg(long, default_value_t = 40000)]
     pub base_port: u16,
     /// NUT launch preset.
