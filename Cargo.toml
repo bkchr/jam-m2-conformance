@@ -42,3 +42,12 @@ rand = "0.8"
 
 [profile.release]
 opt-level = 2
+
+# `jam-node`'s build script embeds the `jam-bootstrap-service` blob only when the
+# profile says `debug = false`; otherwise it defers the build to the first call at
+# runtime, which resolves the workspace from the *caller's* working directory. For
+# a test that is its own crate root, so the lookup lands in this workspace, where
+# no such package exists. Building jam-node without debug info keeps the blob
+# baked in and every `RefChain` test runnable.
+[profile.dev.package.jam-node]
+debug = false
