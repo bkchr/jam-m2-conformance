@@ -210,11 +210,12 @@ pub async fn dial_nut(
     record(&obs, peer, ObsKind::Other(l0::ENDPOINT_DIALED));
 
     // Open UP 0 as the connection initiator and send the genesis handshake.
-    let (mut send, _recv) = connection
+    let (mut send, recv) = connection
         .open_bi()
         .await
         .map_err(|e| EmuError::Protocol(e.to_string()))?;
     record(&obs, peer, ObsKind::OpenUp0);
+    let up0_stream_id = u64::from(send.id());
     let handshake = Handshake {
         final_block: advertised_final(&ref_chain.chain_blocks(), genesis_hash),
         leaves: vec![],
@@ -238,6 +239,23 @@ pub async fn dial_nut(
     }
     // UP 0 is a persistent stream: keep the send half open for future
     // announcements rather than finishing it (simple.md:108-111).
+
+    // Read the receive half of the UP 0 stream we opened. The NUT's handshake
+    // and its announcements come back on it, and nothing else observes them on
+    // an emulator-initiated connection: the accept loop only sees streams the
+    // NUT opens. Left unread, the node's whole UP 0 output on these three
+    // connections is invisible to the harness (A3).
+    tokio::spawn(read_dialed_up0(
+        connection.clone(),
+        recv,
+        peer,
+        genesis_hash,
+        up0_stream_id,
+        Arc::clone(&ref_chain),
+        Arc::clone(&trace),
+        Arc::clone(&obs),
+        Arc::clone(&nut_blocks),
+    ));
 
     // Deliver the peer's L2 tickets on their own streams, concurrently with the handler.
     tokio::spawn(spawn_ticket_sender(
@@ -426,7 +444,7 @@ async fn handle_stream(
         UP => {
             handle_up0(
                 &connection,
-                &mut send,
+                Some(&mut send),
                 peer_index,
                 genesis_hash,
                 ref_chain,
@@ -447,7 +465,7 @@ async fn handle_stream(
                         trace_record(peer_index, UP, stream_id, &content, trace, TraceDir::Tx);
                         handle_up0(
                             &connection,
-                            &mut send,
+                            Some(&mut send),
                             peer_index,
                             genesis_hash,
                             ref_chain,
@@ -492,13 +510,64 @@ fn refuse(send: &mut quinn::SendStream, reader: &mut StreamReader) {
     reader.stop(code);
 }
 
+/// Read the receive half of a UP 0 stream the emulator opened, for as long as
+/// the NUT keeps it open.
+///
+/// The mirror of the UP 0 arm of [`handle_stream`], with two differences: the
+/// half carries no opening kind byte, since we wrote it when we opened the
+/// stream, and nothing is answered — our handshake went out with the open.
+#[allow(clippy::too_many_arguments)]
+async fn read_dialed_up0(
+    connection: quinn::Connection,
+    recv: quinn::RecvStream,
+    peer_index: u16,
+    genesis_hash: [u8; 32],
+    stream_id: u64,
+    ref_chain: Arc<RefChain>,
+    trace: Arc<Mutex<Trace>>,
+    obs: Arc<Mutex<ObsLog>>,
+    nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
+) {
+    let mut reader = StreamReader::with_kind(recv, UP);
+    loop {
+        match reader.next().await {
+            Ok(Some((_, content))) => {
+                trace_record(peer_index, UP, stream_id, &content, &trace, TraceDir::Tx);
+                handle_up0(
+                    &connection,
+                    None,
+                    peer_index,
+                    genesis_hash,
+                    &ref_chain,
+                    stream_id,
+                    &content,
+                    &trace,
+                    &obs,
+                    &nut_blocks,
+                )
+                .await;
+            }
+            // The NUT closed its half: the stream is done, not refused.
+            Ok(None) => break,
+            // Do not reset the stream on a malformed frame: the send half is
+            // still carrying our announcements, and resetting would take the
+            // whole UP 0 stream down with it.
+            Err(_) => break,
+        }
+    }
+}
+
 /// Handle a NUT UP 0 message: an `Announcement` is recorded (`Up0Announce`
 /// plus the L0 re-announce observation — the P0 emulator cannot distinguish
 /// announce from re-announce) and left unanswered; anything else is a
 /// handshake, answered with our own (recording `OpenUp0`).
+///
+/// `send` is `None` on a stream the emulator opened itself: our handshake went
+/// out when the stream was opened, so the NUT's is an answer to it, and
+/// answering back would put a second handshake on the stream.
 async fn handle_up0(
     connection: &quinn::Connection,
-    send: &mut quinn::SendStream,
+    send: Option<&mut quinn::SendStream>,
     peer_index: u16,
     genesis_hash: [u8; 32],
     ref_chain: &RefChain,
@@ -525,6 +594,21 @@ async fn handle_up0(
         if handshake.final_block.header_hash == HeaderHash::from(genesis_hash) {
             record(obs, peer_index, ObsKind::Other(l0::UP0_FINAL_GENESIS));
         }
+        if let Some(send) = send {
+            respond_up0(
+                send,
+                peer_index,
+                genesis_hash,
+                stream_id,
+                ref_chain,
+                trace,
+                obs,
+            )
+            .await;
+        }
+        return;
+    }
+    if let Some(send) = send {
         respond_up0(
             send,
             peer_index,
@@ -535,18 +619,7 @@ async fn handle_up0(
             obs,
         )
         .await;
-        return;
     }
-    respond_up0(
-        send,
-        peer_index,
-        genesis_hash,
-        stream_id,
-        ref_chain,
-        trace,
-        obs,
-    )
-    .await;
 }
 
 /// The `Final` block the emulator advertises on UP 0.
@@ -680,11 +753,22 @@ pub(crate) struct StreamReader {
 }
 
 impl StreamReader {
-    /// Wrap a freshly accepted or opened receive stream.
+    /// Wrap a freshly accepted receive stream, whose first frame carries the
+    /// stream-kind byte.
     pub(crate) fn new(recv: quinn::RecvStream) -> Self {
         Self {
             recv,
             reader: FrameReader::new(),
+            buf: [0u8; 4096],
+        }
+    }
+
+    /// Wrap the receive half of a stream *we* opened, which carries no kind
+    /// byte: we wrote it, so the peer's replies are bare messages under `kind`.
+    pub(crate) fn with_kind(recv: quinn::RecvStream, kind: u8) -> Self {
+        Self {
+            recv,
+            reader: FrameReader::with_kind(kind),
             buf: [0u8; 4096],
         }
     }

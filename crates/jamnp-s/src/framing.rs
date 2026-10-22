@@ -138,6 +138,23 @@ impl FrameReader {
         Self::default()
     }
 
+    /// Creates an empty reader for the half of a stream that carries no opening
+    /// kind byte.
+    ///
+    /// The kind byte is written once by whoever opens the stream
+    /// (`simple.md:122-124`), so on a bidirectional stream only the initiator's
+    /// send half carries it. The responder answers with bare
+    /// `[len: u32 LE] ++ [content]` messages, which a reader built by
+    /// [`FrameReader::new`] would misread: it would take the first byte of the
+    /// length prefix for the kind. Reading the initiator's receive half needs
+    /// this constructor, told the kind the stream was opened with.
+    pub fn with_kind(kind: u8) -> Self {
+        Self {
+            buf: Vec::new(),
+            kind: Some(kind),
+        }
+    }
+
     /// Appends bytes to the reader's buffer.
     pub fn push(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);
@@ -370,5 +387,30 @@ mod tests {
         let mut r = FrameReader::new();
         r.push(&frame(CE133, b"wp"));
         assert_eq!(r.finish(), Err(FrameError::TrailingBytes));
+    }
+
+    /// The responder's half of a stream carries no opening kind byte, so it is
+    /// read by a reader that already knows the kind.
+    #[test]
+    fn with_kind_reads_bare_messages() {
+        let mut r = FrameReader::with_kind(UP);
+        let mut wire = frame_message(b"handshake");
+        wire.extend_from_slice(&frame_message(b"announce"));
+        r.push(&wire);
+        assert_eq!(r.next_frame().unwrap(), Some((UP, b"handshake".to_vec())));
+        assert_eq!(r.next_frame().unwrap(), Some((UP, b"announce".to_vec())));
+        assert_eq!(r.finish(), Ok(()));
+    }
+
+    /// The bug this guards: a `new` reader on that same half takes the first
+    /// byte of the length prefix for the kind. Here that byte is the payload
+    /// length 9, not a stream kind, so the read fails outright -- and for a
+    /// payload whose length happened to be a valid kind it would instead
+    /// desynchronise silently.
+    #[test]
+    fn new_reader_cannot_read_a_half_without_a_kind_byte() {
+        let mut r = FrameReader::new();
+        r.push(&frame_message(b"handshake"));
+        assert!(r.next_frame().is_err());
     }
 }
