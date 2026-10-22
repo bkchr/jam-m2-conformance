@@ -37,8 +37,20 @@ pub enum SpecError {
 
 /// Builds the 6-validator tiny `ChainSpec`: genesis state carries the validator
 /// metadata `(ip, port)` pairs (PeerAddr IPv6 + LE port, DESIGN.md §7) and the
-/// genesis header has slot 0.
-pub fn tiny_spec(validator_ips: &[[u8; 16]], ports: &[u16]) -> Result<ChainSpec, SpecError> {
+/// genesis header is anchored to `anchor_slot`.
+///
+/// `JAM_COMMON_ERA` is a fixed point in the past, so a genesis left at slot 0
+/// starts the chain hundreds of thousands of epochs behind the wall clock. Its
+/// finalized block never leaves genesis, and polkajam's ticket lottery refuses
+/// to run until the finalized block's epoch catches up with the current one, so
+/// no validator ever submits a ticket. Pass
+/// `m2_reference::chain::current_epoch_start_slot()` to start in the present,
+/// or 0 for the unanchored genesis the tests pin values against.
+pub fn tiny_spec(
+    validator_ips: &[[u8; 16]],
+    ports: &[u16],
+    anchor_slot: jam_types::Slot,
+) -> Result<ChainSpec, SpecError> {
     if validator_ips.len() != 6 || ports.len() != 6 {
         return Err(SpecError::ValidatorCount {
             ips: validator_ips.len(),
@@ -54,6 +66,17 @@ pub fn tiny_spec(validator_ips: &[[u8; 16]], ports: &[u16]) -> Result<ChainSpec,
     // overriding the on-chain PeerAddr metadata leaves the hash untouched.
     let base = jam_node::hazmat::dev_spec(jam_node::DEFAULT_DEV_BASE_PORT);
     let mut state = base.build_storage().map_err(SpecError::Storage)?;
+    let ChainSpec {
+        mut genesis_header,
+        bootnodes,
+        ..
+    } = base;
+
+    // The slot *is* part of the header preimage, so anchoring moves the genesis
+    // hash. Take the new hash before patching the state: the one block in the
+    // recent-blocks history has to carry it.
+    genesis_header.slot = anchor_slot;
+    let genesis_hash = genesis_header.hash();
 
     // Rebuild the validator keysets with the requested metadata and patch the
     // three system keys that each carry a full `ValKeysets` copy.
@@ -72,6 +95,11 @@ pub fn tiny_spec(validator_ips: &[[u8; 16]], ports: &[u16]) -> Result<ChainSpec,
     // from it, so leaving it unpatched makes the node dial the dev-spec
     // addresses instead of ours and never connect to any emulated validator.
     let safrole_key = StorageKey::from(SystemKey::Safrole).0;
+    // `dev_spec` writes both of these for slot 0 (`TheState::genesis`), so
+    // anchoring means rewriting them: the state's current time, and the single
+    // recent block, which is genesis itself.
+    let now_key = StorageKey::from(SystemKey::CurrentTime).0;
+    let recent_key = StorageKey::from(SystemKey::RecentBlocks).0;
     for (k, v) in state.iter_mut() {
         if keys.contains(k) {
             *v = Some(encoded.clone());
@@ -81,16 +109,29 @@ pub fn tiny_spec(validator_ips: &[[u8; 16]], ports: &[u16]) -> Result<ChainSpec,
                 .map_err(|e| SpecError::Storage(format!("decode safrole state: {e}")))?;
             safrole.waiting_validators = validators.clone();
             *v = Some(safrole.encode());
+        } else if *k == now_key {
+            *v = Some(anchor_slot.encode());
+        } else if *k == recent_key {
+            let Some(bytes) = v.as_ref() else { continue };
+            let mut recent = jam_std_common::RecentBlocks::decode_all(&mut bytes.as_slice())
+                .map_err(|e| SpecError::Storage(format!("decode recent blocks: {e}")))?;
+            // `BoundedVec` hands out no mutable element access, so rebuild the
+            // one-entry history rather than editing it in place.
+            let mut genesis_block = recent
+                .history
+                .first()
+                .cloned()
+                .ok_or_else(|| SpecError::Storage("genesis has no recent block".into()))?;
+            genesis_block.slot = anchor_slot;
+            genesis_block.hash = genesis_hash;
+            recent.history = jam_types::BoundedVec::try_from(vec![genesis_block])
+                .map_err(|_| SpecError::Storage("recent block count is zero".into()))?;
+            *v = Some(recent.encode());
         }
     }
 
     let storage_builder =
         jam_node::hazmat::StorageBuilder::RawFactory(Box::new(move || Ok(state.clone())));
-    let ChainSpec {
-        genesis_header,
-        bootnodes,
-        ..
-    } = base;
     Ok(ChainSpec {
         storage_builder,
         genesis_header,
@@ -203,7 +244,7 @@ mod tests {
 
     #[test]
     fn m2_spec_shape_and_consistency() {
-        let chain_spec = tiny_spec(&loopback_ips(), &ports()).expect("tiny spec builds");
+        let chain_spec = tiny_spec(&loopback_ips(), &ports(), 0).expect("tiny spec builds");
         let spec = m2_spec("m2-test", &chain_spec).expect("m2 spec builds");
 
         assert_eq!(spec.parameters["validators"], 6);
@@ -239,9 +280,10 @@ mod tests {
     /// (with `now: 0`), so patching the header alone desynchronises state from
     /// header and authoring fails with `BestBlockChanged`.
     #[test]
-    #[ignore = "genesis anchoring needs the genesis state rebuilt; see docstring"]
     fn genesis_is_anchored_to_the_current_epoch() {
-        let chain_spec = tiny_spec(&loopback_ips(), &ports()).expect("tiny spec builds");
+        let anchor = m2_reference::chain::current_epoch_start_slot();
+        let chain_spec =
+            tiny_spec(&loopback_ips(), &ports(), anchor).expect("tiny spec builds");
         let period = jam_types::epoch_period();
         let now = m2_reference::chain::wall_clock_slot();
 
@@ -254,9 +296,46 @@ mod tests {
         );
     }
 
+    /// Anchoring the header alone would desynchronise state from header: the
+    /// state's current time and the one recent block (genesis itself, carrying
+    /// the hash the slot just changed) both have to move with it.
+    #[test]
+    fn anchored_genesis_state_agrees_with_its_header() {
+        const ANCHOR: u32 = 9_373_122;
+
+        let chain_spec = tiny_spec(&loopback_ips(), &ports(), ANCHOR).expect("tiny spec builds");
+        let state = chain_spec.build_storage().expect("storage builds");
+        let value = |key: jam_std_common::SystemKey| {
+            state
+                .iter()
+                .find_map(|(k, v)| {
+                    (*k == jam_std_common::StorageKey::from(key).0).then(|| v.clone())
+                })
+                .flatten()
+                .expect("genesis writes every system key")
+        };
+
+        let now = value(jam_std_common::SystemKey::CurrentTime);
+        assert_eq!(
+            u32::decode_all(&mut now.as_slice()).expect("current time decodes"),
+            ANCHOR
+        );
+
+        let recent = value(jam_std_common::SystemKey::RecentBlocks);
+        let recent = jam_std_common::RecentBlocks::decode_all(&mut recent.as_slice())
+            .expect("recent blocks decode");
+        let genesis_block = recent.history.first().expect("genesis is a recent block");
+        assert_eq!(genesis_block.slot, ANCHOR);
+        assert_eq!(
+            genesis_block.hash,
+            chain_spec.genesis_header.hash(),
+            "the recent block must carry the anchored header's hash, not the slot-0 one"
+        );
+    }
+
     #[test]
     fn genesis_header_hash_consistency() {
-        let chain_spec = tiny_spec(&loopback_ips(), &ports()).expect("tiny spec builds");
+        let chain_spec = tiny_spec(&loopback_ips(), &ports(), 0).expect("tiny spec builds");
         let spec = m2_spec("m2-test", &chain_spec).expect("m2 spec builds");
 
         let bytes = hex::decode(&spec.genesis_header[2..]).expect("valid hex header");
@@ -267,9 +346,32 @@ mod tests {
         assert_eq!(hash, reference.genesis_hash());
     }
 
+    /// The whole point of threading the anchor through both sides: the node is
+    /// started from the runner's spec and the reference engine from an
+    /// identical one, so they must agree on the genesis hash. They would not if
+    /// only one were anchored, the slot being part of the header preimage.
+    #[test]
+    fn anchored_spec_and_reference_chain_share_a_genesis() {
+        const ANCHOR: u32 = 9_373_122;
+
+        let chain_spec = tiny_spec(&loopback_ips(), &ports(), ANCHOR).expect("tiny spec builds");
+        let ref_spec = tiny_spec(&loopback_ips(), &ports(), ANCHOR).expect("tiny spec builds");
+        let reference =
+            m2_reference::chain::RefChain::with_spec(0, ref_spec).expect("reference chain builds");
+
+        assert_eq!(chain_spec.genesis_header.slot, ANCHOR);
+        assert_eq!(chain_spec.genesis_header.hash().0, reference.genesis_hash());
+
+        // ... and an unanchored reference chain would not match, which is the
+        // failure this guards against.
+        let unanchored =
+            m2_reference::chain::RefChain::tiny(0).expect("reference chain builds");
+        assert_ne!(chain_spec.genesis_header.hash().0, unanchored.genesis_hash());
+    }
+
     #[test]
     fn polkajam_spec_parses() {
-        let chain_spec = tiny_spec(&loopback_ips(), &ports()).expect("tiny spec builds");
+        let chain_spec = tiny_spec(&loopback_ips(), &ports(), 0).expect("tiny spec builds");
         let dir = temp_dir("parses");
         let path = write_polkajam_spec(&dir, &chain_spec).expect("writes polkajam spec");
 
@@ -285,7 +387,7 @@ mod tests {
 
     #[test]
     fn files_written() {
-        let chain_spec = tiny_spec(&loopback_ips(), &ports()).expect("tiny spec builds");
+        let chain_spec = tiny_spec(&loopback_ips(), &ports(), 0).expect("tiny spec builds");
         let spec = m2_spec("m2-test", &chain_spec).expect("m2 spec builds");
 
         let dir = temp_dir("files");

@@ -46,7 +46,15 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     let ports: Vec<u16> = (0..VALIDATOR_COUNT)
         .map(|i| cli.base_port + i as u16)
         .collect();
-    let chain_spec = spec::tiny_spec(&ips, &ports).map_err(internal)?;
+    // Genesis is anchored to the start of the current epoch (A9). polkajam
+    // gates its ticket lottery on the finalized block being in the current
+    // epoch, which a genesis at slot 0 can never satisfy, so the node would
+    // never submit a ticket and never author. `ChainSpec` holds a boxed
+    // closure and is not `Clone`, so the reference engine gets its own build
+    // from the same inputs -- `tiny_spec` is deterministic, so the two agree
+    // byte for byte.
+    let anchor_slot = m2_reference::chain::current_epoch_start_slot();
+    let chain_spec = spec::tiny_spec(&ips, &ports, anchor_slot).map_err(internal)?;
     let genesis_hash = chain_spec.genesis_header.hash().0;
     let spec_id = format!("m2-{}", cli.seed);
     let m2_spec = spec::m2_spec(&spec_id, &chain_spec).map_err(internal)?;
@@ -114,7 +122,8 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             None,
         )
     } else {
-        let mut ref_chain = RefChain::tiny(nut_index).map_err(internal)?;
+        let ref_spec = spec::tiny_spec(&ips, &ports, anchor_slot).map_err(internal)?;
+        let mut ref_chain = RefChain::with_spec(nut_index, ref_spec).map_err(internal)?;
         let count = author_emulated_slots(&mut ref_chain).map_err(internal)?;
         let ref_chain = Arc::new(ref_chain);
         let emu = Emulator::l0(emu_indices.clone(), genesis_hash, cli.base_port)

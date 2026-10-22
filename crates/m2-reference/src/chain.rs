@@ -72,8 +72,32 @@ impl RefChain {
     /// Validator `i` holds `SecretKeyset::trivial(i)` (`keygen::generate`), so
     /// the harness keystore takes those keysets for every index but the NUT's,
     /// whose slot gets [`NON_VALIDATOR_KEYSET`]. The chain spec is the dev spec
-    /// with the 6-validator tiny set.
+    /// with the 6-validator tiny set, genesis at slot 0.
+    ///
+    /// A live run uses [`RefChain::with_spec`] instead, so the reference engine
+    /// and the node under test start from one and the same genesis.
     pub fn tiny(nut_index: usize) -> Result<Self, ChainError> {
+        // Before `default_dev_spec`, not after: it sizes the validator set from
+        // the process-wide protocol parameters, so building it under the `full`
+        // default would try to fit 1023 validators into the tiny bound of 6.
+        jam_types::ProtocolParameters::tiny().apply().map_err(|e| {
+            ChainError::Chain(format!("failed to apply tiny protocol parameters: {e}"))
+        })?;
+        Self::with_spec(nut_index, jam_node::hazmat::default_dev_spec())
+    }
+
+    /// Build the reference chain on a caller-supplied chain spec.
+    ///
+    /// The node under test is started from a spec the runner builds, carrying
+    /// the real validator addresses and, for a live run, a genesis anchored to
+    /// the current epoch. The reference engine has to start from that same
+    /// spec: the anchor slot is part of the genesis header preimage, so a
+    /// reference chain left on the slot-0 dev spec would disagree with the node
+    /// about the genesis hash, and every UP 0 handshake would mismatch.
+    pub fn with_spec(
+        nut_index: usize,
+        chain_spec: jam_node::ChainSpec,
+    ) -> Result<Self, ChainError> {
         jam_types::ProtocolParameters::tiny().apply().map_err(|e| {
             ChainError::Chain(format!("failed to apply tiny protocol parameters: {e}"))
         })?;
@@ -83,7 +107,6 @@ impl RefChain {
                 "NUT index {nut_index} is outside the {validator_count}-validator set"
             )));
         }
-        let chain_spec = jam_node::hazmat::default_dev_spec();
         let genesis_hash = chain_spec.genesis_header.hash();
         let validators = SecretKeysets(FixedVec::from_fn(|i| {
             if i == nut_index {
