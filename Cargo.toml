@@ -19,10 +19,10 @@ repository = "https://github.com/paritytech/jam-m2-conformance"
 # two local patches in `patches/` apply only to the NUT *binary*, built by
 # `scripts/prepare-nut.sh` into the gitignored `third_party/`.
 [workspace.dependencies]
-jam-types = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "323e72ded3a03135db41563ffff56e98d5342d1d" }
-jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "323e72ded3a03135db41563ffff56e98d5342d1d" }
-jam-node = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "323e72ded3a03135db41563ffff56e98d5342d1d", features = ["hazmat"] }
-polkajam-fuzz = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "323e72ded3a03135db41563ffff56e98d5342d1d" }
+jam-types = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "940ef56c7a2a601bccfd2a8d2375be48dc0fb941" }
+jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "940ef56c7a2a601bccfd2a8d2375be48dc0fb941" }
+jam-node = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "940ef56c7a2a601bccfd2a8d2375be48dc0fb941", features = ["hazmat"] }
+polkajam-fuzz = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "940ef56c7a2a601bccfd2a8d2375be48dc0fb941" }
 
 quinn = { version = "0.11", features = ["rustls", "runtime-tokio", "log"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
