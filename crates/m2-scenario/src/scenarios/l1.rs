@@ -110,16 +110,27 @@ pub fn l1_state_root(ctx: &L1Ctx) -> Check {
     })
 }
 
-/// L1 — Extrinsic completeness: every NUT block's ticket extrinsic is a
-/// superset of the tickets delivered ≥ 2 s before the slot (all must be
-/// included) and a subset of the delivered tickets (nothing un-delivered or
+/// L1 — Extrinsic completeness: every NUT block's ticket extrinsic holds the
+/// tickets delivered ≥ 2 s before its slot and not yet on chain (all must be
+/// included) and nothing beyond the delivered set (nothing un-delivered or
 /// injected-invalid is included).
+///
+/// "Not yet on chain" is what makes this work over a chain of more than one
+/// block. A ticket already included by an earlier NUT block must not appear
+/// again, so expecting every block to carry every ticket delivered before it
+/// would fail each block after the first — which is what happened once the
+/// reference chain started authoring for the whole window and the NUT
+/// authored more than once.
 pub fn l1_extrinsic_completeness(ctx: &L1Ctx) -> Check {
     let ctx = ctx.clone();
     check("l1_extrinsic_completeness", Severity::Hard, move |_obs| {
         let delivered: HashSet<[u8; 32]> = ctx.delivered_tickets.iter().map(|t| t.id).collect();
+        // Oldest block first, so "already on chain" means what it says.
+        let mut blocks: Vec<_> = ctx.nut_blocks.iter().collect();
+        blocks.sort_by_key(|nut| nut.block.header.slot);
+        let mut already_on_chain: HashSet<[u8; 32]> = HashSet::new();
         let mut results = Vec::new();
-        for nut in &ctx.nut_blocks {
+        for nut in blocks {
             let included: HashSet<[u8; 32]> = nut
                 .block
                 .extrinsic
@@ -130,6 +141,7 @@ pub fn l1_extrinsic_completeness(ctx: &L1Ctx) -> Check {
             let expected: HashSet<[u8; 32]> = ctx
                 .expected_tickets_for_slot(nut.block.header.slot)
                 .into_iter()
+                .filter(|id| !already_on_chain.contains(id))
                 .collect();
             results.push(log::check(
                 "l1_extrinsic_includes_delivered",
@@ -141,6 +153,7 @@ pub fn l1_extrinsic_completeness(ctx: &L1Ctx) -> Check {
                 included.is_subset(&delivered),
                 Severity::Hard,
             ));
+            already_on_chain.extend(included);
         }
         results
     })
@@ -408,6 +421,10 @@ mod tests {
             attempt: t1.attempt,
             signature: RingSignature(t1.proof),
         };
+        let env2 = TicketEnvelope {
+            attempt: t2.attempt,
+            signature: RingSignature(t2.proof),
+        };
         let env3 = TicketEnvelope {
             attempt: t3.attempt,
             signature: RingSignature(t3.proof),
@@ -431,6 +448,45 @@ mod tests {
         assert!(
             all_pass(&run(&l1_extrinsic_completeness(&ctx), &ObsLog::new())),
             "including the delivered ticket passes; a late-delivered one is optional"
+        );
+
+        // A ticket already on chain must not be expected again. The NUT
+        // includes it in its first block; its second block carries none, and
+        // that is correct, not a missing inclusion. Before the reference chain
+        // authored for the whole window the NUT rarely produced a second
+        // block, so this went unnoticed and every later block failed hard.
+        // The first block takes the ticket that was in hand for slot 1; by
+        // slot 2 the late one is owed too, and the first is on chain and must
+        // not be repeated.
+        ctx.nut_blocks = vec![
+            nut_block_with_tickets(1, [1u8; 32], vec![env1.clone()], 0),
+            nut_block_with_tickets(2, [1u8; 32], vec![env2.clone()], 0),
+        ];
+        assert!(
+            all_pass(&run(&l1_extrinsic_completeness(&ctx), &ObsLog::new())),
+            "a ticket included once is not owed again by later blocks"
+        );
+
+        // Order of the blocks must not change the verdict.
+        ctx.nut_blocks.reverse();
+        assert!(
+            all_pass(&run(&l1_extrinsic_completeness(&ctx), &ObsLog::new())),
+            "inclusion is resolved by slot order, not by the order fetched"
+        );
+
+        // Repeating a ticket already on chain is still caught: the second
+        // block owes the late ticket and carries the first one again instead.
+        ctx.nut_blocks = vec![
+            nut_block_with_tickets(1, [1u8; 32], vec![env1.clone()], 0),
+            nut_block_with_tickets(2, [1u8; 32], vec![env1.clone()], 0),
+        ];
+        let repeated = run(&l1_extrinsic_completeness(&ctx), &ObsLog::new());
+        assert!(
+            repeated
+                .iter()
+                .any(|r| r.name == "l1_extrinsic_includes_delivered"
+                    && r.outcome == Outcome::Fail(Severity::Hard)),
+            "the late ticket is still owed by the second block"
         );
 
         ctx.nut_blocks = vec![nut_block(1, [1u8; 32], 0)];

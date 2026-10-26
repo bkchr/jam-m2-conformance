@@ -181,7 +181,7 @@ pub(crate) fn fabricated_obs_log(reference_block_count: usize) -> ObsLog {
 pub(crate) fn fabricated_run_ctx(
     reference_block_count: usize,
 ) -> Result<RunCtx, m2_reference::chain::ChainError> {
-    let mut chain = RefChain::tiny(0)?;
+    let chain = RefChain::tiny(0)?;
     let start = chain.next_slot();
     let mut authored = None;
     for slot in start..start + 12 {

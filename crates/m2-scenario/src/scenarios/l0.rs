@@ -577,7 +577,7 @@ mod tests {
     #[test]
     fn ce128_serve_reference_count() {
         use m2_reference::chain::RefChain;
-        let mut chain = RefChain::tiny(0).expect("tiny chain");
+        let chain = RefChain::tiny(0).expect("tiny chain");
         let mut authored = 0usize;
         for slot in chain.next_slot()..chain.next_slot() + 12 {
             if chain.author_block(slot).expect("authors").is_some() {

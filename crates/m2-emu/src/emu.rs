@@ -24,6 +24,7 @@ use m2_reference::tickets::ScheduledTicket;
 use m2_scenario::ctx::NutBlock;
 use m2_scenario::dsl::{Obs, ObsKind, ObsLog};
 use m2_scenario::scenarios::l0;
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::nut_block::{fetch_block, should_fetch};
@@ -67,6 +68,14 @@ pub struct Emulator {
     trace: Arc<Mutex<Trace>>,
     obs: Arc<Mutex<ObsLog>>,
     nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
+    /// Fan-out for blocks authored after the connections are up (A10).
+    ///
+    /// Every live UP 0 stream subscribes, so a block announced here reaches
+    /// each one without the emulator holding their send halves: a
+    /// `quinn::SendStream` is not clonable, and sharing one behind a lock would
+    /// mean holding that lock across a write. A subscriber also disappears on
+    /// its own when its stream task ends.
+    announce: broadcast::Sender<Vec<u8>>,
 }
 
 impl Emulator {
@@ -104,7 +113,13 @@ impl Emulator {
             trace: Arc::new(Mutex::new(Trace::default())),
             obs: Arc::new(Mutex::new(ObsLog::new())),
             nut_blocks: Arc::new(Mutex::new(Vec::new())),
+            announce: broadcast::Sender::new(ANNOUNCE_BUFFER),
         })
+    }
+
+    /// Sender for live block announcements; see [`Emulator::announce`].
+    pub fn announce_tx(&self) -> broadcast::Sender<Vec<u8>> {
+        self.announce.clone()
     }
 
     /// Validator index of each endpoint, positionally.
@@ -152,6 +167,7 @@ impl Emulator {
                 let nut_blocks = Arc::clone(&self.nut_blocks);
                 let peer_index = self.emu_indices[i] as u16;
                 let genesis_hash = self.genesis_hash;
+                let announce = self.announce.clone();
                 handle.spawn(async move {
                     endpoint_task(
                         endpoint,
@@ -161,6 +177,7 @@ impl Emulator {
                         trace,
                         obs,
                         nut_blocks,
+                        announce,
                     )
                     .await;
                 })
@@ -172,11 +189,32 @@ impl Emulator {
     }
 }
 
+/// The framed UP 0 announcement for `block`, advertising the chain's current
+/// head as final.
+///
+/// Shared by the announcements a connection sends when it opens and by the ones
+/// the slot driver broadcasts later, so both describe the chain the same way.
+pub fn announcement_wire(block: &Block, ref_chain: &RefChain) -> Vec<u8> {
+    let ann = Announcement {
+        header: (**block.header).clone(),
+        final_block: advertised_final(&ref_chain.chain_blocks(), ref_chain.genesis_hash()),
+    };
+    frame_message(&ann.encode())
+}
+
+/// Announcements buffered per UP 0 subscriber.
+///
+/// A slot is 6 s and a stream only falls behind if its write stalls, so a few
+/// slots of slack is plenty; a lagging subscriber drops the oldest and keeps
+/// going rather than stalling the driver.
+const ANNOUNCE_BUFFER: usize = 16;
+
 /// Dial the NUT as emulated validator `index` and run the L0 reactive handler
 /// on the connection: verify the NUT's cert/ALPN (the handshake proves it),
 /// open UP 0 as the connection initiator, then serve the NUT's CE 128 / CE 129
 /// requests. Used where the emulated validator is the preferred initiator
 /// (DESIGN.md §4.3).
+#[allow(clippy::too_many_arguments)]
 pub async fn dial_nut(
     index: usize,
     genesis_hash: [u8; 32],
@@ -187,6 +225,7 @@ pub async fn dial_nut(
     obs: Arc<Mutex<ObsLog>>,
     nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
     plan: Vec<ScheduledTicket>,
+    announce: broadcast::Sender<Vec<u8>>,
 ) -> Result<(), EmuError> {
     let secret = SecretKeyset::trivial(index as u32).ed25519;
     let config = EndpointConfig {
@@ -226,19 +265,24 @@ pub async fn dial_nut(
 
     // Announce the reference blocks (skip genesis) so the NUT has something to
     // sync and re-announce (L1 authoring is announced like a real author).
-    let final_block = advertised_final(&ref_chain.chain_blocks(), genesis_hash);
     for block in ref_chain.chain_blocks().iter().skip(1) {
         record(&obs, peer, ObsKind::Up0Announce);
-        let ann = Announcement {
-            header: (**block.header).clone(),
-            final_block,
-        };
-        let wire = frame_message(&ann.encode());
+        let wire = announcement_wire(block, &ref_chain);
         trace_record(peer, UP, u64::from(send.id()), &wire, &trace, TraceDir::Rx);
         let _ = send.write_all(&wire).await;
     }
     // UP 0 is a persistent stream: keep the send half open for future
-    // announcements rather than finishing it (simple.md:108-111).
+    // announcements rather than finishing it (simple.md:108-111). Nothing else
+    // writes to it from here, so hand it to a pump task that forwards every
+    // block the slot driver authors from now on (A10).
+    tokio::spawn(pump_announcements(
+        send,
+        announce.subscribe(),
+        peer,
+        up0_stream_id,
+        Arc::clone(&trace),
+        Arc::clone(&obs),
+    ));
 
     // Read the receive half of the UP 0 stream we opened. The NUT's handshake
     // and its announcements come back on it, and nothing else observes them on
@@ -275,6 +319,7 @@ pub async fn dial_nut(
         trace,
         obs,
         nut_blocks,
+        announce,
     )
     .await;
     Ok(())
@@ -318,6 +363,7 @@ pub fn serve_ce129(_request: &StateRequest) -> StateResponse {
 
 /// Accept-loop for one emulated validator: record accepts and run the L0
 /// reactive handler on each connection.
+#[allow(clippy::too_many_arguments)]
 async fn endpoint_task(
     endpoint: Arc<Endpoint>,
     peer_index: u16,
@@ -326,6 +372,7 @@ async fn endpoint_task(
     trace: Arc<Mutex<Trace>>,
     obs: Arc<Mutex<ObsLog>>,
     nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
+    announce: broadcast::Sender<Vec<u8>>,
 ) {
     while let Some(incoming) = endpoint.accept().await {
         record(&obs, peer_index, ObsKind::Accept);
@@ -351,6 +398,7 @@ async fn endpoint_task(
         let trace = Arc::clone(&trace);
         let obs = Arc::clone(&obs);
         let nut_blocks = Arc::clone(&nut_blocks);
+        let announce = announce.clone();
         tokio::spawn(async move {
             handle_connection(
                 connection,
@@ -360,6 +408,7 @@ async fn endpoint_task(
                 trace,
                 obs,
                 nut_blocks,
+                announce,
             )
             .await;
         });
@@ -380,6 +429,7 @@ const STREAM_REFUSED: u32 = 1;
 /// would block every later one — nor drop a stream's halves once its first
 /// message is handled. Each accepted stream gets its own task instead, living
 /// exactly as long as the peer keeps the stream open.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     connection: quinn::Connection,
     peer_index: u16,
@@ -388,6 +438,7 @@ async fn handle_connection(
     trace: Arc<Mutex<Trace>>,
     obs: Arc<Mutex<ObsLog>>,
     nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
+    announce: broadcast::Sender<Vec<u8>>,
 ) {
     while let Ok((send, recv)) = connection.accept_bi().await {
         let connection = connection.clone();
@@ -395,6 +446,7 @@ async fn handle_connection(
         let trace = Arc::clone(&trace);
         let obs = Arc::clone(&obs);
         let nut_blocks = Arc::clone(&nut_blocks);
+        let announce = announce.subscribe();
         tokio::spawn(async move {
             handle_stream(
                 connection,
@@ -406,6 +458,7 @@ async fn handle_connection(
                 &trace,
                 &obs,
                 &nut_blocks,
+                announce,
             )
             .await;
         });
@@ -429,6 +482,7 @@ async fn handle_stream(
     trace: &Mutex<Trace>,
     obs: &Mutex<ObsLog>,
     nut_blocks: &Mutex<Vec<NutBlock>>,
+    mut announce: broadcast::Receiver<Vec<u8>>,
 ) {
     let stream_id = u64::from(send.id());
     let mut reader = StreamReader::new(recv);
@@ -459,30 +513,50 @@ async fn handle_stream(
             // further message until the peer closes the stream. Returning here
             // would drop both halves, which the peer reads as its incoming
             // static stream being closed — misbehaviour, and it disconnects.
+            // Both halves are live from here: the NUT keeps sending on this
+            // stream, and the slot driver keeps authoring blocks to announce
+            // back on it (A10).
             loop {
-                match reader.next().await {
-                    Ok(Some((_, content))) => {
-                        trace_record(peer_index, UP, stream_id, &content, trace, TraceDir::Tx);
-                        handle_up0(
-                            &connection,
-                            Some(&mut send),
-                            peer_index,
-                            genesis_hash,
-                            ref_chain,
-                            stream_id,
-                            &content,
-                            trace,
-                            obs,
-                            nut_blocks,
-                        )
-                        .await;
-                    }
-                    // The peer closed its half: the stream is done, not refused.
-                    Ok(None) => break,
-                    Err(_) => {
-                        refuse(&mut send, &mut reader);
-                        break;
-                    }
+                tokio::select! {
+                    incoming = reader.next() => match incoming {
+                        Ok(Some((_, content))) => {
+                            trace_record(peer_index, UP, stream_id, &content, trace, TraceDir::Tx);
+                            handle_up0(
+                                &connection,
+                                Some(&mut send),
+                                peer_index,
+                                genesis_hash,
+                                ref_chain,
+                                stream_id,
+                                &content,
+                                trace,
+                                obs,
+                                nut_blocks,
+                            )
+                            .await;
+                        }
+                        // The peer closed its half: the stream is done, not refused.
+                        Ok(None) => break,
+                        Err(_) => {
+                            refuse(&mut send, &mut reader);
+                            break;
+                        }
+                    },
+                    announced = announce.recv() => match announced {
+                        Ok(wire) => {
+                            record(obs, peer_index, ObsKind::Up0Announce);
+                            trace_record(peer_index, UP, stream_id, &wire, trace, TraceDir::Rx);
+                            if send.write_all(&wire).await.is_err() {
+                                break;
+                            }
+                        }
+                        // Fell behind: skip what was missed rather than stall
+                        // the driver. The NUT can still fetch over CE 128.
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        // The sender lives as long as the `Emulator`, so this
+                        // only happens at teardown, when the run is over.
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
                 }
             }
         }
@@ -508,6 +582,36 @@ fn refuse(send: &mut quinn::SendStream, reader: &mut StreamReader) {
     let code = quinn::VarInt::from_u32(STREAM_REFUSED);
     let _ = send.reset(code);
     reader.stop(code);
+}
+
+/// Forward every announcement the slot driver broadcasts onto one UP 0 send
+/// half, for as long as the stream lives.
+///
+/// A subscriber that falls behind by more than [`ANNOUNCE_BUFFER`] skips what
+/// it missed and carries on: dropping announcements on a stalled stream is
+/// better than stalling the driver, and the node can still fetch any block it
+/// hears about later over CE 128.
+async fn pump_announcements(
+    mut send: quinn::SendStream,
+    mut rx: broadcast::Receiver<Vec<u8>>,
+    peer_index: u16,
+    stream_id: u64,
+    trace: Arc<Mutex<Trace>>,
+    obs: Arc<Mutex<ObsLog>>,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(wire) => {
+                record(&obs, peer_index, ObsKind::Up0Announce);
+                trace_record(peer_index, UP, stream_id, &wire, &trace, TraceDir::Rx);
+                if send.write_all(&wire).await.is_err() {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
 }
 
 /// Read the receive half of a UP 0 stream the emulator opened, for as long as
@@ -584,7 +688,7 @@ async fn handle_up0(
         // block: fetch it over CE 128 and record it (fetch errors leave the
         // announcement recorded and the stream open).
         let hash = announcement.header.hash().0;
-        if should_fetch(&hash, ref_chain) {
+        if should_fetch(&hash, ref_chain, nut_blocks) {
             let _ = fetch_block(connection, hash, trace, obs, peer_index, nut_blocks).await;
         }
         return;
@@ -879,7 +983,7 @@ mod tests {
 
     #[test]
     fn serves_ce128_ascending_from_genesis() -> Result<(), EmuError> {
-        let mut ref_chain = RefChain::tiny(0).map_err(chain_err)?;
+        let ref_chain = RefChain::tiny(0).map_err(chain_err)?;
         let start = ref_chain.next_slot();
         for slot in start..start + 12 {
             let _ = ref_chain.author_block(slot).map_err(chain_err)?;
@@ -976,7 +1080,7 @@ mod tests {
     }
 
     fn chain_with_blocks() -> Result<RefChain, m2_reference::chain::ChainError> {
-        let mut chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(0)?;
         let start = chain.next_slot();
         let mut authored = 0;
         for slot in start..start + 12 {

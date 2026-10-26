@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn import_nut_block_ok_for_chain_head() -> Result<(), ChainError> {
-        let mut chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(0)?;
         let start = chain.next_slot();
         let mut authored = Vec::new();
         for slot in start..start + 60 {

@@ -16,13 +16,29 @@ use m2_scenario::dsl::{ObsKind, ObsLog};
 
 use crate::emu::{lock, record, trace_record, EmuError};
 
-/// True when `hash` is not in the reference chain, so the emulator must fetch
-/// the block from the announcing node rather than serve it locally.
-pub fn should_fetch(hash: &[u8; 32], ref_chain: &RefChain) -> bool {
-    !ref_chain
+/// True when `hash` is neither in the reference chain nor already fetched, so
+/// the emulator must fetch the block from the announcing node.
+///
+/// The NUT announces each of its blocks to every peer it is connected to, so
+/// without the second test the same block is fetched once per peer and
+/// recorded that many times. Six copies of two blocks then read as four
+/// equivocations, because every copy shares its parent with the original.
+pub fn should_fetch(
+    hash: &[u8; 32],
+    ref_chain: &RefChain,
+    nut_blocks: &Mutex<Vec<NutBlock>>,
+) -> bool {
+    let known_locally = ref_chain
         .chain_blocks()
         .iter()
-        .any(|block| block.header.hash().0 == *hash)
+        .any(|block| block.header.hash().0 == *hash);
+    !known_locally && !already_fetched(nut_blocks, hash)
+}
+
+fn already_fetched(nut_blocks: &Mutex<Vec<NutBlock>>, hash: &[u8; 32]) -> bool {
+    lock(nut_blocks)
+        .iter()
+        .any(|nut| nut.block.header.hash().0 == *hash)
 }
 
 /// Fetch the announced block via CE 128 (`DescendingInclusive`, `max_blocks =
@@ -83,12 +99,22 @@ pub async fn fetch_block(
 }
 
 /// Record a successfully fetched NUT block: `AuthorsBlock` + store entry.
+///
+/// Deduplicated under the store's own lock, which is what actually guarantees
+/// one entry per block: two peers can both pass [`should_fetch`] before either
+/// has recorded, and then both arrive here with the same block.
 fn record_block(obs: &Mutex<ObsLog>, peer: u16, nut_blocks: &Mutex<Vec<NutBlock>>, block: Block) {
-    record(obs, peer, ObsKind::AuthorsBlock);
-    lock(nut_blocks).push(NutBlock {
+    let hash = block.header.hash().0;
+    let mut store = lock(nut_blocks);
+    if store.iter().any(|nut| nut.block.header.hash().0 == hash) {
+        return;
+    }
+    store.push(NutBlock {
         block,
         announced_wall_ms: wall_ts(),
     });
+    drop(store);
+    record(obs, peer, ObsKind::AuthorsBlock);
 }
 
 /// Read the single response frame on a CE 128 fetch stream. The responder
@@ -129,8 +155,34 @@ mod tests {
     fn should_fetch_known_and_unknown() {
         let ref_chain = RefChain::tiny(0).expect("tiny chain builds");
         let known = ref_chain.chain_blocks()[0].header.hash().0;
-        assert!(!should_fetch(&known, &ref_chain));
-        assert!(should_fetch(&[0xee; 32], &ref_chain));
+        let store = Mutex::new(Vec::new());
+        assert!(!should_fetch(&known, &ref_chain, &store));
+        assert!(should_fetch(&[0xee; 32], &ref_chain, &store));
+
+        // Announced again by another peer, after the first fetch recorded it:
+        // the NUT announces every block to every peer it is connected to.
+        record_block(
+            &Mutex::new(ObsLog::new()),
+            1,
+            &store,
+            ref_chain.chain_blocks()[0].clone(),
+        );
+        let fetched = ref_chain.chain_blocks()[0].header.hash().0;
+        assert!(
+            !should_fetch(&fetched, &ref_chain, &store),
+            "a block already fetched is not fetched again"
+        );
+        assert_eq!(lock(&store).len(), 1);
+
+        // And the duplicate is refused at the store even when two peers race
+        // past `should_fetch` together.
+        record_block(
+            &Mutex::new(ObsLog::new()),
+            2,
+            &store,
+            ref_chain.chain_blocks()[0].clone(),
+        );
+        assert_eq!(lock(&store).len(), 1, "the store holds one copy per block");
     }
 
     #[test]

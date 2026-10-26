@@ -2,6 +2,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
 use std::time::{Duration, Instant};
 
 use jamnp_s::cert::san_for_key;
@@ -125,8 +126,8 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         )
     } else {
         let ref_spec = spec::tiny_spec(&ips, &ports, anchor_slot).map_err(internal)?;
-        let mut ref_chain = RefChain::with_spec(nut_index, ref_spec).map_err(internal)?;
-        let count = author_emulated_slots(&mut ref_chain).map_err(internal)?;
+        let ref_chain = RefChain::with_spec(nut_index, ref_spec).map_err(internal)?;
+        let count = seed_past_slots(&ref_chain).map_err(internal)?;
         let ref_chain = Arc::new(ref_chain);
         let emu = Emulator::l0(emu_indices.clone(), genesis_hash, cli.base_port)
             .await
@@ -142,7 +143,14 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         // Drive the preferred-initiator connectivity: emulated validators that
         // are the preferred initiator dial the NUT now; the rest wait the 5 s
         // grace then dial anyway (a soft finding).
-        let mut dial_tasks = Vec::new();
+        let announce = emu.announce_tx();
+        // Keep authoring for the whole observation window, announcing each
+        // block as its slot arrives (A10). Aborted with the dial tasks when the
+        // window closes.
+        let mut dial_tasks = vec![tokio::spawn(drive_slots(
+            Arc::clone(&ref_chain),
+            announce.clone(),
+        ))];
         for &i in &plan.initiate_now {
             let trace = trace.clone();
             let obs = obs.clone();
@@ -151,6 +159,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             let nut_san = nut_san.clone();
             let index = emu_indices[i];
             let peer_plan = plan_for_peer(&ticket_plan, index);
+            let announce = announce.clone();
             dial_tasks.push(tokio::spawn(async move {
                 let _ = m2_emu::emu::dial_nut(
                     index,
@@ -162,6 +171,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                     obs,
                     nut_blocks,
                     peer_plan,
+                    announce,
                 )
                 .await;
             }));
@@ -174,6 +184,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             let nut_san = nut_san.clone();
             let index = emu_indices[i];
             let peer_plan = plan_for_peer(&ticket_plan, index);
+            let announce = announce.clone();
             dial_tasks.push(tokio::spawn(async move {
                 tokio::time::sleep(connectivity::INITIATOR_GRACE).await;
                 // The NUT is the preferred initiator for this peer. The grace
@@ -194,6 +205,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                     obs,
                     nut_blocks,
                     peer_plan,
+                    announce,
                 )
                 .await;
             }));
@@ -219,6 +231,12 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
 
     if !dial_tasks.is_empty() {
         tokio::time::sleep(Duration::from_secs(cli.observe_secs)).await;
+    }
+    // Abort rather than drop: dropping a `JoinHandle` detaches the task, so the
+    // slot driver would keep authoring into the reference chain while the
+    // checks read it, and two runs of the same log could disagree.
+    for task in &dial_tasks {
+        task.abort();
     }
     drop(dial_tasks);
 
@@ -291,20 +309,54 @@ fn emulated_indices(nut_index: usize) -> Vec<usize> {
     (0..VALIDATOR_COUNT).filter(|&i| i != nut_index).collect()
 }
 
-/// Author up to three emulated (non-NUT) slots into `chain`; returns how many
-/// blocks were actually produced.
-fn author_emulated_slots(chain: &mut RefChain) -> Result<usize, m2_reference::chain::ChainError> {
-    let start = chain.next_slot();
+/// Seed the reference chain over the slots between genesis and now.
+///
+/// Every slot authored here is in the past, which is the point. The old
+/// pre-window burst started at the *current* slot and ran forward, so all but
+/// the first block carried a slot the wall clock had not reached yet, and a
+/// node is entitled to refuse a header from the future. Genesis is anchored to
+/// the start of the current epoch (A9), so there are real past slots to fill
+/// instead.
+///
+/// Returns how many blocks were produced; the harness skips the NUT's own
+/// slots by itself.
+fn seed_past_slots(chain: &RefChain) -> Result<usize, m2_reference::chain::ChainError> {
+    let now = chain.next_slot();
     let mut count = 0;
-    for slot in start..start + 12 {
+    for slot in (chain.genesis_slot() + 1)..=now {
         if chain.author_block(slot)?.is_some() {
             count += 1;
-            if count >= 3 {
-                break;
-            }
         }
     }
     Ok(count)
+}
+
+/// Author each slot as the wall clock reaches it and announce every block, for
+/// as long as the task lives.
+///
+/// This is what keeps the chain moving: before, it was authored once up front
+/// and then stood still for the rest of the observation window.
+async fn drive_slots(chain: Arc<RefChain>, announce: broadcast::Sender<Vec<u8>>) {
+    let mut next = chain.next_slot() + 1;
+    loop {
+        // Wait for the slot to actually begin. Sleeping to the boundary rather
+        // than for one slot period keeps the pacing from drifting over a run.
+        let start = m2_reference::chain::slot_start(next);
+        if let Ok(delay) = start.duration_since(std::time::SystemTime::now()) {
+            tokio::time::sleep(delay).await;
+        }
+        match chain.author_block(next) {
+            Ok(Some(block)) => {
+                // Fails only when nothing is subscribed, which is not an error:
+                // the announcement simply has nowhere to go yet.
+                let _ = announce.send(m2_emu::emu::announcement_wire(&block, &chain));
+            }
+            // The NUT's own slot, or nothing to author.
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        next += 1;
+    }
 }
 
 /// Probe the NUT port until a handshake succeeds or `timeout_secs` elapses.

@@ -2,7 +2,7 @@
 //! authoring harness, authoring blocks for every emulated validator and
 //! skipping the NUT's slots.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jam_node::hazmat::SecretKeysets;
 use jam_std_common::{Block, SecretKeyset};
@@ -47,6 +47,15 @@ pub fn current_epoch_start_slot() -> u32 {
     now - (now % jam_types::epoch_period())
 }
 
+/// Wall-clock instant at which `slot` begins.
+///
+/// Used to pace authoring on slot boundaries rather than by sleeping a slot
+/// period at a time, which would drift by the cost of each round over a run.
+pub fn slot_start(slot: u32) -> SystemTime {
+    UNIX_EPOCH
+        + Duration::from_secs(jam_types::JAM_COMMON_ERA + slot as u64 * SLOT_PERIOD_SEC)
+}
+
 /// The keyset handed to the NUT's slot in the harness keystore.
 ///
 /// The keystore is a fixed-length vector with one slot per validator, so the
@@ -61,7 +70,16 @@ const NON_VALIDATOR_KEYSET: u32 = u32::MAX;
 /// key it holds. With every keyset but the NUT's loaded, the NUT's slots are
 /// skipped by the harness itself and every other slot is authored.
 pub struct RefChain {
-    harness: jam_node::hazmat::AuthoringHarness,
+    /// Behind a mutex so the chain can be authored while it is shared.
+    ///
+    /// The emulator serves CE 128/129 from an `Arc<RefChain>` on several tasks
+    /// at once, and the slot driver authors into the same chain. Keeping the
+    /// mutex *inside* means every lock is held for a short synchronous section;
+    /// an `Arc<Mutex<RefChain>>` at the call sites would instead put a guard
+    /// into the emulator's async serve paths, where holding one across an
+    /// `.await` is a deadlock and `Send` hazard.
+    harness: std::sync::Mutex<jam_node::hazmat::AuthoringHarness>,
+    genesis_slot: u32,
     genesis_hash: [u8; 32],
 }
 
@@ -108,6 +126,7 @@ impl RefChain {
             )));
         }
         let genesis_hash = chain_spec.genesis_header.hash();
+        let genesis_slot = chain_spec.genesis_header.slot;
         let validators = SecretKeysets(FixedVec::from_fn(|i| {
             if i == nut_index {
                 SecretKeyset::trivial(NON_VALIDATOR_KEYSET)
@@ -125,12 +144,14 @@ impl RefChain {
                 pvm_backend: Some(jam_node::PvmBackend::Interpreter),
             },
         );
-        let mut this = Self {
-            harness,
+        let this = Self {
+            harness: std::sync::Mutex::new(harness),
+            genesis_slot,
             genesis_hash: genesis_hash.0,
         };
         // The reference engine is virtual-time: seed it with the current slot.
-        this.harness.next_slot = this.next_slot();
+        let next = this.next_slot();
+        this.harness().next_slot = next;
         Ok(this)
     }
 
@@ -139,12 +160,20 @@ impl RefChain {
         self.genesis_hash
     }
 
+    /// Slot the chain's genesis is anchored to (A9), which is where authoring
+    /// starts rather than slot 0.
+    pub fn genesis_slot(&self) -> u32 {
+        self.genesis_slot
+    }
+
     /// The underlying hazmat authoring harness.
     ///
     /// `pub(crate)`: the tickets/guarantees/etc. oracles need harness access
     /// (storage, keystore) but the field stays private to this module.
-    pub(crate) fn harness(&self) -> &jam_node::hazmat::AuthoringHarness {
-        &self.harness
+    pub(crate) fn harness(&self) -> std::sync::MutexGuard<'_, jam_node::hazmat::AuthoringHarness> {
+        self.harness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Current wall-clock slot (`(now - JAM_COMMON_ERA) / 6`).
@@ -154,23 +183,22 @@ impl RefChain {
 
     /// Advance virtual time to `slot` and author a block there if the slot
     /// belongs to an emulated validator; `None` when the author is the NUT.
-    pub fn author_block(&mut self, slot: u32) -> Result<Option<Block>, ChainError> {
-        let head_slot = self.harness.chain().best_block().1;
+    pub fn author_block(&self, slot: u32) -> Result<Option<Block>, ChainError> {
+        let mut harness = self.harness();
+        let head_slot = harness.chain().best_block().1;
         if slot <= head_slot {
             return Err(ChainError::Chain(format!(
                 "cannot author slot {slot}: reference chain head is at slot {head_slot}"
             )));
         }
-        let maybe_hash = self
-            .harness
+        let maybe_hash = harness
             .author
             .author_block(slot)
             .map_err(|e| ChainError::Harness(e.to_string()))?;
-        self.harness.next_slot = slot + 1;
+        harness.next_slot = slot + 1;
         match maybe_hash {
             Some(hash) => {
-                let block = self
-                    .harness
+                let block = harness
                     .chain()
                     .block(&hash)
                     .map_err(|e| ChainError::Chain(e.to_string()))?
@@ -185,7 +213,8 @@ impl RefChain {
 
     /// The reference chain (genesis + authored blocks) in order.
     pub fn chain_blocks(&self) -> Vec<Block> {
-        let chain = self.harness.chain();
+        let harness = self.harness();
+        let chain = harness.chain();
         let (head, _) = chain.best_block();
         let mut blocks = Vec::new();
         let mut hash = head;
@@ -206,7 +235,7 @@ impl RefChain {
 
     /// State root for the block with the given hash.
     pub fn storage_root(&self, hash: &[u8; 32]) -> Option<[u8; 32]> {
-        self.harness
+        self.harness()
             .chain()
             .state_root(&HeaderHash::from(*hash))
             .ok()?
@@ -244,7 +273,7 @@ mod tests {
 
     #[test]
     fn authors_emulated_slots_only() -> Result<(), ChainError> {
-        let mut chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(0)?;
         let start = chain.next_slot();
         let mut authored = Vec::new();
         for slot in start..start + 12 {
@@ -286,7 +315,7 @@ mod tests {
         assert_eq!(validator_count, 6, "the tiny keyset is six validators");
 
         for nut_index in 0..validator_count {
-            let mut chain = RefChain::tiny(nut_index)?;
+            let chain = RefChain::tiny(nut_index)?;
             let start = chain.next_slot();
             let mut authored = 0;
             for slot in start..start + 12 {
@@ -323,8 +352,8 @@ mod tests {
 
     #[test]
     fn deterministic_for_fixed_seed() -> Result<(), ChainError> {
-        let mut a = RefChain::tiny(0)?;
-        let mut b = RefChain::tiny(0)?;
+        let a = RefChain::tiny(0)?;
+        let b = RefChain::tiny(0)?;
         let start = a.next_slot();
         let mut a_hashes = Vec::new();
         let mut b_hashes = Vec::new();
@@ -344,7 +373,7 @@ mod tests {
 
     #[test]
     fn storage_root_matches_genesis() -> Result<(), ChainError> {
-        let mut chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(0)?;
         let genesis = chain.genesis_hash();
         let root = chain
             .storage_root(&genesis)

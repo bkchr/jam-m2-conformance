@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn state_snapshot_root_matches_storage_root() -> Result<(), ChainError> {
-        let mut chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(0)?;
         let start = chain.next_slot();
         let mut authored = 0;
         for slot in start..start + 24 {
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn state_diff_reports_root_and_key_mismatch() -> Result<(), ChainError> {
-        let mut chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(0)?;
         let start = chain.next_slot();
         for slot in start..start + 24 {
             if chain.author_block(slot)?.is_some() {

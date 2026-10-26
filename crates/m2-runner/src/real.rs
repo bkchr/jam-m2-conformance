@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn run_build_l1_from_nut_blocks() -> Result<(), ChainError> {
-        let mut ref_chain = RefChain::tiny(0)?;
+        let ref_chain = RefChain::tiny(0)?;
         let start = ref_chain.next_slot();
         let mut authored = None;
         for slot in start..start + 12 {
