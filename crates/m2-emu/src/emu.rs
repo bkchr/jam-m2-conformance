@@ -835,7 +835,10 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Record an observation from `peer` at the current monotonic time.
-pub(crate) fn record(obs: &Mutex<ObsLog>, peer: u16, kind: ObsKind) {
+///
+/// Public so the runner can record decisions it makes about a connection
+/// before any emulator code runs on it, such as the post-grace fallback dial.
+pub fn record(obs: &Mutex<ObsLog>, peer: u16, kind: ObsKind) {
     let at = mono_ts();
     lock(obs).push(
         at,

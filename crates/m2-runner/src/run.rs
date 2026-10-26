@@ -8,6 +8,8 @@ use jamnp_s::cert::san_for_key;
 use m2_emu::emu::Emulator;
 use m2_emu::ticket_io::plan_for_peer;
 use m2_reference::chain::RefChain;
+use m2_scenario::dsl::ObsKind;
+use m2_scenario::scenarios::l0;
 
 use crate::cli::{Cli, Preset};
 use crate::connectivity::{self, ConnectivityPlan, ProbeOutcome};
@@ -141,7 +143,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         // are the preferred initiator dial the NUT now; the rest wait the 5 s
         // grace then dial anyway (a soft finding).
         let mut dial_tasks = Vec::new();
-        for i in plan.initiate_now {
+        for &i in &plan.initiate_now {
             let trace = trace.clone();
             let obs = obs.clone();
             let nut_blocks = nut_blocks.clone();
@@ -164,7 +166,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                 .await;
             }));
         }
-        for i in plan.wait_then_connect {
+        for &i in &plan.wait_then_connect {
             let trace = trace.clone();
             let obs = obs.clone();
             let nut_blocks = nut_blocks.clone();
@@ -174,6 +176,14 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             let peer_plan = plan_for_peer(&ticket_plan, index);
             dial_tasks.push(tokio::spawn(async move {
                 tokio::time::sleep(connectivity::INITIATOR_GRACE).await;
+                // The NUT is the preferred initiator for this peer. The grace
+                // is there so the pair still connects if it never dials, not
+                // so we open a second connection alongside its first.
+                let peer = index as u16;
+                if !connectivity::should_fallback_dial(&lock(&obs), peer) {
+                    return;
+                }
+                m2_emu::emu::record(&obs, peer, ObsKind::Other(l0::FALLBACK_DIAL));
                 let _ = m2_emu::emu::dial_nut(
                     index,
                     genesis_hash,
@@ -221,8 +231,12 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                 data,
                 &lock(obs),
                 &lock(trace),
-                reference_block_count,
-                emu_indices[0] as u16,
+                l0::L0Ctx {
+                    reference_block_count,
+                    first_emu_peer: emu_indices[0] as u16,
+                    nut_preferred_peers: peers_of(&plan.wait_then_connect, &emu_indices),
+                    emu_preferred_peers: peers_of(&plan.initiate_now, &emu_indices),
+                },
             )
         }
         ObsSource::Fabricated { .. } => {
@@ -377,6 +391,16 @@ fn loopback_ips() -> [[u8; 16]; 6] {
         ip[15] = 1;
     }
     ips
+}
+
+/// Map plan positions onto validator indices.
+///
+/// `ConnectivityPlan` holds positions into `emu_indices`, not validator
+/// indices; the observation log is keyed by validator index.
+fn peers_of(positions: &[usize], emu_indices: &[usize]) -> Vec<u16> {
+    let mut peers: Vec<u16> = positions.iter().map(|&i| emu_indices[i] as u16).collect();
+    peers.sort_unstable();
+    peers
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

@@ -56,8 +56,7 @@ pub(crate) fn build_real_run_ctx(
     data: &RealRunData,
     obs: &ObsLog,
     trace: &Trace,
-    reference_block_count: usize,
-    first_emu_peer: u16,
+    l0: m2_scenario::scenarios::l0::L0Ctx,
 ) -> RunCtx {
     let nut_blocks = lock(&data.nut_blocks);
     let l1 = build_l1_ctx(&data.ref_chain, &nut_blocks, obs, &data.plan);
@@ -70,8 +69,7 @@ pub(crate) fn build_real_run_ctx(
         data.target_epoch,
     );
     RunCtx {
-        l0_reference_block_count: reference_block_count,
-        l0_first_emu_peer: first_emu_peer,
+        l0,
         l1: Some(l1),
         l2: Some(l2),
     }

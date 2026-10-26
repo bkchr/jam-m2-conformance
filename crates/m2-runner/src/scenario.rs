@@ -20,9 +20,7 @@ use crate::report::{CheckOutcome, Finding};
 
 /// Per-lane facts a run's scenario evaluation reads.
 pub(crate) struct RunCtx {
-    pub l0_reference_block_count: usize,
-    /// Lowest emulated validator index: 1 only when the NUT is at index 0.
-    pub l0_first_emu_peer: u16,
+    pub l0: l0::L0Ctx,
     pub l1: Option<L1Ctx>,
     pub l2: Option<L2Ctx>,
 }
@@ -53,10 +51,7 @@ pub(crate) fn evaluate(obs: &ObsLog, run_ctx: &RunCtx) -> Evaluation {
     let mut findings = Vec::new();
     let mut all_hard_passed = true;
     let mut lanes: Vec<(&str, Vec<Check>)> =
-        vec![(
-            "L0",
-            l0::all(run_ctx.l0_reference_block_count, run_ctx.l0_first_emu_peer),
-        )];
+        vec![("L0", l0::all(&run_ctx.l0))];
     if let Some(ctx) = &run_ctx.l1 {
         lanes.push(("L1", l1::all(ctx)));
     }
@@ -260,9 +255,14 @@ pub(crate) fn fabricated_run_ctx(
     };
 
     Ok(RunCtx {
-        l0_reference_block_count: reference_block_count,
-        // The fabricated log is written for a NUT at index 0.
-        l0_first_emu_peer: l0::PEER_1,
+        // The fabricated log is written for a NUT at index 0, which initiates
+        // to every emulated peer and so never needs a fallback dial.
+        l0: l0::L0Ctx {
+            reference_block_count,
+            first_emu_peer: l0::PEER_1,
+            nut_preferred_peers: vec![l0::PEER_1],
+            emu_preferred_peers: Vec::new(),
+        },
         l1: Some(l1),
         l2: Some(l2),
     })

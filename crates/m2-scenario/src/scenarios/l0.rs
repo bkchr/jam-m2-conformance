@@ -67,6 +67,9 @@ pub const CE129_SIZE_CAP: u8 = 37;
 pub const CE129_LEN_PREFIXED: u8 = 38;
 pub const NUT_INITIATED: u8 = 39;
 pub const REANNOUNCED: u8 = 40;
+/// The emulator dialled a peer it was *not* the preferred initiator for, after
+/// the grace expired without the NUT connecting (`simple.md:70-80`).
+pub const FALLBACK_DIAL: u8 = 47;
 
 /// TLS cert `simple.md:7-23`: Ed25519 cert, key == on-chain key, exactly one
 /// SAN `e`+base32; a bad cert closes the connection.
@@ -135,19 +138,50 @@ pub fn alpn() -> Check {
     })
 }
 
-/// Preferred initiator `simple.md:70-80`: the NUT initiates where preferred
-/// within the ~5 s grace, then the other side connects anyway (soft).
+/// Preferred initiator `simple.md:70-80`: of each validator pair exactly one
+/// side dials, decided by `P(a, b)`.
 ///
-/// Which emulated peers the NUT is preferred toward depends on the key set
-/// (with trivial keys, the NUT index matters), so the observation is matched
-/// on *any* emulated peer.
-pub fn preferred_initiator() -> Check {
-    check("preferred_initiator", Severity::Hard, |obs| {
-        vec![log::check(
-            "nut_initiates_within_grace",
-            obs.first(ObsKind::Other(NUT_INITIATED)).is_some(),
-            Severity::Soft,
-        )]
+/// Which side that is depends on the key set, so the split is given per run:
+/// `nut_preferred` are the emulated peers the NUT should dial, `emu_preferred`
+/// the ones the emulator dials. Asserting the two sets is strictly stronger
+/// than a flat peer count, which a node that dialled everything, or nothing and
+/// got dialled, would both satisfy.
+///
+/// `FALLBACK_DIAL` marks a peer the emulator dialled only because the grace
+/// expired first, so its absence is what "within the grace" means here. Reading
+/// it from the log beats comparing timestamps: it is recorded at the decision
+/// point, by the code that made the decision.
+pub fn preferred_initiator(nut_preferred: Vec<u16>, emu_preferred: Vec<u16>) -> Check {
+    check("preferred_initiator", Severity::Hard, move |obs| {
+        let initiated = obs.peers_with(ObsKind::Other(NUT_INITIATED));
+        let missing: Vec<u16> = nut_preferred
+            .iter()
+            .copied()
+            .filter(|p| !initiated.contains(p))
+            .collect();
+        let unexpected: Vec<u16> = emu_preferred
+            .iter()
+            .copied()
+            .filter(|p| initiated.contains(p))
+            .collect();
+        let fell_back = obs.peers_with(ObsKind::Other(FALLBACK_DIAL));
+        vec![
+            log::check(
+                "nut_initiates_where_preferred",
+                missing.is_empty(),
+                Severity::Hard,
+            ),
+            log::check(
+                "nut_waits_where_not_preferred",
+                unexpected.is_empty(),
+                Severity::Hard,
+            ),
+            log::check(
+                "nut_initiates_within_grace",
+                fell_back.is_empty(),
+                Severity::Soft,
+            ),
+        ]
     })
 }
 
@@ -284,20 +318,36 @@ pub fn ce129_serve() -> Check {
     })
 }
 
+/// Per-run facts the L0 lane needs, which depend on the validator set rather
+/// than on the protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L0Ctx {
+    /// Blocks the reference chain authored, for the CE 128 coverage check.
+    pub reference_block_count: usize,
+    /// Lowest emulated validator index: 1 only when the NUT is at index 0.
+    pub first_emu_peer: u16,
+    /// Emulated peers the NUT is the preferred initiator for: it should dial
+    /// these, and the emulator should not.
+    pub nut_preferred_peers: Vec<u16>,
+    /// Emulated peers the emulator is the preferred initiator for: it dials
+    /// these, and the NUT should wait.
+    pub emu_preferred_peers: Vec<u16>,
+}
+
 /// All nine L0 checks in dependency order (L0 first; later lanes build on it).
-///
-/// `first_emu_peer` is the lowest emulated validator index of the run, which is
-/// the peer the connection-established check watches.
-pub fn all(reference_block_count: usize, first_emu_peer: u16) -> Vec<Check> {
+pub fn all(ctx: &L0Ctx) -> Vec<Check> {
     vec![
-        tls_cert(first_emu_peer),
+        tls_cert(ctx.first_emu_peer),
         alpn(),
-        preferred_initiator(),
+        preferred_initiator(
+            ctx.nut_preferred_peers.clone(),
+            ctx.emu_preferred_peers.clone(),
+        ),
         endpoint_decoding(),
         builder_slots(),
         up0_handshake(),
         up0_announce(),
-        ce128_serve(reference_block_count),
+        ce128_serve(ctx.reference_block_count),
         ce129_serve(),
     ]
 }
@@ -383,15 +433,97 @@ mod tests {
         );
     }
 
-    #[test]
-    fn preferred_initiator_soft_on_never() {
-        let mut obs = ObsLog::new();
-        obs.push(1000, ev(1, ObsKind::Other(NUT_INITIATED), 1000)); // within 5 s grace
-        assert!(all_pass(&run(&preferred_initiator(), &obs)));
+    /// The run under test: the NUT should dial peers 0, 1 and 2; the emulator
+    /// dials 3 and 4. This is the split the default six-validator set with the
+    /// NUT at index 5 actually produces.
+    fn split() -> (Vec<u16>, Vec<u16>) {
+        (vec![0, 1, 2], vec![3, 4])
+    }
 
-        let never = ObsLog::new(); // NUT never initiates
-        let results = run(&preferred_initiator(), &never);
-        assert_eq!(results[0].outcome, Outcome::Fail(Severity::Soft));
+    fn initiator_check() -> Check {
+        let (nut, emu) = split();
+        preferred_initiator(nut, emu)
+    }
+
+    fn outcome_of<'a>(results: &'a [CheckResult], name: &str) -> &'a Outcome {
+        &results
+            .iter()
+            .find(|r| r.name == name)
+            .expect("check is reported")
+            .outcome
+    }
+
+    #[test]
+    fn preferred_initiator_passes_on_the_exact_split() {
+        let mut obs = ObsLog::new();
+        for peer in [0u16, 1, 2] {
+            obs.push(1000, ev(peer, ObsKind::Other(NUT_INITIATED), 1000));
+        }
+        assert!(all_pass(&run(&initiator_check(), &obs)));
+    }
+
+    /// A node that dials nothing: the old flat check could only call this soft,
+    /// because it asked whether *any* peer saw an initiation.
+    #[test]
+    fn preferred_initiator_fails_hard_when_the_nut_never_dials() {
+        let results = run(&initiator_check(), &ObsLog::new());
+        assert_eq!(
+            outcome_of(&results, "nut_initiates_where_preferred"),
+            &Outcome::Fail(Severity::Hard)
+        );
+    }
+
+    /// A node that dials one of the three it owes is not conformant, and a
+    /// count-based check that compared totals could still be satisfied by it
+    /// dialling somewhere else instead.
+    #[test]
+    fn preferred_initiator_fails_hard_on_a_partial_split() {
+        let mut obs = ObsLog::new();
+        obs.push(1000, ev(0, ObsKind::Other(NUT_INITIATED), 1000));
+        let results = run(&initiator_check(), &obs);
+        assert_eq!(
+            outcome_of(&results, "nut_initiates_where_preferred"),
+            &Outcome::Fail(Severity::Hard)
+        );
+    }
+
+    /// Dialling a peer the emulator is preferred for breaks the rule from the
+    /// other side, even with all three owed connections made.
+    #[test]
+    fn preferred_initiator_fails_hard_when_the_nut_dials_where_it_should_wait() {
+        let mut obs = ObsLog::new();
+        for peer in [0u16, 1, 2, 3] {
+            obs.push(1000, ev(peer, ObsKind::Other(NUT_INITIATED), 1000));
+        }
+        let results = run(&initiator_check(), &obs);
+        assert_eq!(
+            outcome_of(&results, "nut_waits_where_not_preferred"),
+            &Outcome::Fail(Severity::Hard)
+        );
+        assert_eq!(
+            outcome_of(&results, "nut_initiates_where_preferred"),
+            &Outcome::Pass
+        );
+    }
+
+    /// The node connected everywhere it owed, but only after the grace had
+    /// expired and the emulator had already dialled: soft, not hard.
+    #[test]
+    fn preferred_initiator_is_soft_when_the_nut_misses_the_grace() {
+        let mut obs = ObsLog::new();
+        obs.push(5000, ev(2, ObsKind::Other(FALLBACK_DIAL), 5000));
+        for peer in [0u16, 1, 2] {
+            obs.push(7000, ev(peer, ObsKind::Other(NUT_INITIATED), 7000));
+        }
+        let results = run(&initiator_check(), &obs);
+        assert_eq!(
+            outcome_of(&results, "nut_initiates_where_preferred"),
+            &Outcome::Pass
+        );
+        assert_eq!(
+            outcome_of(&results, "nut_initiates_within_grace"),
+            &Outcome::Fail(Severity::Soft)
+        );
     }
 
     #[test]
@@ -510,7 +642,12 @@ mod tests {
 
     #[test]
     fn all_l0_checks_distinct() {
-        let checks = all(2, PEER_1);
+        let checks = all(&L0Ctx {
+            reference_block_count: 2,
+            first_emu_peer: PEER_1,
+            nut_preferred_peers: vec![PEER_1],
+            emu_preferred_peers: Vec::new(),
+        });
         assert_eq!(checks.len(), 9);
         let mut ids: Vec<&str> = checks.iter().map(|c| c.id).collect();
         ids.sort();

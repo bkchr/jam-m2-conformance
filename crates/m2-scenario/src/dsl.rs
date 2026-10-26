@@ -150,6 +150,32 @@ impl ObsLog {
             .map(|(_, o)| o)
     }
 
+    /// First record of `kind` from `peer`, in observation order.
+    ///
+    /// [`ObsLog::first`] ignores the peer, which is wrong for any per-connection
+    /// decision: one peer's observation would answer for all of them.
+    pub fn first_from<K: Into<ObsKind>>(&self, peer: u16, kind: K) -> Option<&Obs> {
+        let kind = kind.into();
+        self.records
+            .iter()
+            .find(|(_, o)| o.peer == peer && o.kind == kind)
+            .map(|(_, o)| o)
+    }
+
+    /// Every peer with a record of `kind`, ascending and deduplicated.
+    pub fn peers_with<K: Into<ObsKind>>(&self, kind: K) -> Vec<u16> {
+        let kind = kind.into();
+        let mut peers: Vec<u16> = self
+            .records
+            .iter()
+            .filter(|(_, o)| o.kind == kind)
+            .map(|(_, o)| o.peer)
+            .collect();
+        peers.sort_unstable();
+        peers.dedup();
+        peers
+    }
+
     /// Last record of `kind`, in observation order.
     pub fn last<K: Into<ObsKind>>(&self, kind: K) -> Option<&Obs> {
         let kind = kind.into();

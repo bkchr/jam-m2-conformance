@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use ed25519_consensus::SigningKey;
 use jamnp_s::endpoint::{Endpoint, EndpointConfig, EndpointError};
 use jamnp_s::preferred::preferred_initiator;
+use m2_scenario::dsl::{ObsKind, ObsLog};
+use m2_scenario::scenarios::l0;
 
 /// How long the runner waits for the NUT's QUIC port to come up (§4 step 2).
 pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -84,6 +86,23 @@ pub fn plan_connectivity(emu_keys: &[[u8; 32]], nut_key: &[u8; 32]) -> Connectiv
         }
     }
     plan
+}
+
+/// Whether a non-preferred emulated validator should still dial `peer` now that
+/// the grace has expired.
+///
+/// The grace exists so a pair still connects when the preferred initiator fails
+/// (`simple.md:70-80`); it is not licence to open a second connection to a peer
+/// that already connected. Dialling unconditionally gives every such pair two
+/// connections, and makes the node's own initiation unmeasurable — the
+/// emulator-initiated count comes out the same whether the node dialled or not.
+///
+/// The predicate is per peer on purpose. [`ObsLog::first`] ignores the peer, so
+/// using it here would let one node-initiated connection suppress the fallback
+/// dial for every other peer too.
+pub fn should_fallback_dial(obs: &ObsLog, peer: u16) -> bool {
+    obs.first_from(peer, ObsKind::Other(l0::NUT_INITIATED))
+        .is_none()
 }
 
 /// Errors surfaced while probing or driving the connectivity phase.
@@ -233,6 +252,53 @@ mod tests {
         let outcome = probe_nut(addr, &wrong_san, GENESIS, Duration::from_secs(2)).await;
         assert!(!outcome.connected);
         server.abort();
+    }
+
+    fn obs_with(entries: &[(u16, u8)]) -> ObsLog {
+        let mut obs = ObsLog::new();
+        for (i, (peer, code)) in entries.iter().enumerate() {
+            let at = i as u64;
+            obs.push(
+                at,
+                m2_scenario::dsl::Obs {
+                    peer: *peer,
+                    kind: ObsKind::Other(*code),
+                    at_ms: at,
+                },
+            );
+        }
+        obs
+    }
+
+    #[test]
+    fn fallback_dials_when_the_nut_never_connected() {
+        assert!(should_fallback_dial(&ObsLog::new(), 2));
+    }
+
+    #[test]
+    fn no_fallback_once_the_nut_connected_to_that_peer() {
+        let obs = obs_with(&[(2, l0::NUT_INITIATED)]);
+        assert!(!should_fallback_dial(&obs, 2));
+    }
+
+    /// The predicate is per peer. `ObsLog::first` ignores the peer, so using it
+    /// would let one node-initiated connection suppress the fallback dial for
+    /// every other peer, leaving them unconnected for the whole run.
+    #[test]
+    fn another_peers_connection_does_not_suppress_the_dial() {
+        let obs = obs_with(&[(1, l0::NUT_INITIATED)]);
+        assert!(
+            should_fallback_dial(&obs, 2),
+            "peer 2 has no connection of its own and must still be dialled"
+        );
+    }
+
+    /// Only an inbound connection counts. Observations the emulator records for
+    /// its own activity on a peer must not read as the NUT having dialled.
+    #[test]
+    fn unrelated_observations_do_not_count_as_a_connection() {
+        let obs = obs_with(&[(2, l0::ENDPOINT_DIALED), (2, l0::CERT_SAN_OK)]);
+        assert!(should_fallback_dial(&obs, 2));
     }
 
     #[test]
