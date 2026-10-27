@@ -284,6 +284,55 @@ mod tests {
         );
     }
 
+    /// A 40-character lowercase hex run, i.e. a commit hash written out.
+    fn carries_a_commit_hash(line: &str) -> bool {
+        line.as_bytes().windows(40).any(|w| {
+            w.iter()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
+    }
+
+    /// The oracle grades the node under test, so both must be built from the
+    /// same polkajam revision unless a run deliberately compares revisions.
+    /// The workspace manifest holds the pin and `scripts/prepare-nut.sh` reads
+    /// it from there; the copy the script used to carry drifted three
+    /// revisions behind before anyone noticed, because nothing compared them.
+    #[test]
+    fn the_nut_binary_is_built_from_the_pinned_revision() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+
+        let revs: Vec<&str> = manifest
+            .lines()
+            .filter(|l| l.contains("polkajam.git"))
+            .filter_map(|l| l.split("rev = \"").nth(1))
+            .filter_map(|r| r.split('"').next())
+            .collect();
+        assert!(
+            !revs.is_empty(),
+            "the workspace must pin polkajam by revision, not by branch"
+        );
+        assert!(
+            revs.windows(2).all(|w| w[0] == w[1]),
+            "every polkajam dependency must name one revision; got {revs:?}"
+        );
+
+        let script = std::fs::read_to_string(root.join("scripts/prepare-nut.sh")).unwrap();
+        assert!(
+            script.contains("Cargo.toml"),
+            "prepare-nut.sh must read the revision out of the manifest"
+        );
+        let copies: Vec<&str> = script
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .filter(|l| carries_a_commit_hash(l))
+            .collect();
+        assert!(
+            copies.is_empty(),
+            "prepare-nut.sh must not hold its own copy of the revision: {copies:?}"
+        );
+    }
+
     #[test]
     fn split_host_port_bracketed_ipv6() {
         assert_eq!(split_host_port("[::]:40000"), ("::", "40000"));

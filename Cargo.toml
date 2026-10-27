@@ -15,9 +15,14 @@ license = "Apache-2.0"
 repository = "https://github.com/paritytech/jam-m2-conformance"
 
 # Polkajam reference-engine crates are git dependencies pinned to a commit
-# (DESIGN.md §8). Nothing from polkajam is vendored into this repository; the
-# two local patches in `patches/` apply only to the NUT *binary*, built by
-# `scripts/prepare-nut.sh` into the gitignored `third_party/`.
+# (DESIGN.md §8). Nothing from polkajam is vendored into this repository.
+#
+# This pin is the single source of the polkajam revision: `scripts/prepare-nut.sh`
+# reads it from here to build the NUT *binary* into the gitignored `third_party/`,
+# so the node under test and the engine that grades it are the same build.
+# Re-pinning is deliberate -- upstream HEAD has broken this workspace three times
+# in four weeks -- so move it at most once per milestone, in a commit of its own
+# that records what changed in the genesis writer and the hazmat exports.
 [workspace.dependencies]
 jam-types = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "940ef56c7a2a601bccfd2a8d2375be48dc0fb941" }
 jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "940ef56c7a2a601bccfd2a8d2375be48dc0fb941" }

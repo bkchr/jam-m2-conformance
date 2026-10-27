@@ -14,7 +14,7 @@ artefact the NUT produces against the polkajam `hazmat` reference engine.
 (connectivity/sync), **L1** (block authoring), and **L2** (Safrole tickets). See [DESIGN.md](DESIGN.md)
 for the design; this README documents the current implementation state.
 
-- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **327 passed / 0 failed** ✓,
+- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **328 passed / 0 failed** ✓,
   `cargo fmt --all --check` ✓, no `unwrap`/`panic`/`expect`/`todo!` in non-test code.
 - Dry-run baseline: `cargo run -p m2-runner -- --preset mock --dry-run --session-dir /tmp/x`
   exits 0 with **all L0+L1+L2 checks HARD PASS** — the harness's own expectations are satisfiable.
@@ -38,10 +38,9 @@ cargo test --workspace
 # Dry-run baseline (no real NUT; fabricates a conforming observation log):
 cargo run -p m2-runner -- --preset mock --dry-run --session-dir /tmp/m2-dry
 
-# Real surface against the patched polkajam NUT:
-# (binary built from third_party/polkajam; needs the generic PVM sandbox env in this environment)
+# Real surface against the polkajam NUT:
+# (binary built from third_party/polkajam by scripts/prepare-nut.sh)
 PATH="$PWD/third_party/polkajam/target/release:$PATH" \
-POLKAVM_SANDBOX=generic POLKAVM_ALLOW_EXPERIMENTAL=1 \
 cargo run -p m2-runner -- --seed 1 --validator-index 5 --base-port 40000 \
   --preset polkajam --session-dir sessions/p0 --startup-timeout 60 --observe-secs 90
 ```
@@ -52,7 +51,7 @@ preferred-initiator rule), `--base-port`, `--preset` (`polkajam`/`docker`/`mock`
 
 ## Real-surface results vs polkajam-as-NUT (2026-09)
 
-The harness runs end-to-end against the patched polkajam NUT and produces a genuine conformance
+The harness runs end-to-end against the polkajam NUT and produces a genuine conformance
 report (`sessions/<id>/report/{report.md,findings.json}`, `traces/jamnp.{bin,json}`):
 
 - **L0 connectivity**: 20/22 HARD PASS — real TLS 1.3 mutual handshake, Ed25519 cert + SAN,
@@ -74,13 +73,12 @@ the dry-run all-pass baseline.
 
 Polkajam's library crates (`jam-types`, `jam-std-common`, `jam-node` with
 `hazmat`, `polkajam-fuzz` declared/unused) are ordinary **git dependencies**
-pinned to commit `44cc3ec20` (DESIGN.md §8). Nothing from polkajam is vendored
-into this repository.
+pinned to a commit in the root `Cargo.toml` (DESIGN.md §8). Nothing from
+polkajam is vendored into this repository.
 
-The two patches in `patches/` (ALPN `jamnp-s/1`, polkavm `generic-sandbox`)
-apply only to the polkajam **binary** used as the node under test — the library
-dependency needs neither, because the harness never runs polkajam's networking
-and pins `PvmBackend::Interpreter`. Build the NUT binary with:
+That pin is the **single source** of the polkajam revision. `prepare-nut.sh`
+reads it from the manifest to build the `polkajam` **binary** used as the node
+under test, so the node and the engine that grades it are the same build:
 
 ```sh
 ./scripts/prepare-nut.sh
@@ -89,6 +87,21 @@ export PATH="$PWD/third_party/polkajam/target/release:$PATH"
 
 `third_party/` is gitignored. The harness's own networking (`jamnp-s`) is an
 independent implementation.
+
+**Re-pinning policy.** Upstream HEAD has broken this workspace three times in
+four weeks, so the revision moves deliberately: at most once per milestone, in
+a commit of its own, recording what changed in the genesis writer
+(`chainspec.rs`, `chain/exec/the_state.rs`) and the `hazmat` export list, with
+a regenerated spec diffed against the old one. `POLKAJAM_REV` overrides the
+revision for a one-off comparison and warns that the oracle no longer matches.
+
+No patches are applied to the NUT. The ALPN patch this repository used to carry
+(`jamnp-s/0` → `/1`) is obsolete: upstream carries `JAMNP_VERSION = 1` itself.
+polkavm's generic sandbox is a one-line feature flip in the script, behind
+`POLKAJAM_GENERIC_SANDBOX=1`, for hosts that deny unprivileged `userfaultfd`;
+run the NUT with `POLKAVM_SANDBOX=generic` when it is enabled. The library
+dependency needs neither, because the harness never runs polkajam's networking
+and pins `PvmBackend::Interpreter`.
 
 ## Roadmap status (DESIGN §13)
 
