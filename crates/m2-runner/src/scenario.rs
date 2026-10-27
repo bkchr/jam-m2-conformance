@@ -212,8 +212,9 @@ pub(crate) fn fabricated_run_ctx(
     let first_root = first.header.hash().0;
     let second_root = second.header.hash().0;
     let slot = first.header.slot;
+    let second_slot = second.header.slot;
     let included_ids: Vec<[u8; 32]> = first.extrinsic.tickets.iter().map(|t| t.id().0).collect();
-    let slot_start = JAM_COMMON_ERA * 1000 + slot as u64 * SLOT_PERIOD_MS;
+    let slot_start = |slot: u32| JAM_COMMON_ERA * 1000 + slot as u64 * SLOT_PERIOD_MS;
     let import = |block: &jam_std_common::Block, root: Option<[u8; 32]>| ImportFact {
         header_root: block.header.hash().0,
         parent: block.header.parent.0,
@@ -236,20 +237,27 @@ pub(crate) fn fabricated_run_ctx(
             import(&second, Some(second_root)),
         ],
         nut_blocks: vec![
+            // Each block is announced at the start of *its own* slot. The two
+            // are not necessarily adjacent -- the reference only authors the
+            // slots it wins, so the NUT may own the one in between -- and
+            // timing the second as `first + one slot period` put its
+            // announcement before its slot had begun whenever that happened,
+            // failing `l1_timing_within_slot` for one wall-clock slot in
+            // several. A fabricated baseline must not depend on the clock.
             NutBlock {
                 block: first,
-                announced_wall_ms: slot_start,
+                announced_wall_ms: slot_start(slot),
             },
             NutBlock {
                 block: second,
-                announced_wall_ms: slot_start + SLOT_PERIOD_MS,
+                announced_wall_ms: slot_start(second_slot),
             },
         ],
         delivered_tickets: included_ids
             .into_iter()
             .map(|id| DeliveredTicket {
                 id,
-                delivered_at_ms: slot_start - TICKET_ARRIVAL_LEAD_MS,
+                delivered_at_ms: slot_start(slot) - TICKET_ARRIVAL_LEAD_MS,
                 target_epoch: slot / jam_types::epoch_period() + 1,
             })
             .collect(),
@@ -322,9 +330,14 @@ mod tests {
             let outcomes: Vec<&CheckOutcome> =
                 eval.outcomes.iter().filter(|o| o.lane == lane).collect();
             assert!(!outcomes.is_empty(), "lane {lane} must produce outcomes");
+            let failed: Vec<&str> = outcomes
+                .iter()
+                .filter(|o| !o.passed)
+                .map(|o| o.id.as_str())
+                .collect();
             assert!(
-                outcomes.iter().all(|o| o.passed),
-                "lane {lane} must all pass"
+                failed.is_empty(),
+                "lane {lane} must all pass; failed: {failed:?}"
             );
         }
 

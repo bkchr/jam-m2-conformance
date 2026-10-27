@@ -1,5 +1,0 @@
---- a/Cargo.toml
-+++ b/Cargo.toml
-@@ -129,7 +129,7 @@
--polkavm = { version = "0.30.0", default-features = false, features = [] }
-+polkavm = { version = "0.30.0", default-features = false, features = ["generic-sandbox"] }
