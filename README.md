@@ -14,7 +14,7 @@ artefact the NUT produces against the polkajam `hazmat` reference engine.
 (connectivity/sync), **L1** (block authoring), and **L2** (Safrole tickets). See [DESIGN.md](DESIGN.md)
 for the design; this README documents the current implementation state.
 
-- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **328 passed / 0 failed** ✓,
+- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **329 passed / 0 failed** ✓,
   `cargo fmt --all --check` ✓, no `unwrap`/`panic`/`expect`/`todo!` in non-test code.
 - Dry-run baseline: `cargo run -p m2-runner -- --preset mock --dry-run --session-dir /tmp/x`
   exits 0 with **all L0+L1+L2 checks HARD PASS** — the harness's own expectations are satisfiable.
@@ -49,25 +49,24 @@ CLI: `--seed` (run seed), `--validator-index` (default 5 — index 0 is degenera
 preferred-initiator rule), `--base-port`, `--preset` (`polkajam`/`docker`/`mock`),
 `--session-dir`, `--startup-timeout`, `--observe-secs` (observation window), `--dry-run`.
 
-## Real-surface results vs polkajam-as-NUT (2026-09)
+## Real-surface results vs polkajam-as-NUT (2026-10)
 
 The harness runs end-to-end against the polkajam NUT and produces a genuine conformance
 report (`sessions/<id>/report/{report.md,findings.json}`, `traces/jamnp.{bin,json}`):
 
-- **L0 connectivity**: 20/22 HARD PASS — real TLS 1.3 mutual handshake, Ed25519 cert + SAN,
-  ALPN `jamnp-s/1/…`, preferred-initiator, UP 0 handshake with genesis Final, block
-  announcement + CE 128 fetch.
-- **L1**: 6 checks evaluated SOFT ("no NUT blocks observed in window").
-- **L2**: 8 rows — `l2_gen_ce131_observed` and `l2_inclusion_covers_valid` FAIL; the rest vacuous
-  pass (no ticket traffic observed).
+- **N0 connectivity and sync**: 26/27 HARD PASS — real TLS 1.3 mutual handshake, Ed25519 cert +
+  SAN, ALPN `jamnp-s/1/…` with a mismatched ALPN refused, preferred-initiator split, 21 `/builder`
+  connections accepted, UP 0 handshake with genesis Final, and the node's own CE 128 and CE 129
+  replies graded. One hard finding: `ce129_boundary_parent_before_child`.
+- **N1 authoring**: the node authors, the harness imports and grades each block — parent,
+  seal, prior and posterior state roots.
 - Runner exits 1 (correct — hard findings exist).
 
-**Why the real NUT does not pass L1/L2:** polkajam-as-NUT never imports the reference blocks (its
-sync stays at `block #0`, `0/0 active peers` in this setup), so its chain never advances past
-genesis — it therefore never authors a block and never distributes tickets. This is a
-polkajam-side behavior (flagged in DESIGN §10), confirmed empirically; the harness reports it as
-findings rather than masking it. The lanes themselves are proven correct by their unit tests and
-the dry-run all-pass baseline.
+**On reading the lane.** The N0 checks assert what the *node* does. Several used to be recorded by
+the emulator's own serve path — the harness answering the node, then entering a pass for itself —
+so they could not fail; the CE 128 and CE 129 rows are now driven by requests the emulator makes
+and graded on the replies (`m2-emu/src/sync_probe.rs`). A check that could only ever pass is worse
+than a missing one, so findings carry the values that disagreed.
 
 ## Dependency wiring
 

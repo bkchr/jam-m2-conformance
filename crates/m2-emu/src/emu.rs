@@ -7,7 +7,10 @@
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
 };
 
 use ed25519_consensus::SigningKey;
@@ -25,10 +28,12 @@ use m2_reference::tickets::ScheduledTicket;
 use m2_scenario::ctx::{DeliveredTicket, NutBlock};
 use m2_scenario::dsl::{Obs, ObsKind, ObsLog};
 use m2_scenario::scenarios::l0;
+use m2_scenario::scenarios::l0::{Ce128Probe, Ce129Probe};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::nut_block::{fetch_block, should_fetch};
+use crate::sync_probe::start_sync_probe;
 use crate::ticket_io::spawn_ticket_sender;
 
 /// Errors raised while building or running the emulated validators.
@@ -71,6 +76,9 @@ pub struct Emulator {
     nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
     ticket_plans: Arc<Mutex<HashMap<u16, Vec<ScheduledTicket>>>>,
     deliveries: Arc<Mutex<Vec<DeliveredTicket>>>,
+    ce128_probes: Arc<Mutex<Vec<Ce128Probe>>>,
+    ce129_probes: Arc<Mutex<Vec<Ce129Probe>>>,
+    sync_probe_pending: Arc<AtomicBool>,
     /// Fan-out for blocks authored after the connections are up (A10).
     ///
     /// Every live UP 0 stream subscribes, so a block announced here reaches
@@ -106,6 +114,13 @@ pub struct EmuShared {
     /// sent. The sender knows each ticket's id, so the L1 lane reads this
     /// rather than re-deriving ids from the observation log.
     pub deliveries: Arc<Mutex<Vec<DeliveredTicket>>>,
+    /// CE 128 replies the node under test gave the emulator.
+    pub ce128_probes: Arc<Mutex<Vec<Ce128Probe>>>,
+    /// CE 129 replies the node under test gave the emulator.
+    pub ce129_probes: Arc<Mutex<Vec<Ce129Probe>>>,
+    /// Cleared by whichever connection runs the sync probes, so they run once
+    /// per run rather than once per peer.
+    pub sync_probe_pending: Arc<AtomicBool>,
 }
 
 impl EmuShared {
@@ -117,6 +132,12 @@ impl EmuShared {
         lock(&self.ticket_plans)
             .remove(&peer)
             .filter(|p| !p.is_empty())
+    }
+
+    /// True for the first caller only: the sync probes are assertions about
+    /// the node, so one answer is the whole evidence.
+    pub fn claim_sync_probe(&self) -> bool {
+        self.sync_probe_pending.swap(false, Ordering::SeqCst)
     }
 }
 
@@ -157,6 +178,9 @@ impl Emulator {
             nut_blocks: Arc::new(Mutex::new(Vec::new())),
             ticket_plans: Arc::new(Mutex::new(HashMap::new())),
             deliveries: Arc::new(Mutex::new(Vec::new())),
+            ce128_probes: Arc::new(Mutex::new(Vec::new())),
+            ce129_probes: Arc::new(Mutex::new(Vec::new())),
+            sync_probe_pending: Arc::new(AtomicBool::new(true)),
             announce: broadcast::Sender::new(ANNOUNCE_BUFFER),
         })
     }
@@ -174,6 +198,16 @@ impl Emulator {
         Arc::clone(&self.deliveries)
     }
 
+    /// CE 128 replies the node under test gave the emulator.
+    pub fn ce128_probes(&self) -> Arc<Mutex<Vec<Ce128Probe>>> {
+        Arc::clone(&self.ce128_probes)
+    }
+
+    /// CE 129 replies the node under test gave the emulator.
+    pub fn ce129_probes(&self) -> Arc<Mutex<Vec<Ce129Probe>>> {
+        Arc::clone(&self.ce129_probes)
+    }
+
     /// The state every connection handler shares, over `ref_chain`.
     pub fn shared(&self, ref_chain: Arc<RefChain>) -> EmuShared {
         EmuShared {
@@ -184,6 +218,9 @@ impl Emulator {
             announce: self.announce.clone(),
             ticket_plans: Arc::clone(&self.ticket_plans),
             deliveries: Arc::clone(&self.deliveries),
+            ce128_probes: Arc::clone(&self.ce128_probes),
+            ce129_probes: Arc::clone(&self.ce129_probes),
+            sync_probe_pending: Arc::clone(&self.sync_probe_pending),
         }
     }
 
@@ -357,6 +394,7 @@ pub async fn dial_nut(
     // Deliver the peer's L2 tickets on their own streams, concurrently with
     // the handler — unless the accept side already took the plan.
     start_ticket_delivery(&connection, peer, &shared);
+    start_sync_probe(&connection, peer, &shared);
 
     // Serve the NUT's CE 128 / CE 129 requests on the dialed connection.
     handle_connection(connection, peer, genesis_hash, shared).await;
@@ -429,6 +467,7 @@ async fn endpoint_task(
         // side opened it: the NUT reaching us first must not cost the peer its
         // whole ticket plan.
         start_ticket_delivery(&connection, peer_index, &shared);
+        start_sync_probe(&connection, peer_index, &shared);
         // One task per connection: with UP 0 persistent the handler runs for
         // the lifetime of the connection, so awaiting it here would stall the
         // accept loop and the peer's redials would never be answered.

@@ -1995,6 +1995,7 @@ dependencies = [
  "m2-emu",
  "m2-reference",
  "m2-scenario",
+ "quinn 0.11.11",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -2005,6 +2006,7 @@ dependencies = [
 name = "m2-scenario"
 version = "0.1.0"
 dependencies = [
+ "blake2b_simd",
  "jam-std-common",
  "jam-types",
  "jamnp-s",

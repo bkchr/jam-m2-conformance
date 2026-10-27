@@ -147,6 +147,139 @@ pub async fn run_connectivity(
     outcomes
 }
 
+/// Simultaneous `/builder` connections the probe opens (`simple.md:82-84`).
+///
+/// Twenty-one, so that "at least twenty accepted" is a statement about the
+/// node's capacity rather than about how many we bothered to open.
+pub const BUILDER_CONNECTIONS: usize = 21;
+
+/// What the node did with the builder-role surface (DESIGN §11 L0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuilderProbe {
+    pub attempted: usize,
+    pub accepted: usize,
+    /// A CE 133 stream opened on a builder connection was not refused.
+    pub ce133_accepted: bool,
+    /// Why CE 133 was judged refused, when it was.
+    pub ce133_detail: Option<String>,
+}
+
+/// Open [`BUILDER_CONNECTIONS`] connections carrying the `/builder` ALPN
+/// suffix, then try a CE 133 stream on one of them.
+///
+/// Nothing exercised this surface before: `ALPN_BUILDER_OK`,
+/// `BUILDERS_ACCEPTED` and `CE133_ON_BUILDER` were written only by the
+/// fabricated dry-run log, so all three checks failed in every live run for
+/// want of a probe rather than for anything the node did.
+pub async fn probe_builder_slots(
+    addr: SocketAddr,
+    expected_san: &str,
+    genesis_hash: [u8; 32],
+    timeout: Duration,
+) -> BuilderProbe {
+    let mut connections = Vec::new();
+    for i in 0..BUILDER_CONNECTIONS {
+        // A distinct identity per connection: a node is entitled to collapse
+        // repeated connections from one key, and counting those as refusals
+        // would understate its builder capacity.
+        let mut seed = [0u8; 32];
+        seed[0] = 0xB0;
+        seed[1] = i as u8;
+        let connected = tokio::time::timeout(
+            timeout,
+            Endpoint::connect(
+                EndpointConfig {
+                    genesis_hash,
+                    builder: true,
+                },
+                SigningKey::from(seed),
+                expected_san.to_string(),
+                addr,
+            ),
+        )
+        .await;
+        if let Ok(Ok(connection)) = connected {
+            connections.push(connection);
+        }
+    }
+    let (ce133_accepted, ce133_detail) = match connections.first() {
+        Some(connection) => submit_ce133(connection).await,
+        None => (
+            false,
+            Some("no builder connection was accepted".to_string()),
+        ),
+    };
+    BuilderProbe {
+        attempted: BUILDER_CONNECTIONS,
+        accepted: connections.len(),
+        ce133_accepted,
+        ce133_detail,
+    }
+}
+
+/// Open CE 133 on `connection` and report whether the node refused the stream.
+///
+/// This asserts stream *acceptance*, not that the work package is valid: a
+/// node is free to reject the package's contents, and telling that apart from
+/// a refused stream kind needs the guaranteeing lane (N3), not this one. The
+/// detail says which was observed so a failure is diagnosable.
+async fn submit_ce133(connection: &quinn::Connection) -> (bool, Option<String>) {
+    let Ok((mut send, mut recv)) = connection.open_bi().await else {
+        return (false, Some("the node refused a new stream".to_string()));
+    };
+    // A minimal, syntactically well-formed CE 133 first message: the core
+    // index and an empty work package body.
+    let wire = jamnp_s::framing::frame(jamnp_s::framing::CE133, &[0u8]);
+    if send.write_all(&wire).await.is_err() {
+        return (
+            false,
+            Some("the node reset the CE 133 stream on write".to_string()),
+        );
+    }
+    let _ = send.finish();
+    let mut buf = [0u8; 1024];
+    match recv.read(&mut buf).await {
+        // Answered, or closed cleanly: the stream kind was accepted.
+        Ok(_) => (true, None),
+        // A reset carrying "no error" is the node declining the *contents* --
+        // this probe deliberately sends a stand-in work package, and judging
+        // the package is the guaranteeing lane's job, not this one's. Only a
+        // reset that signals a protocol error is a refused stream kind.
+        Err(e) if is_clean_reset(&e) => (true, None),
+        Err(e) => (
+            false,
+            Some(format!("the node reset the CE 133 stream: {e}")),
+        ),
+    }
+}
+
+/// QUIC application error code `0x100`, "no error": a deliberate, non-error
+/// close rather than a protocol-level refusal.
+const NO_ERROR_CODE: u64 = 0x100;
+
+fn is_clean_reset(e: &quinn::ReadError) -> bool {
+    matches!(e, quinn::ReadError::Reset(code) if code.into_inner() == NO_ERROR_CODE)
+}
+
+/// Dial with an ALPN the node must not accept: the right version and suffix,
+/// but the wrong genesis nibbles (`simple.md:48-59`).
+///
+/// Returns true when the handshake failed, which is the conforming outcome.
+/// `alpn_wrong_version_rejected` used to read a marker nothing ever wrote, so
+/// its `!mismatched` term was always true and the check passed without a
+/// mismatched connection having been attempted.
+pub async fn probe_wrong_alpn(
+    addr: SocketAddr,
+    expected_san: &str,
+    genesis_hash: [u8; 32],
+    timeout: Duration,
+) -> bool {
+    let mut wrong = genesis_hash;
+    wrong[0] ^= 0xff;
+    let outcome = probe_nut(addr, expected_san, wrong, timeout).await;
+    !outcome.connected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

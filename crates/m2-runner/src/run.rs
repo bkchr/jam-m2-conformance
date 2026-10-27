@@ -108,6 +108,16 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
 
     let mut nut: Option<NutProcess> = None;
     let mut conn_findings: Vec<Finding> = Vec::new();
+    // L0 facts the connectivity phase establishes. A dry run leaves them at
+    // the conforming values, since it fabricates a conforming node.
+    let mut handshake_completed = true;
+    let mut wrong_alpn_rejected = true;
+    let mut builder: Option<l0::BuilderProbeFacts> = Some(l0::BuilderProbeFacts {
+        attempted: connectivity::BUILDER_CONNECTIONS,
+        accepted: connectivity::BUILDER_CONNECTIONS,
+        ce133_accepted: true,
+        ce133_detail: None,
+    });
     if !cli.dry_run {
         let cfg = launch_config(&keys, &cli, spec_path);
         // The peer-id is the 53-char text form ("e" + base32 of the Ed25519
@@ -138,6 +148,31 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             connectivity::run_connectivity(&plan, nut_addr, &emu_addrs, genesis_hash, &nut_san)
                 .await;
         conn_findings = connectivity_findings(&plan, &outcomes);
+        handshake_completed = outcomes.iter().any(|o| o.connected);
+        // Both before the emulator starts: the builder probe opens twenty-one
+        // connections and the mismatch probe deliberately fails one, and
+        // neither should be in flight while the preferred-initiator split is
+        // being observed.
+        wrong_alpn_rejected = connectivity::probe_wrong_alpn(
+            nut_addr,
+            &nut_san,
+            genesis_hash,
+            connectivity::INITIATOR_GRACE,
+        )
+        .await;
+        let probe = connectivity::probe_builder_slots(
+            nut_addr,
+            &nut_san,
+            genesis_hash,
+            connectivity::INITIATOR_GRACE,
+        )
+        .await;
+        builder = Some(l0::BuilderProbeFacts {
+            attempted: probe.attempted,
+            accepted: probe.accepted,
+            ce133_accepted: probe.ce133_accepted,
+            ce133_detail: probe.ce133_detail,
+        });
     }
 
     // §4.4 scenario: reference chain + emulator, or the fabricated dry-run log.
@@ -212,6 +247,8 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                 let _ = m2_emu::emu::dial_nut(index, genesis_hash, nut_addr, nut_san, shared).await;
             }));
         }
+        let ce128_probes = emu.ce128_probes();
+        let ce129_probes = emu.ce129_probes();
         let real_run = RealRunData {
             ref_chain,
             nut_blocks,
@@ -224,6 +261,8 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             ObsSource::Emulator {
                 obs,
                 trace,
+                ce128_probes,
+                ce129_probes,
                 _emu: emu,
             },
             count,
@@ -244,16 +283,36 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     drop(dial_tasks);
 
     let run_ctx = match &source {
-        ObsSource::Emulator { trace, .. } => {
+        ObsSource::Emulator {
+            trace,
+            ce128_probes,
+            ce129_probes,
+            ..
+        } => {
             let data = real_run.as_ref().ok_or_else(|| {
                 RunError::Internal("emulator run missing reference run data".into())
             })?;
+            // Everything after genesis, in slot order: what an ascending
+            // CE 128 walk from genesis is supposed to return.
+            let reference_chain: Vec<[u8; 32]> = data
+                .ref_chain
+                .chain_blocks()
+                .iter()
+                .skip(1)
+                .map(|block| block.header.hash().0)
+                .collect();
             build_real_run_ctx(
                 data,
                 &lock(trace),
                 l0::L0Ctx {
                     reference_block_count,
+                    reference_chain,
+                    ce128_probes: lock(ce128_probes).clone(),
+                    ce129_probes: lock(ce129_probes).clone(),
                     first_emu_peer: emu_indices[0] as u16,
+                    handshake_completed,
+                    wrong_alpn_rejected,
+                    builder,
                     nut_preferred_peers: peers_of(&plan.wait_then_connect, &emu_indices),
                     emu_preferred_peers: peers_of(&plan.initiate_now, &emu_indices),
                 },

@@ -13,6 +13,7 @@ use m2_scenario::ctx::{
     NUT_INDEX, SLOT_PERIOD_MS, TICKET_ARRIVAL_LEAD_MS,
 };
 use m2_scenario::dsl::{Check, Obs, ObsKind, ObsLog, Outcome, Scheduler, Severity};
+use m2_scenario::scenarios::l0::{Ce128Probe, Ce129Probe};
 use m2_scenario::scenarios::obs::{EMU_SENT_131, EMU_SENT_132, RECV_CE131, RECV_CE132};
 use m2_scenario::scenarios::{l0, l1, l2};
 
@@ -38,6 +39,8 @@ pub(crate) enum ObsSource {
     Emulator {
         obs: Arc<Mutex<ObsLog>>,
         trace: Arc<Mutex<Trace>>,
+        ce128_probes: Arc<Mutex<Vec<Ce128Probe>>>,
+        ce129_probes: Arc<Mutex<Vec<Ce129Probe>>>,
         _emu: Emulator,
     },
     /// Deterministic fabricated log + empty trace (dry-run).
@@ -213,6 +216,21 @@ pub(crate) fn fabricated_run_ctx(
     let second_root = second.header.hash().0;
     let slot = first.header.slot;
     let second_slot = second.header.slot;
+    // The N0 sync probes: what a conforming node would answer. The reference
+    // the CE 128 reply is compared against stops at `first`, since that is all
+    // the harness treats as history here; the node is allowed to be ahead.
+    let genesis = chain.genesis_hash();
+    let reference_chain: Vec<[u8; 32]> = history.iter().skip(1).map(|(_, hash)| *hash).collect();
+    let probed_blocks: Vec<l0::ProbedBlock> = chain
+        .chain_blocks()
+        .iter()
+        .skip(1)
+        .map(|block| l0::ProbedBlock {
+            slot: block.header.slot,
+            hash: block.header.hash().0,
+            parent: block.header.parent.0,
+        })
+        .collect();
     let included_ids: Vec<[u8; 32]> = first.extrinsic.tickets.iter().map(|t| t.id().0).collect();
     let slot_start = |slot: u32| JAM_COMMON_ERA * 1000 + slot as u64 * SLOT_PERIOD_MS;
     let import = |block: &jam_std_common::Block, root: Option<[u8; 32]>| ImportFact {
@@ -304,7 +322,39 @@ pub(crate) fn fabricated_run_ctx(
         // to every emulated peer and so never needs a fallback dial.
         l0: l0::L0Ctx {
             reference_block_count,
+            reference_chain: reference_chain.clone(),
+            // A conforming node: the ascending walk returns the reference
+            // chain itself, within the cap, FIN'd; the state slice is sorted,
+            // in range and inside the size cap.
+            ce128_probes: vec![l0::Ce128Probe {
+                peer: l0::PEER_1,
+                max_blocks: 64,
+                from: genesis,
+                returned: probed_blocks,
+                finished: true,
+                error: None,
+            }],
+            ce129_probes: vec![l0::Ce129Probe {
+                peer: l0::PEER_1,
+                start: [0u8; 31],
+                end: [0xffu8; 31],
+                max_size: 16 * 1024,
+                keys: vec![[0u8; 31], [1u8; 31]],
+                boundary_nodes: vec![[7u8; 64]],
+                response_bytes: 128,
+                entry_bytes: vec![64, 64],
+                decoded: true,
+                error: None,
+            }],
             first_emu_peer: l0::PEER_1,
+            handshake_completed: true,
+            wrong_alpn_rejected: true,
+            builder: Some(l0::BuilderProbeFacts {
+                attempted: 21,
+                accepted: 21,
+                ce133_accepted: true,
+                ce133_detail: None,
+            }),
             nut_preferred_peers: vec![l0::PEER_1],
             emu_preferred_peers: Vec::new(),
         },
