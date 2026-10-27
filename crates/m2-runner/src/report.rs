@@ -39,14 +39,19 @@ pub fn ensure_layout(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Coverage-table result marker (§11): `HARD PASS` / `SOFT` / `FAIL`.
+/// Coverage-table result marker (§11): `HARD PASS` / `SOFT PASS` / `SOFT` /
+/// `FAIL`.
+///
+/// A soft check that passed and a soft check that failed are different
+/// outcomes and must not share a marker: printing `SOFT` for both made every
+/// passing soft row read like a finding, when only the failures appear in
+/// `findings.json`.
 fn result_marker(o: &CheckOutcome) -> &'static str {
-    if o.soft {
-        "SOFT"
-    } else if o.passed {
-        "HARD PASS"
-    } else {
-        "FAIL"
+    match (o.soft, o.passed) {
+        (true, true) => "SOFT PASS",
+        (true, false) => "SOFT",
+        (false, true) => "HARD PASS",
+        (false, false) => "FAIL",
     }
 }
 
@@ -195,7 +200,7 @@ mod tests {
         write_report(tmp.path(), &results, &[]).unwrap();
         let md = std::fs::read_to_string(tmp.path().join("report/report.md")).unwrap();
         assert!(md.contains("| L0 | up0_handshake | hard | HARD PASS |"));
-        assert!(md.contains("| L0 | preferred_initiator | soft | SOFT |"));
+        assert!(md.contains("| L0 | preferred_initiator | soft | SOFT PASS |"));
         assert!(md.contains("| L0 | ce128_fetch | hard | FAIL |"));
     }
 

@@ -8,13 +8,13 @@ use jam_types::{Decode, Encode, HeaderHash};
 use jamnp_s::{
     codec::ce128_129::{BlockRequest, BlockResponse, Direction},
     framing::{frame, FrameReader, CE128},
-    trace::{wall_ts, Direction as TraceDir, Trace},
+    trace::{wall_ts, Direction as TraceDir},
 };
 use m2_reference::chain::RefChain;
 use m2_scenario::ctx::NutBlock;
 use m2_scenario::dsl::{ObsKind, ObsLog};
 
-use crate::emu::{lock, record, trace_record, EmuError};
+use crate::emu::{lock, record, trace_record, EmuError, EmuShared};
 
 /// True when `hash` is neither in the reference chain nor already fetched, so
 /// the emulator must fetch the block from the announcing node.
@@ -46,11 +46,10 @@ fn already_fetched(nut_blocks: &Mutex<Vec<NutBlock>>, hash: &[u8; 32]) -> bool {
 pub async fn fetch_block(
     connection: &quinn::Connection,
     announced_hash: [u8; 32],
-    trace: &Mutex<Trace>,
-    obs: &Mutex<ObsLog>,
     peer: u16,
-    nut_blocks: &Mutex<Vec<NutBlock>>,
+    shared: &EmuShared,
 ) -> Result<(), EmuError> {
+    let (trace, obs, nut_blocks) = (&*shared.trace, &*shared.obs, &*shared.nut_blocks);
     let (mut send, mut recv) = connection
         .open_bi()
         .await
@@ -94,20 +93,45 @@ pub async fn fetch_block(
             response.blocks.len()
         )));
     };
-    record_block(obs, peer, nut_blocks, block.clone());
+    if record_block(obs, peer, nut_blocks, block.clone()) {
+        adopt(&shared.ref_chain, block);
+    }
     Ok(())
 }
 
+/// Import a newly fetched NUT block into the reference chain.
+///
+/// polkajam picks its best block by highest slot, so a block authored in a
+/// slot the reference skipped becomes the head the reference authors on next.
+/// Without this the two chains fork at every slot the node claims: the node's
+/// blocks are never built on, so no posterior state root is ever witnessed and
+/// the reference head the parent check compares against is one the node never
+/// had a reason to build on.
+///
+/// A refused import is not an error here — the block simply stays a fork, and
+/// `l1_header_seal` reports the refusal with its reason.
+fn adopt(ref_chain: &RefChain, block: &Block) {
+    let _ = ref_chain.import_nut_block(block);
+}
+
 /// Record a successfully fetched NUT block: `AuthorsBlock` + store entry.
+/// Returns whether this was the block's first sighting.
 ///
 /// Deduplicated under the store's own lock, which is what actually guarantees
 /// one entry per block: two peers can both pass [`should_fetch`] before either
-/// has recorded, and then both arrive here with the same block.
-fn record_block(obs: &Mutex<ObsLog>, peer: u16, nut_blocks: &Mutex<Vec<NutBlock>>, block: Block) {
+/// has recorded, and then both arrive here with the same block. The return
+/// value carries that decision out to the caller so the block is adopted into
+/// the reference chain exactly once as well.
+fn record_block(
+    obs: &Mutex<ObsLog>,
+    peer: u16,
+    nut_blocks: &Mutex<Vec<NutBlock>>,
+    block: Block,
+) -> bool {
     let hash = block.header.hash().0;
     let mut store = lock(nut_blocks);
     if store.iter().any(|nut| nut.block.header.hash().0 == hash) {
-        return;
+        return false;
     }
     store.push(NutBlock {
         block,
@@ -115,6 +139,7 @@ fn record_block(obs: &Mutex<ObsLog>, peer: u16, nut_blocks: &Mutex<Vec<NutBlock>
     });
     drop(store);
     record(obs, peer, ObsKind::AuthorsBlock);
+    true
 }
 
 /// Read the single response frame on a CE 128 fetch stream. The responder
@@ -161,11 +186,14 @@ mod tests {
 
         // Announced again by another peer, after the first fetch recorded it:
         // the NUT announces every block to every peer it is connected to.
-        record_block(
-            &Mutex::new(ObsLog::new()),
-            1,
-            &store,
-            ref_chain.chain_blocks()[0].clone(),
+        assert!(
+            record_block(
+                &Mutex::new(ObsLog::new()),
+                1,
+                &store,
+                ref_chain.chain_blocks()[0].clone(),
+            ),
+            "the first sighting is recorded"
         );
         let fetched = ref_chain.chain_blocks()[0].header.hash().0;
         assert!(
@@ -175,12 +203,16 @@ mod tests {
         assert_eq!(lock(&store).len(), 1);
 
         // And the duplicate is refused at the store even when two peers race
-        // past `should_fetch` together.
-        record_block(
-            &Mutex::new(ObsLog::new()),
-            2,
-            &store,
-            ref_chain.chain_blocks()[0].clone(),
+        // past `should_fetch` together. The `false` is what keeps the block
+        // from being adopted into the reference chain twice as well.
+        assert!(
+            !record_block(
+                &Mutex::new(ObsLog::new()),
+                2,
+                &store,
+                ref_chain.chain_blocks()[0].clone(),
+            ),
+            "a second sighting is not recorded again"
         );
         assert_eq!(lock(&store).len(), 1, "the store holds one copy per block");
     }

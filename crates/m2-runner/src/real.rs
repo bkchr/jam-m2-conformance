@@ -1,7 +1,7 @@
 //! Real-run L1/L2 context builders (m2-runner §4.4): reference-chain facts,
 //! NUT-block imports, and ticket deliveries for the L1/L2 scenario lanes.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use codec::Decode;
@@ -10,15 +10,13 @@ use jamnp_s::framing::{CE131, CE132};
 use jamnp_s::trace::{Direction as TraceDir, Trace};
 use m2_reference::chain::RefChain;
 use m2_reference::tickets::{
-    first_delivery_slot, plan_tickets, verify_ticket, ScheduledTicket, TicketCtx,
+    first_delivery_slot, plan_tickets, verify_ticket, EmulatedTicket, ScheduledTicket, TicketCtx,
     TicketDelivery as ReferenceDelivery,
 };
 use m2_scenario::ctx::{
     DeliveredTicket, EmuTicket, ImportFact, L1Ctx, L2Ctx, NutBlock, NutTicketFacts,
     TicketDelivery as CtxDelivery, SLOT_PERIOD_MS,
 };
-use m2_scenario::dsl::{ObsKind, ObsLog};
-use m2_scenario::scenarios::obs::{EMU_SENT_131, EMU_SENT_132};
 
 use crate::scenario::RunCtx;
 
@@ -27,39 +25,70 @@ use crate::scenario::RunCtx;
 pub(crate) struct RealRunData {
     pub(crate) ref_chain: Arc<RefChain>,
     pub(crate) nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
+    pub(crate) deliveries: Arc<Mutex<Vec<DeliveredTicket>>>,
     pub(crate) ticket_ctx: TicketCtx,
     pub(crate) plan: Vec<ScheduledTicket>,
     pub(crate) target_epoch: u32,
 }
 
-/// The L2 ticket context, generated tickets, and their plan for the target
-/// epoch (`next_slot / epoch_period + 1`), with that epoch's start slot.
-pub(crate) fn compute_ticket_plan(
+/// The emulated validators' tickets for the epoch after the current one.
+///
+/// Ring-VRF proving is the single most expensive thing the harness does — five
+/// authors times four attempts, tens of seconds — so it is split from
+/// [`schedule_tickets`] and run while the node is still starting up. The
+/// tickets are bound to the tickets-entropy of the epoch they are generated
+/// in, which is why `target_epoch` is fixed here and not re-derived later: a
+/// run that crossed an epoch boundary mid-generation would otherwise label
+/// them for an epoch whose entropy they were never built against.
+pub(crate) fn generate_tickets(
     ref_chain: &RefChain,
-    nut_index: usize,
-) -> Result<(TicketCtx, Vec<ScheduledTicket>, u32), m2_reference::chain::ChainError> {
+) -> Result<(TicketCtx, Vec<EmulatedTicket>, u32), m2_reference::chain::ChainError> {
     let ticket_ctx = ref_chain.ticket_ctx()?;
+    let target_epoch = ref_chain.next_slot() / jam_types::epoch_period() + 1;
     let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
+    Ok((ticket_ctx, tickets, target_epoch))
+}
+
+/// Schedule the generated tickets into the submission window still open for
+/// `target_epoch`, as of now.
+///
+/// Empty when that window has already closed — see
+/// [`m2_reference::tickets::plan_tickets`].
+pub(crate) fn schedule_tickets(
+    ref_chain: &RefChain,
+    tickets: &[EmulatedTicket],
+    nut_index: usize,
+    target_epoch: u32,
+) -> Vec<ScheduledTicket> {
     let now_slot = ref_chain.next_slot();
-    let target_epoch = now_slot / jam_types::epoch_period() + 1;
-    let plan = plan_tickets(
-        &tickets,
+    plan_tickets(
+        tickets,
         nut_index,
         first_delivery_slot(now_slot),
         target_epoch,
-    );
-    Ok((ticket_ctx, plan, target_epoch))
+    )
+}
+
+/// The ticket plan split per emulated validator, keyed by peer index.
+pub(crate) fn plans_by_peer(plan: &[ScheduledTicket]) -> HashMap<u16, Vec<ScheduledTicket>> {
+    let mut plans: HashMap<u16, Vec<ScheduledTicket>> = HashMap::new();
+    for scheduled in plan {
+        plans
+            .entry(scheduled.ticket.author as u16)
+            .or_default()
+            .push(scheduled.clone());
+    }
+    plans
 }
 
 /// Build the L1/L2 contexts for a real run from the post-window facts.
 pub(crate) fn build_real_run_ctx(
     data: &RealRunData,
-    obs: &ObsLog,
     trace: &Trace,
     l0: m2_scenario::scenarios::l0::L0Ctx,
 ) -> RunCtx {
     let nut_blocks = lock(&data.nut_blocks);
-    let l1 = build_l1_ctx(&data.ref_chain, &nut_blocks, obs, &data.plan);
+    let l1 = build_l1_ctx(&data.ref_chain, &nut_blocks, &lock(&data.deliveries));
     let nut_tickets = collect_nut_tickets(trace, &data.ticket_ctx);
     let l2 = build_l2_ctx(
         &data.ticket_ctx,
@@ -75,26 +104,36 @@ pub(crate) fn build_real_run_ctx(
     }
 }
 
-/// L1 facts: the reference head and chain hashes, the fetched NUT blocks with
+/// L1 facts: the reference chain with its slots, the fetched NUT blocks with
 /// their import outcomes, and the tickets the emulator delivered to the NUT.
+///
+/// The chain is read before the imports run, so the reference best block is
+/// the one the run actually ended on and not one re-imported here.
 fn build_l1_ctx(
     ref_chain: &RefChain,
     nut_blocks: &[NutBlock],
-    obs: &ObsLog,
-    plan: &[ScheduledTicket],
+    deliveries: &[DeliveredTicket],
 ) -> L1Ctx {
     let chain = ref_chain.chain_blocks();
     let reference_best = chain
         .last()
         .map(|block| block.header.hash().0)
         .unwrap_or_else(|| ref_chain.genesis_hash());
-    let reference_block_hashes = chain.iter().map(|block| block.header.hash().0).collect();
+    let reference_block_hashes: Vec<[u8; 32]> =
+        chain.iter().map(|block| block.header.hash().0).collect();
+    let reference_chain = chain
+        .iter()
+        .map(|block| (block.header.slot, block.header.hash().0))
+        .collect();
     let imports = nut_blocks
         .iter()
         .map(|nut| {
             let outcome = ref_chain.import_nut_block(&nut.block);
             ImportFact {
                 header_root: outcome.header_root,
+                parent: outcome.parent,
+                declared_parent_root: outcome.declared_parent_root,
+                reference_parent_root: outcome.reference_parent_root,
                 ok: outcome.ok,
                 root: outcome.root,
                 error: outcome.error,
@@ -104,41 +143,15 @@ fn build_l1_ctx(
     L1Ctx {
         reference_best,
         reference_block_hashes,
+        reference_chain,
         nut_blocks: nut_blocks.to_vec(),
         imports,
-        delivered_tickets: collect_delivered_tickets(obs, plan),
+        delivered_tickets: deliveries.to_vec(),
         slot_period_ms: SLOT_PERIOD_MS,
+        epoch_period: jam_types::epoch_period(),
+        epoch_tail_start: jam_types::epoch_tail_start(),
+        max_tickets_per_block: jam_types::max_tickets_per_block(),
     }
-}
-
-/// The tickets the emulator actually sent (obs codes 45/46), matched back to
-/// the plan's ticket ids by author (each author sends in plan order).
-fn collect_delivered_tickets(obs: &ObsLog, plan: &[ScheduledTicket]) -> Vec<DeliveredTicket> {
-    let mut pending: HashMap<usize, VecDeque<[u8; 32]>> = HashMap::new();
-    for scheduled in plan {
-        pending
-            .entry(scheduled.ticket.author)
-            .or_default()
-            .push_back(scheduled.ticket.id);
-    }
-    let mut delivered = Vec::new();
-    for (_, observation) in obs.events() {
-        if matches!(
-            observation.kind,
-            ObsKind::Other(EMU_SENT_131) | ObsKind::Other(EMU_SENT_132)
-        ) {
-            if let Some(id) = pending
-                .get_mut(&(observation.peer as usize))
-                .and_then(VecDeque::pop_front)
-            {
-                delivered.push(DeliveredTicket {
-                    id,
-                    delivered_at_ms: observation.at_ms,
-                });
-            }
-        }
-    }
-    delivered
 }
 
 /// L2 facts: the emulator's ticket plan plus every ticket the NUT distributed
@@ -352,14 +365,17 @@ mod tests {
             block: block.clone(),
             announced_wall_ms: 1000,
         }];
-        let obs = ObsLog::new();
-        let plan = Vec::new();
-
-        let l1 = build_l1_ctx(&ref_chain, &nut_blocks, &obs, &plan);
+        let l1 = build_l1_ctx(&ref_chain, &nut_blocks, &[]);
 
         assert_eq!(l1.imports.len(), 1, "one import per NUT block");
         assert!(l1.imports[0].ok, "a re-authored block imports OK");
         assert_eq!(l1.imports[0].header_root, block.header.hash().0);
+        assert_eq!(l1.imports[0].parent, block.header.parent.0);
+        assert_eq!(
+            l1.imports[0].reference_parent_root,
+            Some(l1.imports[0].declared_parent_root),
+            "the reference agrees with the header about the parent's root"
+        );
         assert_eq!(l1.nut_blocks.len(), 1);
         assert_eq!(l1.slot_period_ms, SLOT_PERIOD_MS);
         assert_eq!(
@@ -367,6 +383,48 @@ mod tests {
             ref_chain.chain_blocks().len(),
             "reference block hashes cover the whole chain"
         );
+        assert_eq!(
+            l1.reference_chain.len(),
+            l1.reference_block_hashes.len(),
+            "the chain timeline covers the same blocks, with their slots"
+        );
+        assert!(
+            l1.reference_chain.windows(2).all(|w| w[0].0 < w[1].0),
+            "the chain timeline is ascending by slot"
+        );
+        // The block was authored on the chain head, so the head as of its slot
+        // is its parent.
+        assert_eq!(
+            l1.reference_best_at(block.header.slot),
+            Some(block.header.parent.0)
+        );
+        Ok(())
+    }
+
+    /// The per-peer split is what lets whichever side connects first deliver a
+    /// peer's tickets; every ticket must land in exactly one peer's plan.
+    #[test]
+    fn run_plans_split_by_author() -> Result<(), ChainError> {
+        let ref_chain = RefChain::tiny(0)?;
+        let ticket_ctx = ref_chain.ticket_ctx()?;
+        let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
+        let period = jam_types::epoch_period();
+        let plan = plan_tickets(&tickets, 5, 41 * period, 42);
+        assert!(!plan.is_empty());
+
+        let plans = plans_by_peer(&plan);
+
+        assert_eq!(
+            plans.values().map(Vec::len).sum::<usize>(),
+            plan.len(),
+            "every scheduled ticket lands in exactly one peer's plan"
+        );
+        for (peer, peer_plan) in &plans {
+            assert!(
+                peer_plan.iter().all(|s| s.ticket.author as u16 == *peer),
+                "peer {peer} only delivers its own tickets"
+            );
+        }
         Ok(())
     }
 

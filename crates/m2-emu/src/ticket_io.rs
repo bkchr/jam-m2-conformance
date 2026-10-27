@@ -16,6 +16,7 @@ use jamnp_s::{
     trace::{wall_ts, Direction as TraceDir, Trace},
 };
 use m2_reference::tickets::{ScheduledTicket, TicketDelivery};
+use m2_scenario::ctx::{DeliveredTicket, TICKET_ARRIVAL_LEAD_MS};
 use m2_scenario::dsl::{ObsKind, ObsLog};
 use m2_scenario::scenarios::obs::{
     BAD_PROOF_IGNORED, EMU_SENT_131, EMU_SENT_132, RECV_CE131, RECV_CE132, UNKNOWN_EPOCH_RESET,
@@ -23,6 +24,14 @@ use m2_scenario::scenarios::obs::{
 
 /// Seconds per slot (JAM common slot period).
 const SLOT_PERIOD_SEC: u64 = 6;
+
+/// Slack on top of [`TICKET_ARRIVAL_LEAD_MS`] when timing a delivery.
+///
+/// A ticket has to be in the node's hands a clear 2 s before the slot it is
+/// expected in. Delivering *at* the slot boundary — which is what the sender
+/// used to do — is the one time that can never be true: the node is authoring
+/// that same instant, and its next slot is several slots away.
+const DELIVERY_MARGIN_MS: u64 = 500;
 
 /// An inbound NUT ticket stream, classified by kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,14 +73,6 @@ pub fn classify_received(kind: u8, payload: &[u8]) -> TicketInbound {
     }
 }
 
-/// Filter a plan down to the tickets authored by `peer_author`.
-pub fn plan_for_peer(plan: &[ScheduledTicket], peer_author: usize) -> Vec<ScheduledTicket> {
-    plan.iter()
-        .filter(|scheduled| scheduled.ticket.author == peer_author)
-        .cloned()
-        .collect()
-}
-
 /// Record an inbound NUT ticket stream: `RECV_CE131`/`RECV_CE132` for a
 /// decodable distribution, `BAD_PROOF_IGNORED` (soft) for an invalid one.
 pub async fn handle_inbound_ticket(kind: u8, payload: &[u8], peer: u16, obs: &Mutex<ObsLog>) {
@@ -90,6 +91,7 @@ pub async fn spawn_ticket_sender(
     plan: Vec<ScheduledTicket>,
     trace: Arc<Mutex<Trace>>,
     obs: Arc<Mutex<ObsLog>>,
+    deliveries: Arc<Mutex<Vec<DeliveredTicket>>>,
     peer: u16,
 ) {
     let Some(first) = plan.first() else {
@@ -101,7 +103,7 @@ pub async fn spawn_ticket_sender(
             TicketDelivery::Ce131 => (CE131, EMU_SENT_131),
             TicketDelivery::Ce132 => (CE132, EMU_SENT_132),
         };
-        sleep_until_slot(scheduled.slot).await;
+        sleep_until_delivery(scheduled.slot).await;
         let Ok((mut send, mut recv)) = connection.open_bi().await else {
             continue;
         };
@@ -126,6 +128,15 @@ pub async fn spawn_ticket_sender(
         if send.write_all(&wire).await.is_err() {
             continue;
         }
+        // Recorded only once the bytes are on the wire, and stamped with the
+        // wall clock: the L1 lane compares this against slot starts, which are
+        // absolute, so a run-relative timestamp would make every ticket look
+        // as though it had arrived before the run began.
+        crate::emu::lock(&deliveries).push(DeliveredTicket {
+            id: scheduled.ticket.id,
+            delivered_at_ms: wall_ts(),
+            target_epoch: scheduled.target_epoch,
+        });
         let _ = send.finish();
         // Await the NUT's decision: a clean FIN accepts the ticket; a stream
         // reset rejects it (unknown epoch `:335-337` or bad proof `:329-332`).
@@ -136,8 +147,16 @@ pub async fn spawn_ticket_sender(
     }
 }
 
-async fn sleep_until_slot(slot: u32) {
-    let target_ms = (JAM_COMMON_ERA + u64::from(slot) * SLOT_PERIOD_SEC) * 1000;
+/// When a ticket due in `slot` must be on the wire.
+fn delivery_deadline_ms(slot: u32) -> u64 {
+    let slot_start_ms = (JAM_COMMON_ERA + u64::from(slot) * SLOT_PERIOD_SEC) * 1000;
+    slot_start_ms.saturating_sub(TICKET_ARRIVAL_LEAD_MS + DELIVERY_MARGIN_MS)
+}
+
+/// Wait until a ticket due in `slot` should go out: far enough before the slot
+/// starts that the node has it in hand with the full arrival lead to spare.
+async fn sleep_until_delivery(slot: u32) {
+    let target_ms = delivery_deadline_ms(slot);
     loop {
         let now = wall_ts();
         if now >= target_ms {
@@ -153,7 +172,6 @@ mod tests {
     use jam_types::Encode;
     use jamnp_s::codec::ce131_136::{Ticket, TicketDistribution};
     use jamnp_s::framing::{CE129, CE131, CE132};
-    use m2_reference::tickets::EmulatedTicket;
     use m2_scenario::dsl::ObsLog;
     use m2_scenario::scenarios::obs;
 
@@ -206,31 +224,23 @@ mod tests {
     mod m2_emu_plan_peer {
         use super::*;
 
-        fn scheduled(author: usize, attempt: u8) -> ScheduledTicket {
-            ScheduledTicket {
-                target_epoch: 9,
-                ticket: EmulatedTicket {
-                    id: [attempt; 32],
-                    author,
-                    attempt,
-                    proof: [0u8; 784],
-                    proxy: 0,
-                },
-                delivery: TicketDelivery::Ce132,
-                slot: 100,
-            }
-        }
-
+        /// A ticket goes out well before the slot it is expected in, not at
+        /// the slot boundary: the node needs it in hand a clear
+        /// `TICKET_ARRIVAL_LEAD_MS` beforehand, and at the boundary itself it
+        /// is already authoring.
         #[test]
-        fn plan_for_peer_filters_by_author() {
-            let plan = vec![scheduled(1, 0), scheduled(2, 1), scheduled(3, 2)];
-            let for_2 = plan_for_peer(&plan, 2);
-            assert_eq!(for_2.len(), 1);
-            assert_eq!(for_2[0].ticket.author, 2);
-            assert_eq!(for_2[0].ticket.attempt, 1);
-            assert!(plan_for_peer(&plan, 9).is_empty());
-            // The input plan is untouched.
-            assert_eq!(plan.len(), 3);
+        fn delivery_leads_the_slot_it_is_expected_in() {
+            let slot = 1000u32;
+            let slot_start_ms = (JAM_COMMON_ERA + u64::from(slot) * SLOT_PERIOD_SEC) * 1000;
+            let target = delivery_deadline_ms(slot);
+            assert!(
+                slot_start_ms - target >= TICKET_ARRIVAL_LEAD_MS,
+                "delivery must clear the arrival lead"
+            );
+            assert_eq!(
+                target,
+                slot_start_ms - TICKET_ARRIVAL_LEAD_MS - DELIVERY_MARGIN_MS
+            );
         }
     }
 

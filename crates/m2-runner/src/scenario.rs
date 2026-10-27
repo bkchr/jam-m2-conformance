@@ -50,8 +50,7 @@ pub(crate) fn evaluate(obs: &ObsLog, run_ctx: &RunCtx) -> Evaluation {
     let mut outcomes = Vec::new();
     let mut findings = Vec::new();
     let mut all_hard_passed = true;
-    let mut lanes: Vec<(&str, Vec<Check>)> =
-        vec![("L0", l0::all(&run_ctx.l0))];
+    let mut lanes: Vec<(&str, Vec<Check>)> = vec![("L0", l0::all(&run_ctx.l0))];
     if let Some(ctx) = &run_ctx.l1 {
         lanes.push(("L1", l1::all(ctx)));
     }
@@ -92,7 +91,10 @@ fn run_lane(lane: &str, checks: &[Check], obs: &ObsLog) -> (Vec<CheckOutcome>, V
                     spec_citation: format!("{lane} {}", check.id),
                     slot: None,
                     evidence: "traces/jamnp.bin".into(),
-                    message: format!("{}: {}", check.id, result.name),
+                    message: match &result.detail {
+                        Some(detail) => format!("{}: {}: {detail}", check.id, result.name),
+                        None => format!("{}: {}", check.id, result.name),
+                    },
                 });
             }
             outcomes.push(CheckOutcome {
@@ -101,10 +103,10 @@ fn run_lane(lane: &str, checks: &[Check], obs: &ObsLog) -> (Vec<CheckOutcome>, V
                 severity: if soft { "soft" } else { "hard" }.into(),
                 passed,
                 soft,
-                details: if passed {
-                    "ok".into()
-                } else {
-                    format!("{result:?}")
+                details: match (passed, &result.detail) {
+                    (true, _) => "ok".into(),
+                    (false, Some(detail)) => detail.clone(),
+                    (false, None) => format!("{:?}", result.outcome),
                 },
             });
         }
@@ -183,43 +185,78 @@ pub(crate) fn fabricated_run_ctx(
 ) -> Result<RunCtx, m2_reference::chain::ChainError> {
     let chain = RefChain::tiny(0)?;
     let start = chain.next_slot();
-    let mut authored = None;
-    for slot in start..start + 12 {
+    // Two blocks, the second built on the first: one NUT block on its own can
+    // never witness its own posterior state root, which only the header of a
+    // block built on top of it commits to.
+    let mut authored: Vec<jam_std_common::Block> = Vec::new();
+    for slot in start..start + 24 {
         if let Some(block) = chain.author_block(slot)? {
-            authored = Some(block);
-            break;
+            authored.push(block);
+            if authored.len() == 2 {
+                break;
+            }
         }
     }
-    let block = authored.ok_or_else(|| {
-        m2_reference::chain::ChainError::Chain("no emulated slot to author in 12 slots".into())
+    let [first, second] = <[_; 2]>::try_from(authored).map_err(|_| {
+        m2_reference::chain::ChainError::Chain("no two emulated slots in 24 slots".into())
     })?;
 
-    let header_root = block.header.hash().0;
-    let parent = block.header.parent.0;
-    let slot = block.header.slot;
-    let included_ids: Vec<[u8; 32]> = block.extrinsic.tickets.iter().map(|t| t.id().0).collect();
+    // Everything up to and including `first` is reference history; `second` is
+    // the block under test, so its parent is the reference best at its slot.
+    let history: Vec<(u32, [u8; 32])> = chain
+        .chain_blocks()
+        .iter()
+        .take_while(|block| block.header.slot <= first.header.slot)
+        .map(|block| (block.header.slot, block.header.hash().0))
+        .collect();
+    let first_root = first.header.hash().0;
+    let second_root = second.header.hash().0;
+    let slot = first.header.slot;
+    let included_ids: Vec<[u8; 32]> = first.extrinsic.tickets.iter().map(|t| t.id().0).collect();
     let slot_start = JAM_COMMON_ERA * 1000 + slot as u64 * SLOT_PERIOD_MS;
+    let import = |block: &jam_std_common::Block, root: Option<[u8; 32]>| ImportFact {
+        header_root: block.header.hash().0,
+        parent: block.header.parent.0,
+        declared_parent_root: block.header.parent_state_root.0,
+        reference_parent_root: Some(block.header.parent_state_root.0),
+        ok: true,
+        root,
+        error: None,
+    };
     let l1 = L1Ctx {
-        reference_best: parent,
-        reference_block_hashes: vec![parent],
-        nut_blocks: vec![NutBlock {
-            block,
-            announced_wall_ms: slot_start,
-        }],
-        imports: vec![ImportFact {
-            header_root,
-            ok: true,
-            root: Some(header_root),
-            error: None,
-        }],
+        reference_best: first_root,
+        reference_block_hashes: history.iter().map(|(_, hash)| *hash).collect(),
+        reference_chain: history,
+        imports: vec![
+            // `second` declares `first`'s posterior root, so the witnessed
+            // path is the one this baseline exercises. `second` itself has no
+            // block built on it, which is a soft "not witnessed" — inherent to
+            // the last block of any chain, and reported as such.
+            import(&first, Some(second.header.parent_state_root.0)),
+            import(&second, Some(second_root)),
+        ],
+        nut_blocks: vec![
+            NutBlock {
+                block: first,
+                announced_wall_ms: slot_start,
+            },
+            NutBlock {
+                block: second,
+                announced_wall_ms: slot_start + SLOT_PERIOD_MS,
+            },
+        ],
         delivered_tickets: included_ids
             .into_iter()
             .map(|id| DeliveredTicket {
                 id,
                 delivered_at_ms: slot_start - TICKET_ARRIVAL_LEAD_MS,
+                target_epoch: slot / jam_types::epoch_period() + 1,
             })
             .collect(),
         slot_period_ms: SLOT_PERIOD_MS,
+        epoch_period: jam_types::epoch_period(),
+        epoch_tail_start: jam_types::epoch_tail_start(),
+        max_tickets_per_block: jam_types::max_tickets_per_block(),
     };
 
     let emu = |id: u8, proxy: u16, delivery: TicketDelivery| EmuTicket {

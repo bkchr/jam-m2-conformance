@@ -2,12 +2,11 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use tokio::sync::broadcast;
 use std::time::{Duration, Instant};
+use tokio::sync::broadcast;
 
 use jamnp_s::cert::san_for_key;
 use m2_emu::emu::Emulator;
-use m2_emu::ticket_io::plan_for_peer;
 use m2_reference::chain::RefChain;
 use m2_scenario::dsl::ObsKind;
 use m2_scenario::scenarios::l0;
@@ -16,7 +15,9 @@ use crate::cli::{Cli, Preset};
 use crate::connectivity::{self, ConnectivityPlan, ProbeOutcome};
 use crate::keygen;
 use crate::launch::{self, LaunchConfig, NutProcess};
-use crate::real::{build_real_run_ctx, compute_ticket_plan, RealRunData};
+use crate::real::{
+    build_real_run_ctx, generate_tickets, plans_by_peer, schedule_tickets, RealRunData,
+};
 use crate::report::{self, Finding};
 use crate::scenario::{evaluate, fabricated_obs_log, fabricated_run_ctx, Evaluation, ObsSource};
 use crate::spec;
@@ -79,6 +80,32 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         .verification_key()
         .to_bytes();
     let plan = connectivity::plan_connectivity(&emu_keys, &nut_key);
+
+    // Ring-VRF ticket generation is the most expensive thing in a run — tens
+    // of seconds — and it used to sit between the emulator opening its sockets
+    // and the first emulated validator dialling. The whole of it fell inside
+    // the observation window: the reference chain stood eight slots stale by
+    // the time the window opened, and the ticket plan was left straddling the
+    // end of the epoch's submission window. Start it here instead, so it runs
+    // while the node is starting up and the connectivity phase is probing, and
+    // seed the chain afterwards, when it is about to be needed.
+    //
+    // A `spawn_blocking` task cannot be cancelled, so a run that gives up on
+    // the NUT's startup still waits for whatever is left of the generation
+    // before the runtime shuts down. That is bounded by the generation itself
+    // and overlaps the startup timeout, so it costs seconds, not minutes.
+    let reference = if cli.dry_run {
+        None
+    } else {
+        let ref_spec = spec::tiny_spec(&ips, &ports, anchor_slot).map_err(internal)?;
+        let ref_chain = Arc::new(RefChain::with_spec(nut_index, ref_spec).map_err(internal)?);
+        let tickets = tokio::task::spawn_blocking({
+            let ref_chain = Arc::clone(&ref_chain);
+            move || generate_tickets(&ref_chain)
+        });
+        Some((ref_chain, tickets))
+    };
+
     let mut nut: Option<NutProcess> = None;
     let mut conn_findings: Vec<Finding> = Vec::new();
     if !cli.dry_run {
@@ -125,94 +152,70 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             None,
         )
     } else {
-        let ref_spec = spec::tiny_spec(&ips, &ports, anchor_slot).map_err(internal)?;
-        let ref_chain = RefChain::with_spec(nut_index, ref_spec).map_err(internal)?;
+        let (ref_chain, tickets) = reference.expect("a live run builds the reference chain");
+        let (ticket_ctx, tickets, target_epoch) =
+            tickets.await.map_err(internal)?.map_err(internal)?;
+        // Seeded here, not before the launch: every slot between genesis and
+        // now has to be filled for the chain to be current when the window
+        // opens, and "now" moves while the node starts and the tickets are
+        // generated.
         let count = seed_past_slots(&ref_chain).map_err(internal)?;
-        let ref_chain = Arc::new(ref_chain);
+        let ticket_plan = schedule_tickets(&ref_chain, &tickets, nut_index, target_epoch);
+        if ticket_plan.is_empty() {
+            conn_findings.push(empty_ticket_plan_finding(&ref_chain, target_epoch));
+        }
         let emu = Emulator::l0(emu_indices.clone(), genesis_hash, cli.base_port)
             .await
             .map_err(internal)?;
+        // Each emulated validator's tickets go out on the first connection to
+        // it, whichever side opened it.
+        emu.set_ticket_plans(plans_by_peer(&ticket_plan));
         let obs = emu.obs();
         let trace = emu.trace();
         let nut_blocks = emu.nut_blocks();
+        let deliveries = emu.deliveries();
+        let shared = emu.shared(Arc::clone(&ref_chain));
         let _accept = emu.accept_loop(ref_chain.clone());
-        // L2: compute the emulated ticket plan for the target epoch so each
-        // dialed connection can deliver its own tickets to the NUT.
-        let (ticket_ctx, ticket_plan, target_epoch) =
-            compute_ticket_plan(&ref_chain, nut_index).map_err(internal)?;
         // Drive the preferred-initiator connectivity: emulated validators that
         // are the preferred initiator dial the NUT now; the rest wait the 5 s
         // grace then dial anyway (a soft finding).
-        let announce = emu.announce_tx();
+        //
         // Keep authoring for the whole observation window, announcing each
         // block as its slot arrives (A10). Aborted with the dial tasks when the
         // window closes.
         let mut dial_tasks = vec![tokio::spawn(drive_slots(
             Arc::clone(&ref_chain),
-            announce.clone(),
+            emu.announce_tx(),
         ))];
         for &i in &plan.initiate_now {
-            let trace = trace.clone();
-            let obs = obs.clone();
-            let nut_blocks = nut_blocks.clone();
-            let ref_chain = ref_chain.clone();
+            let shared = shared.clone();
             let nut_san = nut_san.clone();
             let index = emu_indices[i];
-            let peer_plan = plan_for_peer(&ticket_plan, index);
-            let announce = announce.clone();
             dial_tasks.push(tokio::spawn(async move {
-                let _ = m2_emu::emu::dial_nut(
-                    index,
-                    genesis_hash,
-                    nut_addr,
-                    nut_san,
-                    ref_chain,
-                    trace,
-                    obs,
-                    nut_blocks,
-                    peer_plan,
-                    announce,
-                )
-                .await;
+                let _ = m2_emu::emu::dial_nut(index, genesis_hash, nut_addr, nut_san, shared).await;
             }));
         }
         for &i in &plan.wait_then_connect {
-            let trace = trace.clone();
-            let obs = obs.clone();
-            let nut_blocks = nut_blocks.clone();
-            let ref_chain = ref_chain.clone();
+            let shared = shared.clone();
             let nut_san = nut_san.clone();
             let index = emu_indices[i];
-            let peer_plan = plan_for_peer(&ticket_plan, index);
-            let announce = announce.clone();
             dial_tasks.push(tokio::spawn(async move {
                 tokio::time::sleep(connectivity::INITIATOR_GRACE).await;
                 // The NUT is the preferred initiator for this peer. The grace
                 // is there so the pair still connects if it never dials, not
                 // so we open a second connection alongside its first.
                 let peer = index as u16;
-                if !connectivity::should_fallback_dial(&lock(&obs), peer) {
+                if !connectivity::should_fallback_dial(&lock(&shared.obs), peer) {
                     return;
                 }
-                m2_emu::emu::record(&obs, peer, ObsKind::Other(l0::FALLBACK_DIAL));
-                let _ = m2_emu::emu::dial_nut(
-                    index,
-                    genesis_hash,
-                    nut_addr,
-                    nut_san,
-                    ref_chain,
-                    trace,
-                    obs,
-                    nut_blocks,
-                    peer_plan,
-                    announce,
-                )
-                .await;
+                m2_emu::emu::record(&shared.obs, peer, ObsKind::Other(l0::FALLBACK_DIAL));
+                let _ = m2_emu::emu::dial_nut(index, genesis_hash, nut_addr, nut_san, shared).await;
             }));
         }
         let real_run = RealRunData {
             ref_chain,
             nut_blocks,
+            deliveries,
             ticket_ctx,
             plan: ticket_plan,
             target_epoch,
@@ -241,13 +244,12 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     drop(dial_tasks);
 
     let run_ctx = match &source {
-        ObsSource::Emulator { obs, trace, .. } => {
+        ObsSource::Emulator { trace, .. } => {
             let data = real_run.as_ref().ok_or_else(|| {
                 RunError::Internal("emulator run missing reference run data".into())
             })?;
             build_real_run_ctx(
                 data,
-                &lock(obs),
                 &lock(trace),
                 l0::L0Ctx {
                     reference_block_count,
@@ -345,6 +347,14 @@ async fn drive_slots(chain: Arc<RefChain>, announce: broadcast::Sender<Vec<u8>>)
         if let Ok(delay) = start.duration_since(std::time::SystemTime::now()) {
             tokio::time::sleep(delay).await;
         }
+        // The head no longer moves only when this task authors: a NUT block
+        // adopted into the chain can already occupy this slot or a later one,
+        // and authoring at or behind the head is an error that would end the
+        // driver for the rest of the run.
+        if next <= chain.best_slot() {
+            next += 1;
+            continue;
+        }
         match chain.author_block(next) {
             Ok(Some(block)) => {
                 // Fails only when nothing is subscribed, which is not an error:
@@ -356,6 +366,27 @@ async fn drive_slots(chain: Arc<RefChain>, announce: broadcast::Sender<Vec<u8>>)
             Err(_) => break,
         }
         next += 1;
+    }
+}
+
+/// A soft finding for a run whose ticket plan came out empty: the epoch's
+/// submission window closed before the harness was ready to use it.
+///
+/// Reported rather than swallowed, because the L1 and L2 ticket checks are
+/// then measuring nothing — the honest reading is "not exercised", not "no
+/// defect found".
+fn empty_ticket_plan_finding(ref_chain: &RefChain, target_epoch: u32) -> Finding {
+    let now = ref_chain.next_slot();
+    Finding {
+        severity: "soft".into(),
+        spec_citation: "simple.md :305-349".into(),
+        slot: Some(now),
+        evidence: "ticket plan".into(),
+        message: format!(
+            "no tickets scheduled: at slot {now} (epoch offset {}) the submission window for \
+             epoch {target_epoch} has closed, so the ticket lanes are not exercised",
+            now % jam_types::epoch_period()
+        ),
     }
 }
 

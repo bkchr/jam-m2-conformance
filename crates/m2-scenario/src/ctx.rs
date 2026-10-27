@@ -18,6 +18,16 @@ pub const SLOT_PERIOD_MS: u64 = 6000;
 /// Tickets must arrive this long before a slot's start to be expected in it.
 pub const TICKET_ARRIVAL_LEAD_MS: u64 = 2000;
 
+/// Default epoch length in slots (tiny protocol parameters).
+pub const EPOCH_PERIOD: u32 = 12;
+
+/// Default first slot of the epoch tail, past which a block's ticket extrinsic
+/// must be empty (tiny protocol parameters).
+pub const EPOCH_TAIL_START: u32 = 10;
+
+/// Default per-block ticket-extrinsic cap (tiny protocol parameters).
+pub const MAX_TICKETS_PER_BLOCK: usize = 3;
+
 /// A block the NUT announced (the block itself, and when it announced it).
 #[derive(Clone, Debug)]
 pub struct NutBlock {
@@ -26,21 +36,41 @@ pub struct NutBlock {
 }
 
 /// Outcome of the runner importing a NUT block into the reference chain.
+///
+/// Three distinct 32-byte values, easy to confuse and checked against each
+/// other by the L1 state-root lane: `header_root` identifies the block,
+/// `declared_parent_root` is the prior state root its header claims, and
+/// `root` is the reference engine's posterior state root for the block itself.
 #[derive(Clone, Debug)]
 pub struct ImportFact {
+    /// Hash of the block's header.
     pub header_root: [u8; 32],
+    /// Hash of the block's parent.
+    pub parent: [u8; 32],
+    /// Prior state root the block's header declares.
+    pub declared_parent_root: [u8; 32],
+    /// The reference's own posterior state root for the parent.
+    pub reference_parent_root: Option<[u8; 32]>,
     pub ok: bool,
-    /// Reference state root after a successful import.
+    /// Reference posterior state root of this block after a successful import.
     pub root: Option<[u8; 32]>,
     /// Why the import failed, when `ok` is false.
     pub error: Option<String>,
 }
 
 /// A ticket the runner delivered to the NUT over the wire.
+///
+/// `delivered_at_ms` is wall-clock milliseconds since the Unix epoch, the same
+/// base as [`L1Ctx::slot_start_ms`]. It has to be: the two are compared, and
+/// filling this from the observation log's run-relative timestamps made every
+/// ticket look as if it had been delivered before the run began.
 #[derive(Clone, Debug)]
 pub struct DeliveredTicket {
     pub id: [u8; 32],
     pub delivered_at_ms: u64,
+    /// Epoch the ticket is *for*; it may only be included in a block of the
+    /// epoch before this one.
+    pub target_epoch: u32,
 }
 
 /// Facts the L1 (block authoring) lane reads.
@@ -51,10 +81,19 @@ pub struct DeliveredTicket {
 pub struct L1Ctx {
     pub reference_best: [u8; 32],
     pub reference_block_hashes: Vec<[u8; 32]>,
+    /// The reference best chain as `(slot, header hash)`, ascending by slot.
+    ///
+    /// What a NUT block's parent must be judged against is the reference head
+    /// *at that block's slot*, not the head after the window closed; see
+    /// [`L1Ctx::reference_best_at`].
+    pub reference_chain: Vec<(u32, [u8; 32])>,
     pub nut_blocks: Vec<NutBlock>,
     pub imports: Vec<ImportFact>,
     pub delivered_tickets: Vec<DeliveredTicket>,
     pub slot_period_ms: u64,
+    pub epoch_period: u32,
+    pub epoch_tail_start: u32,
+    pub max_tickets_per_block: usize,
 }
 
 impl L1Ctx {
@@ -63,15 +102,46 @@ impl L1Ctx {
         JAM_COMMON_ERA * 1000 + slot as u64 * self.slot_period_ms
     }
 
-    /// Tickets delivered at least [`TICKET_ARRIVAL_LEAD_MS`] before the slot
-    /// start — the ones the NUT must already have in hand for `slot`.
+    /// The reference best block as of the start of `slot`: the last block on
+    /// the reference chain with a strictly earlier slot.
+    ///
+    /// The reference chain only ever extends during a run (it adopts the NUT's
+    /// blocks rather than forking away from them), so every block on the final
+    /// best chain was also the best block at its own slot.
+    pub fn reference_best_at(&self, slot: u32) -> Option<[u8; 32]> {
+        self.reference_chain
+            .iter()
+            .rev()
+            .find(|(s, _)| *s < slot)
+            .map(|(_, hash)| *hash)
+    }
+
+    /// Whether a block at `slot` may carry tickets at all: inside the epoch,
+    /// before the tail (`slot % epoch_period < epoch_tail_start`).
+    pub fn slot_accepts_tickets(&self, slot: u32) -> bool {
+        slot % self.epoch_period < self.epoch_tail_start
+    }
+
+    /// Tickets the NUT owes a block at `slot`: delivered at least
+    /// [`TICKET_ARRIVAL_LEAD_MS`] before the slot started, targeting the epoch
+    /// after this block's, and in a slot that still accepts tickets.
+    ///
+    /// All three conditions matter. A ticket for epoch `e` may only be
+    /// submitted during epoch `e - 1`, and nothing at all may be submitted in
+    /// the tail — so a check that only applied the 2 s arrival rule demanded
+    /// inclusions the node is required to refuse.
     pub fn expected_tickets_for_slot(&self, slot: u32) -> Vec<[u8; 32]> {
+        if !self.slot_accepts_tickets(slot) {
+            return Vec::new();
+        }
         let cutoff = self
             .slot_start_ms(slot)
             .saturating_sub(TICKET_ARRIVAL_LEAD_MS);
+        let submittable_epoch = slot / self.epoch_period + 1;
         self.delivered_tickets
             .iter()
             .filter(|t| t.delivered_at_ms <= cutoff)
+            .filter(|t| t.target_epoch == submittable_epoch)
             .map(|t| t.id)
             .collect()
     }
@@ -142,10 +212,14 @@ mod tests {
         L1Ctx {
             reference_best: [0u8; 32],
             reference_block_hashes: Vec::new(),
+            reference_chain: Vec::new(),
             nut_blocks: Vec::new(),
             imports: Vec::new(),
             delivered_tickets: Vec::new(),
             slot_period_ms: SLOT_PERIOD_MS,
+            epoch_period: EPOCH_PERIOD,
+            epoch_tail_start: EPOCH_TAIL_START,
+            max_tickets_per_block: MAX_TICKETS_PER_BLOCK,
         }
     }
 
@@ -156,10 +230,12 @@ mod tests {
             DeliveredTicket {
                 id: [1u8; 32],
                 delivered_at_ms: jam_types::JAM_COMMON_ERA * 1000 - 2000,
+                target_epoch: 1,
             },
             DeliveredTicket {
                 id: [2u8; 32],
                 delivered_at_ms: jam_types::JAM_COMMON_ERA * 1000 - 500,
+                target_epoch: 1,
             },
         ];
 
@@ -173,6 +249,52 @@ mod tests {
             !expected.contains(&[2u8; 32]),
             "ticket 500 ms early is excluded"
         );
+    }
+
+    /// The arrival rule is not the only one: a slot in the epoch tail owes
+    /// nothing, and a ticket whose target epoch has already begun is stale.
+    #[test]
+    fn ctx_expected_tickets_respect_tail_and_target_epoch() {
+        let mut ctx = base_l1();
+        let long_ago = 0;
+        ctx.delivered_tickets = vec![DeliveredTicket {
+            id: [1u8; 32],
+            delivered_at_ms: long_ago,
+            target_epoch: 1,
+        }];
+
+        assert_eq!(
+            ctx.expected_tickets_for_slot(EPOCH_TAIL_START - 1),
+            vec![[1u8; 32]],
+            "the last slot before the tail still owes it"
+        );
+        assert!(
+            ctx.expected_tickets_for_slot(EPOCH_TAIL_START).is_empty(),
+            "nothing is owed once the epoch tail starts"
+        );
+        assert!(
+            ctx.expected_tickets_for_slot(EPOCH_PERIOD).is_empty(),
+            "a ticket for epoch 1 is stale in epoch 1"
+        );
+    }
+
+    /// The reference head is resolved as of the block's own slot, so a block
+    /// is never judged against a head that did not exist when it was authored.
+    #[test]
+    fn ctx_reference_best_at_slot() {
+        let mut ctx = base_l1();
+        ctx.reference_chain = vec![(3, [1u8; 32]), (7, [2u8; 32])];
+
+        assert_eq!(ctx.reference_best_at(0), None);
+        assert_eq!(
+            ctx.reference_best_at(3),
+            None,
+            "strictly earlier slots only"
+        );
+        assert_eq!(ctx.reference_best_at(4), Some([1u8; 32]));
+        assert_eq!(ctx.reference_best_at(7), Some([1u8; 32]));
+        assert_eq!(ctx.reference_best_at(8), Some([2u8; 32]));
+        assert_eq!(ctx.reference_best_at(99), Some([2u8; 32]));
     }
 
     #[test]
@@ -191,6 +313,7 @@ mod tests {
         let l1 = L1Ctx {
             reference_best: [7u8; 32],
             reference_block_hashes: vec![[1u8; 32], [2u8; 32]],
+            reference_chain: vec![(1, [1u8; 32]), (2, [2u8; 32])],
             nut_blocks: vec![NutBlock {
                 block: Block {
                     header: Arc::new(Header::genesis().into()),
@@ -200,6 +323,9 @@ mod tests {
             }],
             imports: vec![ImportFact {
                 header_root: [3u8; 32],
+                parent: [8u8; 32],
+                declared_parent_root: [9u8; 32],
+                reference_parent_root: Some([9u8; 32]),
                 ok: true,
                 root: Some([4u8; 32]),
                 error: None,
@@ -207,8 +333,12 @@ mod tests {
             delivered_tickets: vec![DeliveredTicket {
                 id: [5u8; 32],
                 delivered_at_ms: 500,
+                target_epoch: 1,
             }],
             slot_period_ms: SLOT_PERIOD_MS,
+            epoch_period: EPOCH_PERIOD,
+            epoch_tail_start: EPOCH_TAIL_START,
+            max_tickets_per_block: MAX_TICKETS_PER_BLOCK,
         };
         assert_eq!(l1.reference_best, [7u8; 32]);
         assert_eq!(l1.reference_block_hashes, vec![[1u8; 32], [2u8; 32]]);

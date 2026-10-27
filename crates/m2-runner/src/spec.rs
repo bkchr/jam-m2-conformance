@@ -282,8 +282,7 @@ mod tests {
     #[test]
     fn genesis_is_anchored_to_the_current_epoch() {
         let anchor = m2_reference::chain::current_epoch_start_slot();
-        let chain_spec =
-            tiny_spec(&loopback_ips(), &ports(), anchor).expect("tiny spec builds");
+        let chain_spec = tiny_spec(&loopback_ips(), &ports(), anchor).expect("tiny spec builds");
         let period = jam_types::epoch_period();
         let now = m2_reference::chain::wall_clock_slot();
 
@@ -364,9 +363,11 @@ mod tests {
 
         // ... and an unanchored reference chain would not match, which is the
         // failure this guards against.
-        let unanchored =
-            m2_reference::chain::RefChain::tiny(0).expect("reference chain builds");
-        assert_ne!(chain_spec.genesis_header.hash().0, unanchored.genesis_hash());
+        let unanchored = m2_reference::chain::RefChain::tiny(0).expect("reference chain builds");
+        assert_ne!(
+            chain_spec.genesis_header.hash().0,
+            unanchored.genesis_hash()
+        );
     }
 
     #[test]

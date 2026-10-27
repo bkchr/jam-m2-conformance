@@ -5,6 +5,7 @@
 //! runner/scenario. This module only frames, signs and records.
 
 use std::{
+    collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -21,7 +22,7 @@ use jamnp_s::{
 };
 use m2_reference::chain::RefChain;
 use m2_reference::tickets::ScheduledTicket;
-use m2_scenario::ctx::NutBlock;
+use m2_scenario::ctx::{DeliveredTicket, NutBlock};
 use m2_scenario::dsl::{Obs, ObsKind, ObsLog};
 use m2_scenario::scenarios::l0;
 use tokio::sync::broadcast;
@@ -68,6 +69,8 @@ pub struct Emulator {
     trace: Arc<Mutex<Trace>>,
     obs: Arc<Mutex<ObsLog>>,
     nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
+    ticket_plans: Arc<Mutex<HashMap<u16, Vec<ScheduledTicket>>>>,
+    deliveries: Arc<Mutex<Vec<DeliveredTicket>>>,
     /// Fan-out for blocks authored after the connections are up (A10).
     ///
     /// Every live UP 0 stream subscribes, so a block announced here reaches
@@ -76,6 +79,45 @@ pub struct Emulator {
     /// mean holding that lock across a write. A subscriber also disappears on
     /// its own when its stream task ends.
     announce: broadcast::Sender<Vec<u8>>,
+}
+
+/// Everything a connection handler shares with the rest of the emulator.
+///
+/// Bundled rather than passed one argument at a time: the handlers already
+/// carried eight to ten parameters each, and the ticket plans and the delivery
+/// log would have made every one of them longer again.
+#[derive(Clone)]
+pub struct EmuShared {
+    pub ref_chain: Arc<RefChain>,
+    pub trace: Arc<Mutex<Trace>>,
+    pub obs: Arc<Mutex<ObsLog>>,
+    pub nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
+    /// Blocks authored after the connections are up; see [`Emulator::announce`].
+    pub announce: broadcast::Sender<Vec<u8>>,
+    /// Each emulated validator's undelivered tickets, keyed by peer.
+    ///
+    /// A plan is *taken* by the first connection to that peer, whichever side
+    /// opened it. Ticket delivery used to live in [`dial_nut`] alone, so a peer
+    /// the NUT connected to first never delivered its tickets at all — and
+    /// after the harness stopped dialling peers that had already connected,
+    /// that was most of them.
+    pub ticket_plans: Arc<Mutex<HashMap<u16, Vec<ScheduledTicket>>>>,
+    /// Tickets actually put on the wire, with the wall-clock time they were
+    /// sent. The sender knows each ticket's id, so the L1 lane reads this
+    /// rather than re-deriving ids from the observation log.
+    pub deliveries: Arc<Mutex<Vec<DeliveredTicket>>>,
+}
+
+impl EmuShared {
+    /// Take `peer`'s ticket plan, leaving nothing behind.
+    ///
+    /// Returns `None` once taken, so a second connection to the same peer does
+    /// not deliver the same tickets twice.
+    pub fn take_ticket_plan(&self, peer: u16) -> Option<Vec<ScheduledTicket>> {
+        lock(&self.ticket_plans)
+            .remove(&peer)
+            .filter(|p| !p.is_empty())
+    }
 }
 
 impl Emulator {
@@ -113,8 +155,36 @@ impl Emulator {
             trace: Arc::new(Mutex::new(Trace::default())),
             obs: Arc::new(Mutex::new(ObsLog::new())),
             nut_blocks: Arc::new(Mutex::new(Vec::new())),
+            ticket_plans: Arc::new(Mutex::new(HashMap::new())),
+            deliveries: Arc::new(Mutex::new(Vec::new())),
             announce: broadcast::Sender::new(ANNOUNCE_BUFFER),
         })
+    }
+
+    /// Hand each emulated validator the tickets it is to deliver to the NUT.
+    ///
+    /// Whichever side opens the first connection to a peer delivers that
+    /// peer's plan; see [`EmuShared::ticket_plans`].
+    pub fn set_ticket_plans(&self, plans: HashMap<u16, Vec<ScheduledTicket>>) {
+        *lock(&self.ticket_plans) = plans;
+    }
+
+    /// The tickets the emulator put on the wire, with their send times.
+    pub fn deliveries(&self) -> Arc<Mutex<Vec<DeliveredTicket>>> {
+        Arc::clone(&self.deliveries)
+    }
+
+    /// The state every connection handler shares, over `ref_chain`.
+    pub fn shared(&self, ref_chain: Arc<RefChain>) -> EmuShared {
+        EmuShared {
+            ref_chain,
+            trace: Arc::clone(&self.trace),
+            obs: Arc::clone(&self.obs),
+            nut_blocks: Arc::clone(&self.nut_blocks),
+            announce: self.announce.clone(),
+            ticket_plans: Arc::clone(&self.ticket_plans),
+            deliveries: Arc::clone(&self.deliveries),
+        }
     }
 
     /// Sender for live block announcements; see [`Emulator::announce`].
@@ -155,31 +225,18 @@ impl Emulator {
     /// (i.e. once the endpoints are closed).
     pub fn accept_loop(&self, ref_chain: Arc<RefChain>) -> JoinHandle<()> {
         let handle = tokio::runtime::Handle::current();
+        let shared = self.shared(ref_chain);
         let tasks: Vec<JoinHandle<()>> = self
             .endpoints
             .iter()
             .enumerate()
             .map(|(i, endpoint)| {
                 let endpoint = Arc::clone(endpoint);
-                let ref_chain = Arc::clone(&ref_chain);
-                let trace = Arc::clone(&self.trace);
-                let obs = Arc::clone(&self.obs);
-                let nut_blocks = Arc::clone(&self.nut_blocks);
+                let shared = shared.clone();
                 let peer_index = self.emu_indices[i] as u16;
                 let genesis_hash = self.genesis_hash;
-                let announce = self.announce.clone();
                 handle.spawn(async move {
-                    endpoint_task(
-                        endpoint,
-                        peer_index,
-                        genesis_hash,
-                        ref_chain,
-                        trace,
-                        obs,
-                        nut_blocks,
-                        announce,
-                    )
-                    .await;
+                    endpoint_task(endpoint, peer_index, genesis_hash, shared).await;
                 })
             })
             .collect();
@@ -214,19 +271,18 @@ const ANNOUNCE_BUFFER: usize = 16;
 /// open UP 0 as the connection initiator, then serve the NUT's CE 128 / CE 129
 /// requests. Used where the emulated validator is the preferred initiator
 /// (DESIGN.md §4.3).
-#[allow(clippy::too_many_arguments)]
 pub async fn dial_nut(
     index: usize,
     genesis_hash: [u8; 32],
     nut_addr: SocketAddr,
     nut_san: String,
-    ref_chain: Arc<RefChain>,
-    trace: Arc<Mutex<Trace>>,
-    obs: Arc<Mutex<ObsLog>>,
-    nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
-    plan: Vec<ScheduledTicket>,
-    announce: broadcast::Sender<Vec<u8>>,
+    shared: EmuShared,
 ) -> Result<(), EmuError> {
+    let (ref_chain, trace, obs) = (
+        Arc::clone(&shared.ref_chain),
+        Arc::clone(&shared.trace),
+        Arc::clone(&shared.obs),
+    );
     let secret = SecretKeyset::trivial(index as u32).ed25519;
     let config = EndpointConfig {
         genesis_hash,
@@ -277,7 +333,7 @@ pub async fn dial_nut(
     // block the slot driver authors from now on (A10).
     tokio::spawn(pump_announcements(
         send,
-        announce.subscribe(),
+        shared.announce.subscribe(),
         peer,
         up0_stream_id,
         Arc::clone(&trace),
@@ -295,33 +351,15 @@ pub async fn dial_nut(
         peer,
         genesis_hash,
         up0_stream_id,
-        Arc::clone(&ref_chain),
-        Arc::clone(&trace),
-        Arc::clone(&obs),
-        Arc::clone(&nut_blocks),
+        shared.clone(),
     ));
 
-    // Deliver the peer's L2 tickets on their own streams, concurrently with the handler.
-    tokio::spawn(spawn_ticket_sender(
-        connection.clone(),
-        plan,
-        trace.clone(),
-        obs.clone(),
-        peer,
-    ));
+    // Deliver the peer's L2 tickets on their own streams, concurrently with
+    // the handler — unless the accept side already took the plan.
+    start_ticket_delivery(&connection, peer, &shared);
 
-    // Serve the NUT.s CE 128 / CE 129 requests on the dialed connection.
-    handle_connection(
-        connection,
-        peer,
-        genesis_hash,
-        ref_chain,
-        trace,
-        obs,
-        nut_blocks,
-        announce,
-    )
-    .await;
+    // Serve the NUT's CE 128 / CE 129 requests on the dialed connection.
+    handle_connection(connection, peer, genesis_hash, shared).await;
     Ok(())
 }
 
@@ -363,17 +401,13 @@ pub fn serve_ce129(_request: &StateRequest) -> StateResponse {
 
 /// Accept-loop for one emulated validator: record accepts and run the L0
 /// reactive handler on each connection.
-#[allow(clippy::too_many_arguments)]
 async fn endpoint_task(
     endpoint: Arc<Endpoint>,
     peer_index: u16,
     genesis_hash: [u8; 32],
-    ref_chain: Arc<RefChain>,
-    trace: Arc<Mutex<Trace>>,
-    obs: Arc<Mutex<ObsLog>>,
-    nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
-    announce: broadcast::Sender<Vec<u8>>,
+    shared: EmuShared,
 ) {
+    let obs = Arc::clone(&shared.obs);
     while let Some(incoming) = endpoint.accept().await {
         record(&obs, peer_index, ObsKind::Accept);
         let Ok(connecting) = incoming.accept() else {
@@ -391,28 +425,33 @@ async fn endpoint_task(
         record(&obs, peer_index, ObsKind::Other(l0::ALPN_ACCEPTED));
         record(&obs, peer_index, ObsKind::Other(l0::ALPN_OFFERED));
         record(&obs, peer_index, ObsKind::Other(l0::NUT_INITIATED));
+        // Deliver this peer's tickets on the first connection to it, whichever
+        // side opened it: the NUT reaching us first must not cost the peer its
+        // whole ticket plan.
+        start_ticket_delivery(&connection, peer_index, &shared);
         // One task per connection: with UP 0 persistent the handler runs for
         // the lifetime of the connection, so awaiting it here would stall the
         // accept loop and the peer's redials would never be answered.
-        let ref_chain = Arc::clone(&ref_chain);
-        let trace = Arc::clone(&trace);
-        let obs = Arc::clone(&obs);
-        let nut_blocks = Arc::clone(&nut_blocks);
-        let announce = announce.clone();
+        let shared = shared.clone();
         tokio::spawn(async move {
-            handle_connection(
-                connection,
-                peer_index,
-                genesis_hash,
-                ref_chain,
-                trace,
-                obs,
-                nut_blocks,
-                announce,
-            )
-            .await;
+            handle_connection(connection, peer_index, genesis_hash, shared).await;
         });
     }
+}
+
+/// Spawn the ticket sender for `peer`, if its plan has not been taken yet.
+fn start_ticket_delivery(connection: &quinn::Connection, peer: u16, shared: &EmuShared) {
+    let Some(plan) = shared.take_ticket_plan(peer) else {
+        return;
+    };
+    tokio::spawn(spawn_ticket_sender(
+        connection.clone(),
+        plan,
+        Arc::clone(&shared.trace),
+        Arc::clone(&shared.obs),
+        Arc::clone(&shared.deliveries),
+        peer,
+    ));
 }
 
 /// Application error code used when the emulator refuses a stream: an unknown
@@ -429,24 +468,16 @@ const STREAM_REFUSED: u32 = 1;
 /// would block every later one — nor drop a stream's halves once its first
 /// message is handled. Each accepted stream gets its own task instead, living
 /// exactly as long as the peer keeps the stream open.
-#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     connection: quinn::Connection,
     peer_index: u16,
     genesis_hash: [u8; 32],
-    ref_chain: Arc<RefChain>,
-    trace: Arc<Mutex<Trace>>,
-    obs: Arc<Mutex<ObsLog>>,
-    nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
-    announce: broadcast::Sender<Vec<u8>>,
+    shared: EmuShared,
 ) {
     while let Ok((send, recv)) = connection.accept_bi().await {
         let connection = connection.clone();
-        let ref_chain = Arc::clone(&ref_chain);
-        let trace = Arc::clone(&trace);
-        let obs = Arc::clone(&obs);
-        let nut_blocks = Arc::clone(&nut_blocks);
-        let announce = announce.subscribe();
+        let announce = shared.announce.subscribe();
+        let shared = shared.clone();
         tokio::spawn(async move {
             handle_stream(
                 connection,
@@ -454,10 +485,7 @@ async fn handle_connection(
                 recv,
                 peer_index,
                 genesis_hash,
-                &ref_chain,
-                &trace,
-                &obs,
-                &nut_blocks,
+                &shared,
                 announce,
             )
             .await;
@@ -471,19 +499,16 @@ async fn handle_connection(
 /// (`simple.md:122-124`), and selects the handler. CE streams are ephemeral:
 /// one request, one response, FIN. UP 0 is persistent: keep reading messages
 /// until the peer closes it, and never drop the halves first.
-#[allow(clippy::too_many_arguments)]
 async fn handle_stream(
     connection: quinn::Connection,
     mut send: quinn::SendStream,
     recv: quinn::RecvStream,
     peer_index: u16,
     genesis_hash: [u8; 32],
-    ref_chain: &RefChain,
-    trace: &Mutex<Trace>,
-    obs: &Mutex<ObsLog>,
-    nut_blocks: &Mutex<Vec<NutBlock>>,
+    shared: &EmuShared,
     mut announce: broadcast::Receiver<Vec<u8>>,
 ) {
+    let (ref_chain, trace, obs) = (&*shared.ref_chain, &*shared.trace, &*shared.obs);
     let stream_id = u64::from(send.id());
     let mut reader = StreamReader::new(recv);
     let (kind, content) = match reader.next().await {
@@ -501,12 +526,9 @@ async fn handle_stream(
                 Some(&mut send),
                 peer_index,
                 genesis_hash,
-                ref_chain,
                 stream_id,
                 &content,
-                trace,
-                obs,
-                nut_blocks,
+                shared,
             )
             .await;
             // UP 0 is static for the lifetime of the connection: serve every
@@ -526,12 +548,9 @@ async fn handle_stream(
                                 Some(&mut send),
                                 peer_index,
                                 genesis_hash,
-                                ref_chain,
                                 stream_id,
                                 &content,
-                                trace,
-                                obs,
-                                nut_blocks,
+                                shared,
                             )
                             .await;
                         }
@@ -620,34 +639,34 @@ async fn pump_announcements(
 /// The mirror of the UP 0 arm of [`handle_stream`], with two differences: the
 /// half carries no opening kind byte, since we wrote it when we opened the
 /// stream, and nothing is answered — our handshake went out with the open.
-#[allow(clippy::too_many_arguments)]
 async fn read_dialed_up0(
     connection: quinn::Connection,
     recv: quinn::RecvStream,
     peer_index: u16,
     genesis_hash: [u8; 32],
     stream_id: u64,
-    ref_chain: Arc<RefChain>,
-    trace: Arc<Mutex<Trace>>,
-    obs: Arc<Mutex<ObsLog>>,
-    nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
+    shared: EmuShared,
 ) {
     let mut reader = StreamReader::with_kind(recv, UP);
     loop {
         match reader.next().await {
             Ok(Some((_, content))) => {
-                trace_record(peer_index, UP, stream_id, &content, &trace, TraceDir::Tx);
+                trace_record(
+                    peer_index,
+                    UP,
+                    stream_id,
+                    &content,
+                    &shared.trace,
+                    TraceDir::Tx,
+                );
                 handle_up0(
                     &connection,
                     None,
                     peer_index,
                     genesis_hash,
-                    &ref_chain,
                     stream_id,
                     &content,
-                    &trace,
-                    &obs,
-                    &nut_blocks,
+                    &shared,
                 )
                 .await;
             }
@@ -674,13 +693,11 @@ async fn handle_up0(
     send: Option<&mut quinn::SendStream>,
     peer_index: u16,
     genesis_hash: [u8; 32],
-    ref_chain: &RefChain,
     stream_id: u64,
     content: &[u8],
-    trace: &Mutex<Trace>,
-    obs: &Mutex<ObsLog>,
-    nut_blocks: &Mutex<Vec<NutBlock>>,
+    shared: &EmuShared,
 ) {
+    let (ref_chain, trace, obs) = (&*shared.ref_chain, &*shared.trace, &*shared.obs);
     if let Ok(announcement) = Announcement::decode(&mut &content[..]) {
         record(obs, peer_index, ObsKind::Up0Announce);
         record(obs, peer_index, ObsKind::Other(l0::REANNOUNCED));
@@ -688,8 +705,8 @@ async fn handle_up0(
         // block: fetch it over CE 128 and record it (fetch errors leave the
         // announcement recorded and the stream open).
         let hash = announcement.header.hash().0;
-        if should_fetch(&hash, ref_chain, nut_blocks) {
-            let _ = fetch_block(connection, hash, trace, obs, peer_index, nut_blocks).await;
+        if should_fetch(&hash, ref_chain, &shared.nut_blocks) {
+            let _ = fetch_block(connection, hash, peer_index, shared).await;
         }
         return;
     }

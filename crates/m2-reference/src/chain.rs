@@ -52,8 +52,7 @@ pub fn current_epoch_start_slot() -> u32 {
 /// Used to pace authoring on slot boundaries rather than by sleeping a slot
 /// period at a time, which would drift by the cost of each round over a run.
 pub fn slot_start(slot: u32) -> SystemTime {
-    UNIX_EPOCH
-        + Duration::from_secs(jam_types::JAM_COMMON_ERA + slot as u64 * SLOT_PERIOD_SEC)
+    UNIX_EPOCH + Duration::from_secs(jam_types::JAM_COMMON_ERA + slot as u64 * SLOT_PERIOD_SEC)
 }
 
 /// The keyset handed to the NUT's slot in the harness keystore.
@@ -179,6 +178,16 @@ impl RefChain {
     /// Current wall-clock slot (`(now - JAM_COMMON_ERA) / 6`).
     pub fn next_slot(&self) -> u32 {
         wall_clock_slot()
+    }
+
+    /// Slot of the chain's current best block.
+    ///
+    /// The slot driver needs it because the chain head no longer moves only
+    /// when the driver authors: a NUT block adopted into the chain can put the
+    /// head at a slot the driver is about to try, and [`RefChain::author_block`]
+    /// refuses to author at or behind the head.
+    pub fn best_slot(&self) -> u32 {
+        self.harness().chain().best_block().1
     }
 
     /// Advance virtual time to `slot` and author a block there if the slot

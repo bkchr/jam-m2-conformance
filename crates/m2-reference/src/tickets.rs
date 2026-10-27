@@ -121,17 +121,45 @@ pub fn first_delivery_slot(now_slot: u32) -> u32 {
     }
 }
 
+/// The slots in which a ticket for `target_epoch` may still be submitted,
+/// given that the earliest the emulator can deliver is `first_slot`.
+///
+/// Tickets for epoch `e` are submitted during epoch `e - 1` and only before
+/// its tail (`epoch_tail_start`). `None` when that window has already closed —
+/// the honest answer when ticket generation ran long enough to miss it, and
+/// better than scheduling deliveries the node is obliged to refuse.
+pub fn submission_window(first_slot: u32, target_epoch: u32) -> Option<(u32, u32)> {
+    let period = jam_types::epoch_period();
+    let epoch_start = target_epoch.checked_sub(1)?.checked_mul(period)?;
+    let start = first_slot.max(epoch_start);
+    // `epoch_tail_start` is the first slot of the tail, so the last slot that
+    // still accepts tickets is the one before it.
+    let end = epoch_start + jam_types::epoch_tail_start() - 1;
+    (start <= end).then_some((start, end))
+}
+
 /// Schedule delivery of each ticket within the epoch submission window.
 ///
-/// A ticket whose proxy is the NUT goes via CE 131 at `epoch_start + 1`; any
-/// other ticket is delivered via CE 132 at a deterministic slot in
-/// `[epoch_start + 1, epoch_start + 5]` (round-robin by author index).
+/// A ticket whose proxy is the NUT goes via CE 131 at the window's first slot;
+/// any other ticket is delivered via CE 132 at a deterministic slot spread
+/// across the window (round-robin by author index).
+///
+/// The schedule is clamped to [`submission_window`], so no delivery lands in
+/// the epoch tail or after the target epoch has already begun. The old
+/// schedule ran `first_slot..first_slot + 5` unconditionally, which in a run
+/// that started late in an epoch put most deliveries past the tail and the
+/// rest inside the target epoch itself, where every one of them is correctly
+/// refused.
 pub fn plan_tickets(
     tickets: &[EmulatedTicket],
     nut_index: usize,
     first_slot: u32,
     target_epoch: u32,
 ) -> Vec<ScheduledTicket> {
+    let Some((start, end)) = submission_window(first_slot, target_epoch) else {
+        return Vec::new();
+    };
+    let span = end - start + 1;
     tickets
         .iter()
         .map(|t| {
@@ -139,14 +167,14 @@ pub fn plan_tickets(
                 ScheduledTicket {
                     ticket: t.clone(),
                     delivery: TicketDelivery::Ce131,
-                    slot: first_slot,
+                    slot: start,
                     target_epoch,
                 }
             } else {
                 ScheduledTicket {
                     ticket: t.clone(),
                     delivery: TicketDelivery::Ce132,
-                    slot: first_slot + (t.author % 5) as u32,
+                    slot: start + (t.author as u32 % span),
                     target_epoch,
                 }
             }
@@ -225,25 +253,79 @@ mod tests {
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         let nut_index = 0;
-        let first = 1001;
-        let plan = plan_tickets(&tickets, nut_index, first, 42);
+        let period = jam_types::epoch_period();
+        let target_epoch = 42;
+        // Early in epoch 41, so the whole submission window is still ahead.
+        let first = 41 * period + 1;
+        let (start, end) = submission_window(first, target_epoch).expect("window is open");
+        let plan = plan_tickets(&tickets, nut_index, first, target_epoch);
         assert!(!plan.is_empty());
         for s in &plan {
             assert!(
-                (first..first + 5).contains(&s.slot),
-                "slot {} outside submission window",
+                (start..=end).contains(&s.slot),
+                "slot {} outside submission window {start}..={end}",
                 s.slot
             );
-            assert_eq!(s.target_epoch, 42);
+            assert_eq!(s.target_epoch, target_epoch);
             if s.ticket.proxy == nut_index {
                 assert_eq!(s.delivery, TicketDelivery::Ce131);
-                assert_eq!(s.slot, first);
+                assert_eq!(s.slot, start);
             } else {
                 assert_eq!(s.delivery, TicketDelivery::Ce132);
             }
         }
-        let plan2 = plan_tickets(&tickets, nut_index, first, 42);
+        let plan2 = plan_tickets(&tickets, nut_index, first, target_epoch);
         assert_eq!(plan, plan2);
+        Ok(())
+    }
+
+    /// Every planned slot must be one in which the node may still accept a
+    /// ticket: inside the epoch before the target, and before that epoch's
+    /// tail. A schedule that violates either is a harness fault reported as a
+    /// node one.
+    #[test]
+    fn plan_never_schedules_past_the_tail_or_into_the_target_epoch() -> Result<(), ChainError> {
+        let chain = RefChain::tiny(0)?;
+        let ctx = chain.ticket_ctx()?;
+        let tickets = chain.generate_tickets(&ctx)?;
+        let period = jam_types::epoch_period();
+        let tail = jam_types::epoch_tail_start();
+        let target_epoch = 42;
+
+        for offset in 0..period {
+            let plan = plan_tickets(&tickets, 0, 41 * period + offset, target_epoch);
+            for s in &plan {
+                assert_eq!(s.slot / period, 41, "slot {} left epoch 41", s.slot);
+                assert!(s.slot % period < tail, "slot {} is in the tail", s.slot);
+                assert!(
+                    s.slot >= 41 * period + offset,
+                    "slot {} is in the past",
+                    s.slot
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Generation that overruns the submission window yields no plan at all,
+    /// rather than deliveries the node must refuse.
+    #[test]
+    fn plan_is_empty_once_the_window_has_closed() -> Result<(), ChainError> {
+        let chain = RefChain::tiny(0)?;
+        let ctx = chain.ticket_ctx()?;
+        let tickets = chain.generate_tickets(&ctx)?;
+        let period = jam_types::epoch_period();
+        let tail = jam_types::epoch_tail_start();
+
+        // The first slot of the tail: nothing may still be submitted.
+        let first = 41 * period + tail;
+        assert_eq!(submission_window(first, 42), None);
+        assert!(plan_tickets(&tickets, 0, first, 42).is_empty());
+        // And the slot before it still has room for exactly one.
+        assert_eq!(
+            submission_window(first - 1, 42),
+            Some((first - 1, first - 1))
+        );
         Ok(())
     }
 

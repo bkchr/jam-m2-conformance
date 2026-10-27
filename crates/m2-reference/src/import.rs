@@ -9,10 +9,24 @@ use jam_types::HeaderHash;
 use crate::chain::RefChain;
 
 /// Outcome of importing a NUT block into the reference chain.
+///
+/// Carries both state roots the L1 lane needs, which are different quantities
+/// and neither of which is the header hash: `declared_parent_root` is what the
+/// block's header claims its parent's posterior root was, and
+/// `reference_parent_root` is what the reference engine computed for that same
+/// parent. `root` is the reference's posterior root for *this* block, which
+/// only a block built on top of it can be checked against.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportOutcome {
     /// Hash of the imported block's header.
     pub header_root: [u8; 32],
+    /// Hash of the block's parent (`header.parent`).
+    pub parent: [u8; 32],
+    /// Prior state root the block's header declares (`header.parent_state_root`).
+    pub declared_parent_root: [u8; 32],
+    /// The reference engine's own posterior state root for the parent, when it
+    /// knows the parent at all.
+    pub reference_parent_root: Option<[u8; 32]>,
     /// `true` when the block was accepted (imported or already imported).
     pub ok: bool,
     /// Posterior state root of the block when accepted.
@@ -23,26 +37,33 @@ pub struct ImportOutcome {
 
 impl RefChain {
     /// Import a NUT-authored block into the reference chain by fresh execution.
+    ///
+    /// On success the block joins the reference chain, and because polkajam
+    /// picks its best block by highest slot it also becomes the head the
+    /// reference authors on next. That is deliberate: a reference that keeps
+    /// authoring on its own head instead forks away from the node at every
+    /// slot the node claims, and then nothing ever builds on a NUT block, so
+    /// no block's posterior state root is ever witnessed.
     pub fn import_nut_block(&self, block: &Block) -> ImportOutcome {
         let chain = self.harness().chain();
         let header_root = block.header.hash().0;
         let hash = HeaderHash::from(header_root);
+        let parent = block.header.parent;
+        let outcome = |ok, root, error| ImportOutcome {
+            header_root,
+            parent: parent.0,
+            declared_parent_root: block.header.parent_state_root.0,
+            reference_parent_root: chain.state_root(&parent).ok().flatten().map(|r| r.0),
+            ok,
+            root,
+            error,
+        };
         match chain.import_block(block.clone(), ImportBlockParams::new_exec(hash)) {
             Ok(_) => {
                 let root = chain.state_root(&hash).ok().flatten().map(|r| r.0);
-                ImportOutcome {
-                    header_root,
-                    ok: true,
-                    root,
-                    error: None,
-                }
+                outcome(true, root, None)
             }
-            Err(e) => ImportOutcome {
-                header_root,
-                ok: false,
-                root: None,
-                error: Some(e.to_string()),
-            },
+            Err(e) => outcome(false, None, Some(e.to_string())),
         }
     }
 }
@@ -157,6 +178,31 @@ mod tests {
         assert!(second.error.is_none());
         assert_eq!(second.header_root, first.header_root);
         assert_eq!(second.root, first.root);
+        Ok(())
+    }
+
+    /// The two roots the L1 state-root check compares are the header's
+    /// declared prior root and the reference's own root for the same parent —
+    /// never the header hash, which is a different quantity entirely and can
+    /// only ever differ.
+    #[test]
+    fn import_reports_prior_and_posterior_roots_separately() -> Result<(), ChainError> {
+        let mut chain = RefChain::tiny(0)?;
+        let block = authored_head(&mut chain)?;
+        let outcome = chain.import_nut_block(&block);
+
+        assert!(outcome.ok, "import succeeds: {:?}", outcome.error);
+        assert_eq!(outcome.parent, block.header.parent.0);
+        assert_eq!(
+            outcome.reference_parent_root,
+            Some(outcome.declared_parent_root),
+            "a well-formed block's declared prior root is the reference's own"
+        );
+        assert_ne!(
+            outcome.root,
+            Some(outcome.header_root),
+            "the posterior state root is not the header hash"
+        );
         Ok(())
     }
 }

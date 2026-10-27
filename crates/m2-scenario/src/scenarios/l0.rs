@@ -101,6 +101,7 @@ pub fn tls_cert(first_emu_peer: u16) -> Check {
         results.push(CheckResult {
             name: "tls_cert_connection_established",
             outcome: seq.outcome,
+            detail: None,
         });
         results
     })
@@ -399,7 +400,10 @@ mod tests {
         obs.push(20, ev(1, ObsKind::Other(CERT_KEY_MATCH), 20));
         obs.push(30, ev(1, ObsKind::Other(CERT_SAN_OK), 30));
         obs.push(40, ev(1, ObsKind::OpenUp0, 40));
-        assert!(all_pass(&run(&tls_cert(PEER_1), &obs)), "conforming log passes");
+        assert!(
+            all_pass(&run(&tls_cert(PEER_1), &obs)),
+            "conforming log passes"
+        );
 
         let mut bad = ObsLog::new();
         bad.push(0, ev(1, ObsKind::Accept, 0));
