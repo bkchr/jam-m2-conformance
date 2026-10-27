@@ -14,7 +14,7 @@ artefact the NUT produces against the polkajam `hazmat` reference engine.
 (connectivity/sync), **L1** (block authoring), and **L2** (Safrole tickets). See [DESIGN.md](DESIGN.md)
 for the design; this README documents the current implementation state.
 
-- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **329 passed / 0 failed** ✓,
+- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **348 passed / 0 failed** ✓,
   `cargo fmt --all --check` ✓, no `unwrap`/`panic`/`expect`/`todo!` in non-test code.
 - Dry-run baseline: `cargo run -p m2-runner -- --preset mock --dry-run --session-dir /tmp/x`
   exits 0 with **all L0+L1+L2 checks HARD PASS** — the harness's own expectations are satisfiable.
@@ -59,14 +59,45 @@ report (`sessions/<id>/report/{report.md,findings.json}`, `traces/jamnp.{bin,jso
   connections accepted, UP 0 handshake with genesis Final, and the node's own CE 128 and CE 129
   replies graded. One hard finding: `ce129_boundary_parent_before_child`.
 - **N1 authoring**: the node authors, the harness imports and grades each block — parent,
-  seal, prior and posterior state roots.
+  seal, prior and posterior state roots. One hard finding: a block that left an owed ticket
+  out with room to carry it (`l1_extrinsic_includes_delivered`).
+- **N2 Safrole tickets**: the node accepts the emulator's tickets, runs its own lottery and
+  distributes to proxies; proofs, target epochs, attempt ranges, per-epoch caps, proxy
+  routing and inclusion are all graded. One hard finding: a ticket for an epoch past the
+  node's horizon is rejected but the stream is not reset (`l2_unknown_epoch_reset_observed`).
 - Runner exits 1 (correct — hard findings exist).
 
-**On reading the lane.** The N0 checks assert what the *node* does. Several used to be recorded by
+**On reading the lanes.** Every check asserts what the *node* does. Several used to be recorded by
 the emulator's own serve path — the harness answering the node, then entering a pass for itself —
 so they could not fail; the CE 128 and CE 129 rows are now driven by requests the emulator makes
 and graded on the replies (`m2-emu/src/sync_probe.rs`). A check that could only ever pass is worse
 than a missing one, so findings carry the values that disagreed.
+
+The same audit over N1 and N2 found the defect in five more shapes, every one of which made a
+conforming node look wrong or a wrong one look conforming. Tickets were sealed against entropy
+buffer entry 1 where a node checks entry 2, so **every ticket the emulator ever offered was
+rejected** — invisible because the two entries agree whenever an epoch boundary happens to fall
+between proving and delivery, which a genesis anchored 28 epochs in the past made likely. That
+anchor was itself a defect: it was computed before the tiny protocol parameters were applied, so
+it divided by an epoch period of 600 instead of 12. Tickets were also proved against the chain
+*before* it was seeded, carrying genesis entropy; the node's own tickets were charged as tickets
+nobody delivered, though a validator's own tickets belong in its own block; one block was asked to
+carry every valid ticket of the epoch against a cap of three; and inclusion was judged on the
+newest block even when it fell outside the epoch those tickets could be submitted in.
+
+Where a rule genuinely was not exercised the harness now says so rather than passing: a ticket
+that arrived too late in the lottery to demand a forward, an epoch with no NUT block to judge, and
+a proof for an epoch the harness holds no context for are reported as soft "not exercised" rows.
+
+The N2 lane had the same fault in a different form. It told a proxied ticket from a self-proxied
+one by the peer index a frame arrived at, in a space where the node's own index never appears —
+making two checks unfailable — while requiring frames from a peer the run never emulates, making
+two others unpassable. The lane now reads CE 131 from CE 132 off the stream kind, takes the
+emulated set from the run, counts tickets rather than frames, and derives the epoch a ticket must
+name from the moment it was sent rather than pinning one for the whole run. Three further rules
+are reported as **not exercised** rather than passed when a run cannot reach them: a proof for an
+epoch the harness holds no ring for, a proxied ticket delivered too late in the lottery for any
+forwarding window, and an unknown-epoch probe that was never scheduled.
 
 ## Dependency wiring
 

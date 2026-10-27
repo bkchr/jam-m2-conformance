@@ -56,3 +56,12 @@ opt-level = 2
 # baked in and every `RefChain` test runnable.
 [profile.dev.package.jam-node]
 debug = false
+
+# Ring-VRF proving is the harness's one hot path: twenty proofs take 46 s
+# unoptimized, which is 7.7 of an epoch's 12 slots under the tiny parameters.
+# A run that starts more than a slot or two into an epoch then finishes proving
+# after the ticket submission window has closed, and both ticket lanes measure
+# nothing. Optimizing the dependencies -- our own crates keep full debug info --
+# brings it back under a slot.
+[profile.dev.package."*"]
+opt-level = 3

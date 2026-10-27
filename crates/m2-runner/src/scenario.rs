@@ -10,11 +10,13 @@ use m2_emu::emu::Emulator;
 use m2_reference::chain::RefChain;
 use m2_scenario::ctx::{
     DeliveredTicket, EmuTicket, ImportFact, L1Ctx, L2Ctx, NutBlock, NutTicketFacts, TicketDelivery,
-    NUT_INDEX, SLOT_PERIOD_MS, TICKET_ARRIVAL_LEAD_MS,
+    SLOT_PERIOD_MS, TICKET_ARRIVAL_LEAD_MS,
 };
 use m2_scenario::dsl::{Check, Obs, ObsKind, ObsLog, Outcome, Scheduler, Severity};
 use m2_scenario::scenarios::l0::{Ce128Probe, Ce129Probe};
-use m2_scenario::scenarios::obs::{EMU_SENT_131, EMU_SENT_132, RECV_CE131, RECV_CE132};
+use m2_scenario::scenarios::obs::{
+    EMU_SENT_131, EMU_SENT_132, RECV_CE131, RECV_CE132, UNKNOWN_EPOCH_RESET,
+};
 use m2_scenario::scenarios::{l0, l1, l2};
 
 use crate::report::{CheckOutcome, Finding};
@@ -175,6 +177,8 @@ pub(crate) fn fabricated_obs_log(reference_block_count: usize) -> ObsLog {
     }
     push(l0::PEER_1, ObsKind::Other(EMU_SENT_131));
     push(l0::PEER_1, ObsKind::Other(EMU_SENT_132));
+    // L2: the NUT reset the stream carrying the unknown-epoch probe.
+    push(l0::PEER_1, ObsKind::Other(UNKNOWN_EPOCH_RESET));
     log
 }
 
@@ -243,6 +247,10 @@ pub(crate) fn fabricated_run_ctx(
         error: None,
     };
     let l1 = L1Ctx {
+        // The fabricated node's blocks carry only tickets the emulator
+        // delivered, so there are none of its own to account for. The
+        // own-ticket allowance is exercised by the L1 lane's own tests.
+        own_ticket_ids: Vec::new(),
         reference_best: first_root,
         reference_block_hashes: history.iter().map(|(_, hash)| *hash).collect(),
         reference_chain: history,
@@ -285,36 +293,83 @@ pub(crate) fn fabricated_run_ctx(
         max_tickets_per_block: jam_types::max_tickets_per_block(),
     };
 
-    let emu = |id: u8, proxy: u16, delivery: TicketDelivery| EmuTicket {
+    // The fabricated NUT sits at validator index 0, so the emulated peers —
+    // the index space the observation log and the ticket facts share — are
+    // the other five validators.
+    const FAB_NUT_INDEX: u16 = 0;
+    const FAB_TARGET_EPOCH: u32 = 3;
+    let emu_peers: Vec<u16> = (1..=5).collect();
+    // Emulator-sent tickets carry proofs in the low range; the node's own
+    // carry the high range, so a forward is never mistaken for a ticket the
+    // node generated, and vice versa.
+    let emu = |id: u8, proxy: u16, delivery: TicketDelivery, target_epoch: u32| EmuTicket {
         id: [id; 32],
         author: 1,
         attempt: 0,
-        proof: [0u8; 784],
+        proof: [id; 784],
         proxy,
         valid: true,
         delivery,
         slot: 1,
+        target_epoch,
     };
-    let nut = |attempt: u8, peer: u16| NutTicketFacts {
-        epoch: 3,
-        ticket: Ce131Ticket {
-            attempt,
-            proof: [0u8; 784],
-        },
-        peer,
-        verified: true,
-        received_at_ms: 100,
+    // A ticket the node generates during epoch 2 is for epoch 3, so the facts
+    // are stamped inside epoch 2 rather than at an arbitrary instant: the
+    // lane derives the epoch it expects from the moment the frame went out.
+    let sent_in_epoch_2 =
+        JAM_COMMON_ERA * 1000 + u64::from(2 * jam_types::epoch_period()) * SLOT_PERIOD_MS;
+    let sent =
+        |attempt: u8, proof: [u8; 784], peer: u16, delivery: TicketDelivery| NutTicketFacts {
+            epoch: FAB_TARGET_EPOCH,
+            ticket: Ce131Ticket { attempt, proof },
+            peer,
+            delivery,
+            verified: Some(true),
+            received_at_ms: sent_in_epoch_2,
+        };
+    let own = |attempt: u8, peer: u16, delivery: TicketDelivery| {
+        sent(attempt, [0x80 + attempt; 784], peer, delivery)
     };
+    let proxied_to_the_nut = emu(1, FAB_NUT_INDEX, TicketDelivery::Ce131, FAB_TARGET_EPOCH);
+    // Two tickets of its own proxied to one validator each, one it proxies
+    // for itself and so broadcasts, and the forward of the ticket another
+    // validator proxied to it.
+    let mut nut_tickets = vec![
+        own(0, 1, TicketDelivery::Ce131),
+        own(1, 2, TicketDelivery::Ce131),
+    ];
+    for &peer in &emu_peers {
+        nut_tickets.push(own(2, peer, TicketDelivery::Ce132));
+        nut_tickets.push(sent(
+            proxied_to_the_nut.attempt,
+            proxied_to_the_nut.proof,
+            peer,
+            TicketDelivery::Ce132,
+        ));
+    }
     let l2 = L2Ctx {
-        target_epoch: 3,
+        target_epoch: FAB_TARGET_EPOCH,
         epoch_start_slot: 0,
         emu_plan: vec![
-            emu(1, NUT_INDEX, TicketDelivery::Ce131),
-            emu(2, 1, TicketDelivery::Ce132),
+            proxied_to_the_nut,
+            emu(2, 1, TicketDelivery::Ce132, FAB_TARGET_EPOCH),
+            // The unknown-epoch probe (`simple.md:335-337`): an epoch the
+            // node cannot know yet, which it must reset the stream on.
+            emu(3, 1, TicketDelivery::Ce132, FAB_TARGET_EPOCH + 2),
         ],
-        nut_tickets: vec![nut(0, 1), nut(1, 2)],
-        nut_block_ticket_ids: vec![[1u8; 32], [2u8; 32]],
-        nut_block_slot: 12,
+        nut_tickets,
+        // Two delivered tickets plus one of the node's own: a validator's own
+        // ticket belongs in its own block, and the baseline says so.
+        nut_block_ticket_ids: vec![[1u8; 32], [2u8; 32], [9u8; 32]],
+        own_ticket_ids: vec![[9u8; 32]],
+        nut_block_slot: Some(12),
+        nut_index: FAB_NUT_INDEX,
+        emulated_peers: emu_peers,
+        slot_period_ms: SLOT_PERIOD_MS,
+        epoch_period: jam_types::epoch_period(),
+        epoch_tail_start: jam_types::epoch_tail_start(),
+        tickets_per_validator: jam_types::tickets_per_validator(jam_types::max_val_count()),
+        max_tickets_per_block: jam_types::max_tickets_per_block(),
     };
 
     Ok(RunCtx {
@@ -365,7 +420,6 @@ pub(crate) fn fabricated_run_ctx(
 
 #[cfg(test)]
 mod tests {
-    use m2_scenario::scenarios::obs::RECV_CE132;
 
     use super::*;
 
@@ -375,7 +429,16 @@ mod tests {
         let log = fabricated_obs_log(3);
         let eval = evaluate(&log, &run_ctx);
 
-        assert!(eval.all_hard_passed, "fabricated log must pass all lanes");
+        let hard_failures: Vec<&str> = eval
+            .outcomes
+            .iter()
+            .filter(|o| !o.passed)
+            .map(|o| o.id.as_str())
+            .collect();
+        assert!(
+            eval.all_hard_passed,
+            "fabricated log must pass all lanes; failed: {hard_failures:?}"
+        );
         for lane in ["L0", "L1", "L2"] {
             let outcomes: Vec<&CheckOutcome> =
                 eval.outcomes.iter().filter(|o| o.lane == lane).collect();
@@ -391,20 +454,33 @@ mod tests {
             );
         }
 
-        // L1 facts come from the ctx, not the log (every L1 check ignores
-        // `obs`), so a log change cannot fail L1; strip instead the CE 132
-        // distribution every L2 proxy/self-proxy check requires.
-        let mut no_ce132 = ObsLog::new();
-        for (t, o) in fabricated_obs_log(3).events() {
-            if o.kind != ObsKind::Other(RECV_CE132) {
-                no_ce132.push(*t, *o);
-            }
-        }
-        let eval = evaluate(&no_ce132, &run_ctx);
-        assert!(!eval.all_hard_passed, "missing CE 132 must fail the run");
+        // The L1 and L2 verdicts come from the ctx facts, not from markers in
+        // the log, so the negative case has to change what the node did: drop
+        // every CE 132 frame it sent and the broadcast and forwarding duties
+        // both go unmet.
+        let mut silent = run_ctx;
+        let l2 = silent
+            .l2
+            .as_mut()
+            .expect("the fabricated run has an L2 lane");
+        l2.nut_tickets
+            .retain(|f| f.delivery != m2_scenario::ctx::TicketDelivery::Ce132);
+        let eval = evaluate(&log, &silent);
         assert!(
-            eval.outcomes.iter().any(|o| o.lane == "L2" && !o.passed),
-            "L2 must have a failing outcome"
+            !eval.all_hard_passed,
+            "a node that broadcast no CE 132 at all must fail the run"
+        );
+        let failed: Vec<&str> = eval
+            .outcomes
+            .iter()
+            .filter(|o| o.lane == "L2" && !o.passed)
+            .map(|o| o.id.as_str())
+            .collect();
+        assert!(
+            failed
+                .iter()
+                .any(|id| id.contains("l2_proxy_duty_forwarded")),
+            "the unforwarded ticket must be named: {failed:?}"
         );
     }
 }

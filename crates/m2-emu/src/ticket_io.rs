@@ -140,8 +140,11 @@ pub async fn spawn_ticket_sender(
         let _ = send.finish();
         // Await the NUT's decision: a clean FIN accepts the ticket; a stream
         // reset rejects it (unknown epoch `:335-337` or bad proof `:329-332`).
+        // Only a reset counts. A connection that died for its own reasons
+        // also fails this read, and recording that as a rejection would let
+        // a run credit the node with a refusal it never made.
         let mut buf = [0u8; 1024];
-        if recv.read(&mut buf).await.is_err() {
+        if let Err(quinn::ReadError::Reset(_)) = recv.read(&mut buf).await {
             crate::emu::record(&obs, peer, reset_obs(epoch_index, plan_epoch));
         }
     }

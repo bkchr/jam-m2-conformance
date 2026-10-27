@@ -41,7 +41,14 @@ pub fn l1_timing(ctx: &L1Ctx) -> Check {
                 let start = ctx.slot_start_ms(nut.block.header.slot);
                 let in_window = nut.announced_wall_ms >= start
                     && nut.announced_wall_ms <= start + ctx.slot_period_ms;
-                log::check("l1_timing_within_slot", in_window, Severity::Soft)
+                log::check_detail("l1_timing_within_slot", in_window, Severity::Soft, || {
+                    let drift = nut.announced_wall_ms as i64 - start as i64;
+                    format!(
+                        "the block for slot {} was announced {drift} ms from that slot's \
+                         start, outside the {} ms it lasts",
+                        nut.block.header.slot, ctx.slot_period_ms,
+                    )
+                })
             })
             .collect()
     })
@@ -121,11 +128,27 @@ pub fn l1_header_seal(ctx: &L1Ctx) -> Check {
             .iter()
             .map(|nut| {
                 let header_root = nut.block.header.hash().0;
-                let imported_ok = ctx
+                let import = ctx
                     .imports
                     .iter()
-                    .any(|imp| imp.header_root == header_root && imp.ok);
-                log::check("l1_header_seal_import_ok", imported_ok, Severity::Hard)
+                    .find(|imp| imp.header_root == header_root);
+                let imported_ok = import.is_some_and(|imp| imp.ok);
+                log::check_detail(
+                    "l1_header_seal_import_ok",
+                    imported_ok,
+                    Severity::Hard,
+                    || match import.and_then(|imp| imp.error.as_deref()) {
+                        Some(error) => format!(
+                            "the reference refused the block at slot {}: {error}",
+                            nut.block.header.slot
+                        ),
+                        None => format!(
+                            "no import outcome was recorded for the block at slot {} ({})",
+                            nut.block.header.slot,
+                            short(&header_root),
+                        ),
+                    },
+                )
             })
             .collect()
     })
@@ -235,7 +258,16 @@ pub fn l1_state_root(ctx: &L1Ctx) -> Check {
 pub fn l1_extrinsic_completeness(ctx: &L1Ctx) -> Check {
     let ctx = ctx.clone();
     check("l1_extrinsic_completeness", Severity::Hard, move |_obs| {
+        // The node's own tickets count as legitimately in hand: it is a
+        // validator and runs the lottery itself. Only the emulator's tickets
+        // are *owed*, but a block carrying the node's own is not carrying one
+        // from nowhere.
         let delivered: HashSet<[u8; 32]> = ctx.delivered_tickets.iter().map(|t| t.id).collect();
+        let in_hand: HashSet<[u8; 32]> = delivered
+            .iter()
+            .copied()
+            .chain(ctx.own_ticket_ids.iter().copied())
+            .collect();
         // Oldest block first, so "already on chain" means what it says.
         let mut blocks: Vec<_> = ctx.nut_blocks.iter().collect();
         blocks.sort_by_key(|nut| nut.block.header.slot);
@@ -271,12 +303,13 @@ pub fn l1_extrinsic_completeness(ctx: &L1Ctx) -> Check {
             ));
             results.push(log::check_detail(
                 "l1_extrinsic_no_undelivered",
-                included.is_subset(&delivered),
+                included.is_subset(&in_hand),
                 Severity::Hard,
                 || {
-                    let extra: Vec<String> = included.difference(&delivered).map(short).collect();
+                    let extra: Vec<String> = included.difference(&in_hand).map(short).collect();
                     format!(
-                        "block at slot {slot} includes never-delivered ticket(s): {}",
+                        "block at slot {slot} includes ticket(s) that were neither \
+                         delivered to the node nor announced by it: {}",
                         extra.join(", ")
                     )
                 },
@@ -331,10 +364,18 @@ pub fn l1_skipped_slots(ctx: &L1Ctx) -> Check {
                 }
                 None => parent_is_reference,
             };
-            results.push(log::check(
+            results.push(log::check_detail(
                 "l1_skipped_slots_valid_parent",
                 pass,
                 Severity::Hard,
+                || {
+                    format!(
+                        "the block at slot {} skipped past its parent {} without that \
+                         parent being on the reference chain",
+                        nut.block.header.slot,
+                        short(&parent),
+                    )
+                },
             ));
             slot_by_hash.insert(nut.block.header.hash().0, nut.block.header.slot);
         }
@@ -406,6 +447,7 @@ mod tests {
             nut_blocks: Vec::new(),
             imports: Vec::new(),
             delivered_tickets: Vec::new(),
+            own_ticket_ids: Vec::new(),
             slot_period_ms: SLOT_PERIOD_MS,
             epoch_period: EPOCH_PERIOD,
             epoch_tail_start: EPOCH_TAIL_START,
@@ -721,6 +763,48 @@ mod tests {
                 && r.outcome == Outcome::Fail(Severity::Hard)));
     }
 
+    /// The node under test is a validator and runs the lottery itself, so its
+    /// own tickets belong in its own blocks. Judging every included ticket
+    /// against the emulator's deliveries alone failed a conforming node the
+    /// moment it included one of its own.
+    #[test]
+    fn l1_extrinsic_allows_the_nodes_own_tickets() -> Result<(), m2_reference::chain::ChainError> {
+        let chain = m2_reference::chain::RefChain::tiny(0)?;
+        let tctx = chain.ticket_ctx()?;
+        let tickets = chain.generate_tickets(&tctx)?;
+        let env = |t: &m2_reference::tickets::EmulatedTicket| TicketEnvelope {
+            attempt: t.attempt,
+            signature: RingSignature(t.proof),
+        };
+        let (delivered_t, own_t) = (&tickets[0], &tickets[1]);
+
+        let mut ctx = base_ctx();
+        ctx.reference_best = [1u8; 32];
+        ctx.reference_block_hashes = vec![[1u8; 32]];
+        ctx.delivered_tickets = vec![delivered_for(&ctx, delivered_t.id, 1, 2000)];
+        ctx.nut_blocks = vec![nut_block_with_tickets(
+            1,
+            [1u8; 32],
+            vec![env(delivered_t), env(own_t)],
+            0,
+        )];
+
+        assert!(
+            run(&l1_extrinsic_completeness(&ctx), &ObsLog::new())
+                .iter()
+                .any(|r| r.name == "l1_extrinsic_no_undelivered"
+                    && r.outcome == Outcome::Fail(Severity::Hard)),
+            "a ticket the node neither received nor announced is unaccounted for"
+        );
+
+        ctx.own_ticket_ids = vec![own_t.id];
+        assert!(
+            all_pass(&run(&l1_extrinsic_completeness(&ctx), &ObsLog::new())),
+            "the same ticket, announced by the node itself, is its own to carry"
+        );
+        Ok(())
+    }
+
     #[test]
     fn l1_extrinsic_pass_and_missing() -> Result<(), m2_reference::chain::ChainError> {
         // Real reference-generated tickets: distinct, valid ring-VRF ids.
@@ -988,6 +1072,7 @@ mod tests {
             nut_blocks: vec![],
             imports: vec![],
             delivered_tickets: vec![],
+            own_ticket_ids: Vec::new(),
             slot_period_ms: 6000,
             epoch_period: EPOCH_PERIOD,
             epoch_tail_start: EPOCH_TAIL_START,

@@ -90,6 +90,13 @@ pub struct L1Ctx {
     pub nut_blocks: Vec<NutBlock>,
     pub imports: Vec<ImportFact>,
     pub delivered_tickets: Vec<DeliveredTicket>,
+    /// Ids of tickets the NUT itself announced over CE 131/132.
+    ///
+    /// The node under test is a validator: it runs the lottery too, and its
+    /// own tickets belong in its own blocks. Without this the harness sees
+    /// them as tickets nobody delivered and fails a node for doing exactly
+    /// what the protocol asks of it.
+    pub own_ticket_ids: Vec<[u8; 32]>,
     pub slot_period_ms: u64,
     pub epoch_period: u32,
     pub epoch_tail_start: u32,
@@ -167,16 +174,39 @@ pub struct EmuTicket {
     pub valid: bool,
     pub delivery: TicketDelivery,
     pub slot: u32,
+    /// Epoch the ticket is labelled for. Equal to the plan's target epoch for
+    /// every real ticket; the unknown-epoch probe (`simple.md:335-337`) is
+    /// the one entry that names an epoch the NUT cannot know yet.
+    pub target_epoch: u32,
 }
 
 /// Facts about a ticket the NUT distributed to the emulator.
+///
+/// One fact per frame, so a CE 132 broadcast of a single ticket yields one
+/// fact per emulated validator it reached. `peer` is the emulated validator
+/// the frame arrived at — the same index space the NUT itself lives in — so
+/// a CE 131 distribution's `peer` is the proxy the NUT chose for it.
 #[derive(Clone, Debug)]
 pub struct NutTicketFacts {
     pub epoch: u32,
     pub ticket: jamnp_s::codec::ce131_136::Ticket,
     pub peer: u16,
-    pub verified: bool,
+    /// Which common entry carried it: CE 131 (to the proxy) or CE 132
+    /// (broadcast). Read off the stream kind, never inferred from `peer`.
+    pub delivery: TicketDelivery,
+    /// Whether the ring-VRF proof verified, or `None` when the harness held
+    /// no ticket context for the ticket's epoch and so could not judge it.
+    pub verified: Option<bool>,
     pub received_at_ms: u64,
+}
+
+impl NutTicketFacts {
+    /// Identity of the ticket this frame carried, for grouping the copies of
+    /// one broadcast together. The wire never names a ticket id, and the
+    /// `(attempt, proof)` pair determines it.
+    pub fn identity(&self) -> (u8, [u8; 784]) {
+        (self.ticket.attempt, self.ticket.proof)
+    }
 }
 
 /// Facts the L2 (Safrole tickets) lane reads.
@@ -191,14 +221,81 @@ pub struct L2Ctx {
     pub nut_tickets: Vec<NutTicketFacts>,
     /// Ticket ids in the NUT's authored block's ticket extrinsic.
     pub nut_block_ticket_ids: Vec<[u8; 32]>,
-    /// Slot of the NUT's authored block (epoch-tail inclusion rule).
-    pub nut_block_slot: u32,
+    /// Ids of tickets the NUT itself announced -- see [`L1Ctx::own_ticket_ids`].
+    pub own_ticket_ids: Vec<[u8; 32]>,
+    /// Slot of the NUT block judged for inclusion, or `None` when the NUT
+    /// authored no block in the epoch the tickets were submittable in.
+    ///
+    /// Not a sentinel slot: there is no slot value that means "no block", and
+    /// judging a block that does not exist credits or blames the node for
+    /// something it never did.
+    pub nut_block_slot: Option<u32>,
+    /// Validator index of the node under test.
+    pub nut_index: u16,
+    /// Validator indices the harness emulates — every validator but the NUT.
+    pub emulated_peers: Vec<u16>,
+    pub slot_period_ms: u64,
+    pub epoch_period: u32,
+    pub epoch_tail_start: u32,
+    /// Ticket attempts one validator may make per epoch, and so the most
+    /// tickets it may generate for one epoch.
+    pub tickets_per_validator: u8,
+    /// Most tickets one block's extrinsic may carry.
+    pub max_tickets_per_block: usize,
 }
 
 impl L2Ctx {
     /// Whether `ticket` was proxied to the NUT itself (proxy == NUT index).
     pub fn proxy_is_nut(&self, ticket: &EmuTicket) -> bool {
-        ticket.proxy == NUT_INDEX
+        ticket.proxy == self.nut_index
+    }
+
+    /// The slot the wall clock was in at `ms`.
+    pub fn slot_at_ms(&self, ms: u64) -> u32 {
+        let since_era = ms.saturating_sub(JAM_COMMON_ERA * 1000);
+        (since_era / self.slot_period_ms) as u32
+    }
+
+    /// The epoch a ticket sent at `ms` must be for.
+    ///
+    /// A validator generates tickets during epoch `e` for epoch `e + 1`
+    /// (`simple.md:305-349`), so the expectation moves with the clock. A run
+    /// that crosses an epoch boundary — and one spanning a full epoch always
+    /// does — sees the NUT switch targets mid-run, which is correct of it.
+    pub fn expected_target_epoch(&self, ms: u64) -> u32 {
+        self.slot_at_ms(ms) / self.epoch_period + 1
+    }
+
+    /// Whether `slot` is in the epoch tail, where a block's ticket extrinsic
+    /// must be empty.
+    pub fn slot_in_tail(&self, slot: u32) -> bool {
+        slot % self.epoch_period >= self.epoch_tail_start
+    }
+
+    /// Whether a ticket reaching the NUT in `slot` leaves it room to forward
+    /// as proxy before the lottery closes.
+    ///
+    /// A proxy forwards within a window inside the lottery period, not at the
+    /// instant it receives: it delays to avoid revealing when the generator
+    /// sent, and stops well before the tail. How long that window is belongs
+    /// to the node, so the harness only asserts the duty for a ticket that
+    /// arrived in the lottery's first half — early enough that any window
+    /// must still be open. A ticket the harness delivered later than that is
+    /// reported as not exercised, because a node that does not forward it is
+    /// not thereby wrong.
+    /// Whether the emulator itself delivered this ticket to the NUT.
+    ///
+    /// A ticket the NUT sends that the harness first sent it is a forward,
+    /// not one the NUT generated — the two are told apart by the ticket, not
+    /// by the entry that carried it, since CE 132 carries both.
+    pub fn was_delivered_by_the_emulator(&self, attempt: u8, proof: &[u8; 784]) -> bool {
+        self.emu_plan
+            .iter()
+            .any(|t| t.attempt == attempt && t.proof == *proof)
+    }
+
+    pub fn leaves_room_to_forward(&self, slot: u32) -> bool {
+        slot % self.epoch_period < self.epoch_tail_start / 2
     }
 }
 
@@ -216,6 +313,7 @@ mod tests {
             nut_blocks: Vec::new(),
             imports: Vec::new(),
             delivered_tickets: Vec::new(),
+            own_ticket_ids: Vec::new(),
             slot_period_ms: SLOT_PERIOD_MS,
             epoch_period: EPOCH_PERIOD,
             epoch_tail_start: EPOCH_TAIL_START,
@@ -335,6 +433,7 @@ mod tests {
                 delivered_at_ms: 500,
                 target_epoch: 1,
             }],
+            own_ticket_ids: Vec::new(),
             slot_period_ms: SLOT_PERIOD_MS,
             epoch_period: EPOCH_PERIOD,
             epoch_tail_start: EPOCH_TAIL_START,
@@ -361,11 +460,12 @@ mod tests {
             valid: true,
             delivery: TicketDelivery::Ce132,
             slot: 10,
+            target_epoch: 3,
         };
         let l2 = L2Ctx {
             target_epoch: 3,
             epoch_start_slot: 10,
-            emu_plan: vec![emu.clone()],
+            emu_plan: vec![emu],
             nut_tickets: vec![NutTicketFacts {
                 epoch: 3,
                 ticket: jamnp_s::codec::ce131_136::Ticket {
@@ -373,11 +473,20 @@ mod tests {
                     proof: [0u8; 784],
                 },
                 peer: 1,
-                verified: true,
+                delivery: TicketDelivery::Ce131,
+                verified: Some(true),
                 received_at_ms: 2000,
             }],
             nut_block_ticket_ids: vec![[6u8; 32]],
-            nut_block_slot: 12,
+            own_ticket_ids: Vec::new(),
+            nut_block_slot: Some(12),
+            nut_index: NUT_INDEX,
+            emulated_peers: (0..NUT_INDEX).collect(),
+            slot_period_ms: SLOT_PERIOD_MS,
+            epoch_period: EPOCH_PERIOD,
+            epoch_tail_start: EPOCH_TAIL_START,
+            tickets_per_validator: 4,
+            max_tickets_per_block: MAX_TICKETS_PER_BLOCK,
         };
         assert_eq!(l2.target_epoch, 3);
         assert_eq!(l2.epoch_start_slot, 10);
@@ -393,10 +502,11 @@ mod tests {
         assert_eq!(l2.nut_tickets[0].ticket.attempt, 0);
         assert_eq!(l2.nut_tickets[0].ticket.proof, [0u8; 784]);
         assert_eq!(l2.nut_tickets[0].peer, 1);
-        assert!(l2.nut_tickets[0].verified);
+        assert_eq!(l2.nut_tickets[0].verified, Some(true));
+        assert_eq!(l2.nut_tickets[0].delivery, TicketDelivery::Ce131);
         assert_eq!(l2.nut_tickets[0].received_at_ms, 2000);
         assert_eq!(l2.nut_block_ticket_ids, vec![[6u8; 32]]);
-        assert_eq!(l2.nut_block_slot, 12);
+        assert_eq!(l2.nut_block_slot, Some(12));
 
         assert!(l2.proxy_is_nut(&emu), "proxy == NUT index is the NUT");
         assert!(

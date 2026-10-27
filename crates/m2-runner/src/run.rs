@@ -8,6 +8,7 @@ use tokio::sync::broadcast;
 use jamnp_s::cert::san_for_key;
 use m2_emu::emu::Emulator;
 use m2_reference::chain::RefChain;
+use m2_reference::tickets::{ScheduledTicket, TicketCtx};
 use m2_scenario::dsl::ObsKind;
 use m2_scenario::scenarios::l0;
 
@@ -16,7 +17,8 @@ use crate::connectivity::{self, ConnectivityPlan, ProbeOutcome};
 use crate::keygen;
 use crate::launch::{self, LaunchConfig, NutProcess};
 use crate::real::{
-    build_real_run_ctx, generate_tickets, plans_by_peer, schedule_tickets, RealRunData,
+    build_real_run_ctx, generate_tickets, plans_by_peer, schedule_tickets, EpochContexts,
+    RealRunData,
 };
 use crate::report::{self, Finding};
 use crate::scenario::{evaluate, fabricated_obs_log, fabricated_run_ctx, Evaluation, ObsSource};
@@ -40,6 +42,18 @@ pub enum RunError {
 pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     let session_dir = &cli.session_dir;
     report::ensure_layout(session_dir).map_err(internal)?;
+
+    // Before anything reads a protocol parameter. `current_epoch_start_slot`
+    // divides by `epoch_period`, and under the process-wide default that is
+    // 600 rather than the tiny set's 12 -- which anchored genesis 336 slots in
+    // the past instead of at most 11. The node then had to import and finalize
+    // a month of chain before it would accept a ticket, and the whole ticket
+    // plan was delivered into that window and rejected with "finality
+    // lagging". Everything downstream applies these too; this call is the one
+    // that happens first.
+    jam_types::ProtocolParameters::tiny()
+        .apply()
+        .map_err(|e| internal(format!("failed to apply tiny protocol parameters: {e}")))?;
 
     // §4.1 keys + spec.
     let nut_index = cli.validator_index;
@@ -81,29 +95,24 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         .to_bytes();
     let plan = connectivity::plan_connectivity(&emu_keys, &nut_key);
 
-    // Ring-VRF ticket generation is the most expensive thing in a run — tens
-    // of seconds — and it used to sit between the emulator opening its sockets
-    // and the first emulated validator dialling. The whole of it fell inside
-    // the observation window: the reference chain stood eight slots stale by
-    // the time the window opened, and the ticket plan was left straddling the
-    // end of the epoch's submission window. Start it here instead, so it runs
-    // while the node is starting up and the connectivity phase is probing, and
-    // seed the chain afterwards, when it is about to be needed.
-    //
-    // A `spawn_blocking` task cannot be cancelled, so a run that gives up on
-    // the NUT's startup still waits for whatever is left of the generation
-    // before the runtime shuts down. That is bounded by the generation itself
-    // and overlaps the startup timeout, so it costs seconds, not minutes.
+    // The reference chain is built here so the connectivity phase can serve
+    // from it, but ticket generation deliberately is *not* started alongside
+    // it. A ring-VRF ticket is sealed against the tickets entropy read from
+    // the chain head, and at this point the chain is still at its anchored
+    // genesis: tickets proved now carry genesis entropy, while the node
+    // validates them against the entropy of the epoch the run is actually in.
+    // They never match, and the node rejects every one with "invalid ticket
+    // signature" -- which is what it did, silently, for as long as the ticket
+    // plan existed. Generation happens after seeding instead; with the
+    // dependencies optimized it costs about three seconds, so there is nothing
+    // left to overlap with the node's startup.
     let reference = if cli.dry_run {
         None
     } else {
         let ref_spec = spec::tiny_spec(&ips, &ports, anchor_slot).map_err(internal)?;
-        let ref_chain = Arc::new(RefChain::with_spec(nut_index, ref_spec).map_err(internal)?);
-        let tickets = tokio::task::spawn_blocking({
-            let ref_chain = Arc::clone(&ref_chain);
-            move || generate_tickets(&ref_chain)
-        });
-        Some((ref_chain, tickets))
+        Some(Arc::new(
+            RefChain::with_spec(nut_index, ref_spec).map_err(internal)?,
+        ))
     };
 
     let mut nut: Option<NutProcess> = None;
@@ -187,15 +196,20 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             None,
         )
     } else {
-        let (ref_chain, tickets) = reference.expect("a live run builds the reference chain");
-        let (ticket_ctx, tickets, target_epoch) =
-            tickets.await.map_err(internal)?.map_err(internal)?;
-        // Seeded here, not before the launch: every slot between genesis and
-        // now has to be filled for the chain to be current when the window
-        // opens, and "now" moves while the node starts and the tickets are
-        // generated.
-        let count = seed_past_slots(&ref_chain).map_err(internal)?;
-        let ticket_plan = schedule_tickets(&ref_chain, &tickets, nut_index, target_epoch);
+        let ref_chain = reference.expect("a live run builds the reference chain");
+        // Seeded before the tickets are proved, not after: every slot between
+        // genesis and now has to be filled for the chain to be current, and
+        // the entropy the tickets are sealed against is read from its head.
+        seed_past_slots(&ref_chain).map_err(internal)?;
+        let epoch_contexts: EpochContexts = Arc::new(Mutex::new(Vec::new()));
+        let (ticket_ctx, ticket_plan, target_epoch) =
+            plan_tickets_for_this_run(&ref_chain, nut_index)
+                .await
+                .map_err(internal)?;
+        // Counted from the chain rather than from the seeding, which may have
+        // run twice: the L0 lane compares this against the reference chain the
+        // contexts are built from, and the two have to be the same chain.
+        let count = ref_chain.chain_blocks().len().saturating_sub(1);
         if ticket_plan.is_empty() {
             conn_findings.push(empty_ticket_plan_finding(&ref_chain, target_epoch));
         }
@@ -221,6 +235,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         let mut dial_tasks = vec![tokio::spawn(drive_slots(
             Arc::clone(&ref_chain),
             emu.announce_tx(),
+            Arc::clone(&epoch_contexts),
         ))];
         for &i in &plan.initiate_now {
             let shared = shared.clone();
@@ -256,6 +271,9 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             ticket_ctx,
             plan: ticket_plan,
             target_epoch,
+            nut_index,
+            emu_indices: emu_indices.clone(),
+            epoch_contexts,
         };
         (
             ObsSource::Emulator {
@@ -370,7 +388,7 @@ fn emulated_indices(nut_index: usize) -> Vec<usize> {
     (0..VALIDATOR_COUNT).filter(|&i| i != nut_index).collect()
 }
 
-/// Seed the reference chain over the slots between genesis and now.
+/// Seed the reference chain over the slots between its head and now.
 ///
 /// Every slot authored here is in the past, which is the point. The old
 /// pre-window burst started at the *current* slot and ran forward, so all but
@@ -379,12 +397,17 @@ fn emulated_indices(nut_index: usize) -> Vec<usize> {
 /// the start of the current epoch (A9), so there are real past slots to fill
 /// instead.
 ///
+/// Seeding resumes from the head rather than from genesis, so calling it
+/// again after the clock has moved tops the chain up instead of failing:
+/// authoring a slot the chain already holds is an error, which made a second
+/// call abort the whole run.
+///
 /// Returns how many blocks were produced; the harness skips the NUT's own
 /// slots by itself.
 fn seed_past_slots(chain: &RefChain) -> Result<usize, m2_reference::chain::ChainError> {
     let now = chain.next_slot();
     let mut count = 0;
-    for slot in (chain.genesis_slot() + 1)..=now {
+    for slot in (chain.best_slot() + 1)..=now {
         if chain.author_block(slot)?.is_some() {
             count += 1;
         }
@@ -392,13 +415,62 @@ fn seed_past_slots(chain: &RefChain) -> Result<usize, m2_reference::chain::Chain
     Ok(count)
 }
 
+/// Prove the emulated validators' tickets and schedule them, regenerating once
+/// if proving was overtaken by an epoch boundary.
+///
+/// The caller seeds the chain first. That ordering is not an optimization: a
+/// ticket is sealed against the tickets entropy of the chain head, so proving
+/// against an unseeded head produces tickets the node rejects outright.
+///
+/// Even seeded, proving can still straddle a boundary — it reads the entropy,
+/// proves, and by the time the plan is laid the submission window for the
+/// epoch it generated for may have closed, which leaves *both* ticket lanes
+/// measuring nothing. The second attempt re-seeds, so it reads the entropy of
+/// the epoch the run is now in and has that epoch's whole window ahead of it.
+async fn plan_tickets_for_this_run(
+    ref_chain: &RefChain,
+    nut_index: usize,
+) -> Result<(TicketCtx, Vec<ScheduledTicket>, u32), m2_reference::chain::ChainError> {
+    let (ticket_ctx, tickets, target_epoch) = generate_tickets(ref_chain)?;
+    let plan = schedule_tickets(ref_chain, &tickets, nut_index, target_epoch);
+    if !plan.is_empty() {
+        return Ok((ticket_ctx, plan, target_epoch));
+    }
+    // The window for this epoch's lottery has closed, and nothing within this
+    // epoch can reopen it: tickets are submitted before the tail, and the tail
+    // is where the run started. Waiting it out costs a slot or three and buys
+    // the whole of the next epoch's window; not waiting costs both ticket
+    // lanes, which then measure nothing at all.
+    wait_for_next_epoch(ref_chain).await;
+    seed_past_slots(ref_chain)?;
+    let (ticket_ctx, tickets, target_epoch) = generate_tickets(ref_chain)?;
+    let plan = schedule_tickets(ref_chain, &tickets, nut_index, target_epoch);
+    Ok((ticket_ctx, plan, target_epoch))
+}
+
+/// Sleep until the start of the next epoch.
+async fn wait_for_next_epoch(ref_chain: &RefChain) {
+    let period = jam_types::epoch_period();
+    let now = ref_chain.next_slot();
+    let slots = period - now % period;
+    tokio::time::sleep(Duration::from_millis(
+        u64::from(slots) * m2_scenario::ctx::SLOT_PERIOD_MS,
+    ))
+    .await;
+}
+
 /// Author each slot as the wall clock reaches it and announce every block, for
 /// as long as the task lives.
 ///
 /// This is what keeps the chain moving: before, it was authored once up front
 /// and then stood still for the rest of the observation window.
-async fn drive_slots(chain: Arc<RefChain>, announce: broadcast::Sender<Vec<u8>>) {
+async fn drive_slots(
+    chain: Arc<RefChain>,
+    announce: broadcast::Sender<Vec<u8>>,
+    contexts: EpochContexts,
+) {
     let mut next = chain.next_slot() + 1;
+    let mut captured_epoch = None;
     loop {
         // Wait for the slot to actually begin. Sleeping to the boundary rather
         // than for one slot period keeps the pacing from drifting over a run.
@@ -423,6 +495,23 @@ async fn drive_slots(chain: Arc<RefChain>, announce: broadcast::Sender<Vec<u8>>)
             // The NUT's own slot, or nothing to author.
             Ok(None) => {}
             Err(_) => break,
+        }
+        // A ticket proof is bound to the tickets-entropy of the epoch it
+        // targets, so the only moment the harness can read the context for
+        // epoch `e + 1` is while the chain is *in* epoch `e`. Capturing it on
+        // each boundary is the difference between judging the node's tickets
+        // and reporting them unjudged: a run spans several epochs, and the
+        // node generates afresh in each one.
+        //
+        // Read after authoring, not before: the entropy rotates with the first
+        // block of the new epoch, so a read taken before it still holds the
+        // previous epoch's and the context would be filed one epoch late.
+        let epoch = next / jam_types::epoch_period();
+        if captured_epoch != Some(epoch) {
+            if let Ok(ctx) = chain.ticket_ctx() {
+                lock(&contexts).push((epoch + 1, ctx));
+            }
+            captured_epoch = Some(epoch);
         }
         next += 1;
     }
@@ -560,6 +649,75 @@ fn startup(e: impl std::fmt::Display) -> RunError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `current_epoch_start_slot` divides the wall-clock slot by
+    /// `epoch_period`, which is process-wide state. Read before the tiny
+    /// parameters are applied it uses 600 instead of 12, and genesis lands up
+    /// to 599 slots back rather than 11 -- a chain the node must import and
+    /// finalize before it will accept a single ticket.
+    #[test]
+    fn the_genesis_anchor_uses_the_tiny_epoch_period() {
+        jam_types::ProtocolParameters::tiny()
+            .apply()
+            .expect("tiny parameters apply");
+        let period = jam_types::epoch_period();
+        let anchor = m2_reference::chain::current_epoch_start_slot();
+        let now = m2_reference::chain::wall_clock_slot();
+        assert_eq!(anchor % period, 0, "the anchor is an epoch boundary");
+        assert!(
+            now - anchor < period,
+            "genesis is anchored inside the current epoch: {now} - {anchor} >= {period}"
+        );
+    }
+
+    /// Seeding has to be callable again once the clock has moved: ticket
+    /// generation that overran its epoch tops the chain up before proving
+    /// afresh. Seeding from genesis each time re-authors a slot the chain
+    /// already holds, which is an error — and that error aborted the whole
+    /// run before any report was written.
+    ///
+    /// Anchored to the current epoch, exactly as a live run anchors it: on the
+    /// slot-0 dev spec the gap between genesis and now is nine million slots,
+    /// and seeding it would author every one of them.
+    #[test]
+    fn seed_past_slots_can_be_called_again() -> Result<(), m2_reference::chain::ChainError> {
+        // Before the anchor is read, exactly as `run` does it. The parameters
+        // are process-wide, so a test that reads the anchor first gets
+        // whichever set some other test happened to install: with the default
+        // 600-slot epoch genesis lands up to 599 slots back, `tiny_spec` then
+        // installs the tiny set anyway, and seeding authors every one of those
+        // slots until the test is killed. That is a flake in the suite, not in
+        // the harness -- `run` applies these first -- but it has aborted a
+        // whole test run twice.
+        jam_types::ProtocolParameters::tiny()
+            .apply()
+            .expect("tiny parameters apply");
+        let ports: Vec<u16> = (0..VALIDATOR_COUNT).map(|i| 40000 + i as u16).collect();
+        let anchor = m2_reference::chain::current_epoch_start_slot();
+        let spec = spec::tiny_spec(&loopback_ips(), &ports, anchor)
+            .map_err(|e| m2_reference::chain::ChainError::Chain(e.to_string()))?;
+        let chain = RefChain::with_spec(5, spec)?;
+
+        seed_past_slots(&chain)?;
+        let head = chain.best_slot();
+
+        // The second call is the regression: seeding from genesis would try to
+        // re-author a slot the chain already holds, which `author_block`
+        // rejects. It may legitimately fill a slot or two -- seeding takes
+        // seconds and a slot is six of them -- but never one at or behind the
+        // head, and it must not fail.
+        let second = seed_past_slots(&chain).expect("seeding resumes instead of re-authoring");
+        assert!(
+            chain.best_slot() >= head,
+            "the head only ever moves forward"
+        );
+        assert_eq!(
+            chain.best_slot() - head,
+            second as u32,
+            "the second call authored exactly the slots the clock had moved on by"
+        );
+        Ok(())
+    }
 
     /// Defect 2: at every NUT position the harness emulates the other five
     /// validators and never the NUT itself. The old contiguous range gave

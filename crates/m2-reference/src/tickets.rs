@@ -10,6 +10,7 @@ use jam_std_common::{
 use crate::chain::{ChainError, RefChain};
 
 /// Ticket context for a target epoch.
+#[derive(Clone)]
 pub struct TicketCtx {
     /// Serialized bandersnatch public keys of the designated validators.
     pub pks: Vec<[u8; 32]>,
@@ -53,8 +54,15 @@ pub struct ScheduledTicket {
 
 impl RefChain {
     /// Ticket context for the current head state: serialized bandersnatch
-    /// public keys of the designated validators and the tickets entropy
-    /// (entropy buffer entry 1, current after the upcoming epoch change).
+    /// public keys of the designated validators and the tickets entropy.
+    ///
+    /// The entropy is buffer entry *2*, which is what a node checks a
+    /// submitted ticket against. Entry 1 looks plausible -- it is what entry 2
+    /// becomes after the next epoch change -- and it is what this read, so
+    /// every ticket the emulator ever offered was rejected with "invalid
+    /// ticket signature". It went unnoticed because the two agree whenever an
+    /// epoch boundary happens to fall between proving and delivery, which a
+    /// genesis anchored far enough in the past made likely.
     pub fn ticket_ctx(&self) -> Result<TicketCtx, ChainError> {
         let storage = self.harness().storage(None);
         let validators = storage
@@ -63,7 +71,7 @@ impl RefChain {
         let pks = validators.iter().map(|v| v.bandersnatch.0).collect();
         let entropy = storage
             .entropy()
-            .map_err(|e| ChainError::Tickets(format!("entropy: {e}")))?[1]
+            .map_err(|e| ChainError::Tickets(format!("entropy: {e}")))?[2]
             .0;
         Ok(TicketCtx { pks, entropy })
     }
@@ -160,7 +168,7 @@ pub fn plan_tickets(
         return Vec::new();
     };
     let span = end - start + 1;
-    tickets
+    let mut scheduled: Vec<ScheduledTicket> = tickets
         .iter()
         .map(|t| {
             if t.proxy == nut_index {
@@ -179,7 +187,45 @@ pub fn plan_tickets(
                 }
             }
         })
-        .collect()
+        .collect();
+    scheduled.extend(unknown_epoch_probe(tickets, target_epoch, end));
+    scheduled
+}
+
+/// The unknown-epoch probe (`simple.md:335-337`): one ticket labelled for an
+/// epoch past the node's horizon, which it must answer by resetting the
+/// stream.
+///
+/// It reuses a real ticket's proof, so no second round of ring-VRF proving is
+/// needed: the node rejects the distribution on its epoch before the proof is
+/// ever in question. Delivered last, in the window's final slot, so a node
+/// that answered by dropping the connection instead cannot cost the run its
+/// legitimate deliveries. Without it nothing in a run exercises the rule, and
+/// a check over a rule nothing exercised reports coverage the run never had.
+fn unknown_epoch_probe(
+    tickets: &[EmulatedTicket],
+    target_epoch: u32,
+    last_slot: u32,
+) -> Option<ScheduledTicket> {
+    // `target_epoch` is already the epoch after the current one, so `+ 1` is
+    // the first epoch no validator can hold the entropy for yet.
+    let unknown = target_epoch.checked_add(1)?;
+    Some(ScheduledTicket {
+        ticket: tickets.first()?.clone(),
+        delivery: TicketDelivery::Ce132,
+        slot: last_slot,
+        target_epoch: unknown,
+    })
+}
+
+/// The ticket id carried by a ring signature: its VRF output.
+///
+/// A ticket announced over CE 131/132 is just an attempt index and a proof;
+/// the id a block's extrinsic is keyed by is derived from the proof, so the
+/// harness can recognise the node's own tickets in its own blocks without
+/// having been told them.
+pub fn ticket_id(proof: &[u8; 784]) -> [u8; 32] {
+    ring_vrf::Signature(*proof).vrf_output().0
 }
 
 /// Verify a ticket's ring signature against the context's validator ring.
@@ -266,7 +312,11 @@ mod tests {
                 "slot {} outside submission window {start}..={end}",
                 s.slot
             );
-            assert_eq!(s.target_epoch, target_epoch);
+            if s.target_epoch != target_epoch {
+                // The unknown-epoch probe, which is the one entry deliberately
+                // labelled for an epoch outside the plan's.
+                continue;
+            }
             if s.ticket.proxy == nut_index {
                 assert_eq!(s.delivery, TicketDelivery::Ce131);
                 assert_eq!(s.slot, start);
@@ -307,6 +357,41 @@ mod tests {
         Ok(())
     }
 
+    /// Every plan carries exactly one ticket for an epoch past the node's
+    /// horizon, so each run exercises the reset rule (`simple.md:335-337`).
+    /// It is delivered last and reuses a real proof, costing no extra
+    /// ring-VRF work and no legitimate delivery.
+    #[test]
+    fn plan_carries_one_unknown_epoch_probe() -> Result<(), ChainError> {
+        let chain = RefChain::tiny(0)?;
+        let ctx = chain.ticket_ctx()?;
+        let tickets = chain.generate_tickets(&ctx)?;
+        let period = jam_types::epoch_period();
+        let target_epoch = 42;
+        let first = 41 * period + 1;
+        let (_, end) = submission_window(first, target_epoch).expect("window is open");
+
+        let plan = plan_tickets(&tickets, 0, first, target_epoch);
+        let probes: Vec<&ScheduledTicket> = plan
+            .iter()
+            .filter(|s| s.target_epoch != target_epoch)
+            .collect();
+        assert_eq!(probes.len(), 1, "exactly one probe");
+        assert!(
+            probes[0].target_epoch > target_epoch,
+            "the probe names an epoch past the one being submitted into"
+        );
+        assert_eq!(probes[0].slot, end, "the probe is delivered last");
+        assert_eq!(probes[0].delivery, TicketDelivery::Ce132);
+        assert_eq!(
+            plan.first().map(|s| s.target_epoch),
+            Some(target_epoch),
+            "the plan still opens on a real ticket, which is what the \
+             emulator reads the plan's own epoch from"
+        );
+        Ok(())
+    }
+
     /// Generation that overruns the submission window yields no plan at all,
     /// rather than deliveries the node must refuse.
     #[test]
@@ -329,8 +414,12 @@ mod tests {
         Ok(())
     }
 
+    /// A submitted ticket is checked against entropy buffer entry 2, so that
+    /// is what it must be sealed with. This test previously asserted entry 1
+    /// -- pinning the defect in place rather than catching it -- and the node
+    /// rejected every ticket the emulator offered.
     #[test]
-    fn entropy_from_storage_index_1() -> Result<(), ChainError> {
+    fn tickets_are_sealed_with_the_entropy_a_node_checks_them_against() -> Result<(), ChainError> {
         let chain = RefChain::tiny(0)?;
         let ctx = chain.ticket_ctx()?;
         assert_eq!(ctx.entropy.len(), 32);
@@ -338,7 +427,7 @@ mod tests {
         let entropy = storage
             .entropy()
             .map_err(|e| ChainError::Tickets(e.to_string()))?;
-        assert_eq!(ctx.entropy, entropy[1].0);
+        assert_eq!(ctx.entropy, entropy[2].0);
         Ok(())
     }
 

@@ -167,6 +167,11 @@ pub async fn spawn(cmd: &str, session_dir: &Path) -> std::io::Result<NutProcess>
         .args(args)
         .stdout(stdout_file)
         .stderr(stderr_file)
+        // The run kills the NUT explicitly at teardown, but every `?` between
+        // the launch and that point would otherwise leave it running and
+        // holding its QUIC port -- which outlives the run and fails the next
+        // one with `AddrInUse`. Dropping the handle now reaps it too.
+        .kill_on_drop(true)
         .spawn()?;
 
     Ok(NutProcess {
@@ -372,11 +377,35 @@ mod tests {
     #[tokio::test]
     async fn kill_running_process() {
         let dir = temp_dir("kill-running");
-        let mut nut = spawn("sleep 30", &dir).await.unwrap();
+        let nut = spawn("sleep 30", &dir).await.unwrap();
         let pid = nut.child.id().unwrap();
         super::kill(nut).await.unwrap();
         // Killed and reaped: the child's /proc entry is gone.
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A run that dies between the launch and teardown -- any `?` on the way
+    /// -- drops the handle without ever calling `kill`. Before `kill_on_drop`,
+    /// that left the NUT running and holding its QUIC port, and the next run
+    /// on those ports failed with `AddrInUse`.
+    #[tokio::test]
+    async fn dropped_process_is_reaped() {
+        let dir = temp_dir("drop-reaps");
+        let nut = spawn("sleep 30", &dir).await.unwrap();
+        let pid = nut.child.id().unwrap();
+        drop(nut);
+        // Tokio reaps on drop in the background, so give it a moment.
+        for _ in 0..100 {
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "dropping the handle must kill the NUT, not leak it"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

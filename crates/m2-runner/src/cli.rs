@@ -73,8 +73,17 @@ fn exit_code(all_hard_passed: bool, startup_failed: bool) -> i32 {
 pub async fn run(cli: Cli) -> i32 {
     match run::run_once(cli).await {
         Ok(eval) => exit_code(eval.all_hard_passed, false),
-        Err(run::RunError::Startup(_)) => 1,
-        Err(run::RunError::Internal(_)) => 2,
+        // A run that dies before it can write a report has nowhere else to
+        // say why: the session directory holds the node's log and nothing of
+        // the harness's own. Exiting silently leaves the operator guessing.
+        Err(e @ run::RunError::Startup(_)) => {
+            eprintln!("m2-runner: {e}");
+            1
+        }
+        Err(e @ run::RunError::Internal(_)) => {
+            eprintln!("m2-runner: {e}");
+            2
+        }
     }
 }
 
