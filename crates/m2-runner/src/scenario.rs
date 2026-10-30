@@ -1,4 +1,4 @@
-//! Scenario evaluation for a run: the L0 checks against an observation log
+//! Scenario evaluation for a run: the N0 checks against an observation log
 //! and the deterministic dry-run baseline log.
 
 use std::sync::{Arc, Mutex};
@@ -9,23 +9,24 @@ use jamnp_s::trace::Trace;
 use m2_emu::emu::Emulator;
 use m2_reference::chain::RefChain;
 use m2_scenario::ctx::{
-    DeliveredTicket, EmuTicket, ImportFact, L1Ctx, L2Ctx, NutBlock, NutTicketFacts, TicketDelivery,
+    DeliveredTicket, EmuTicket, ImportFact, N1Ctx, N2Ctx, NutBlock, NutTicketFacts, TicketDelivery,
     SLOT_PERIOD_MS, TICKET_ARRIVAL_LEAD_MS,
 };
 use m2_scenario::dsl::{Check, Obs, ObsKind, ObsLog, Outcome, Scheduler, Severity};
-use m2_scenario::scenarios::l0::{Ce128Probe, Ce129Probe};
+use m2_scenario::scenarios::n0::{Ce128Probe, Ce129Probe};
 use m2_scenario::scenarios::obs::{
     EMU_SENT_131, EMU_SENT_132, RECV_CE131, RECV_CE132, UNKNOWN_EPOCH_RESET,
 };
-use m2_scenario::scenarios::{l0, l1, l2};
+use m2_scenario::scenarios::{n0, n1, n2};
 
+use crate::cli::LaneSet;
 use crate::report::{CheckOutcome, Finding};
 
 /// Per-lane facts a run's scenario evaluation reads.
 pub(crate) struct RunCtx {
-    pub l0: l0::L0Ctx,
-    pub l1: Option<L1Ctx>,
-    pub l2: Option<L2Ctx>,
+    pub n0: n0::N0Ctx,
+    pub n1: Option<N1Ctx>,
+    pub n2: Option<N2Ctx>,
 }
 
 /// The outcome of a run's scenario evaluation.
@@ -49,18 +50,26 @@ pub(crate) enum ObsSource {
     Fabricated { log: ObsLog, trace: Trace },
 }
 
-/// Run the L0/L1/L2 checks against `obs` and reduce to report outcomes +
-/// findings. L1/L2 lanes fire only when their context is present.
-pub(crate) fn evaluate(obs: &ObsLog, run_ctx: &RunCtx) -> Evaluation {
+/// Run the selected lanes' checks against `obs` and reduce to report outcomes
+/// and findings. A lane fires only when it was asked for *and* its context is
+/// present.
+pub(crate) fn evaluate(obs: &ObsLog, run_ctx: &RunCtx, selected: LaneSet) -> Evaluation {
     let mut outcomes = Vec::new();
     let mut findings = Vec::new();
     let mut all_hard_passed = true;
-    let mut lanes: Vec<(&str, Vec<Check>)> = vec![("L0", l0::all(&run_ctx.l0))];
-    if let Some(ctx) = &run_ctx.l1 {
-        lanes.push(("L1", l1::all(ctx)));
+    // Two conditions, and they mean different things. `selected` is what the
+    // operator asked to grade; the context being present is whether the run
+    // produced anything to grade it on. A lane nobody asked for is absent
+    // from the report rather than passed.
+    let mut lanes: Vec<(&str, Vec<Check>)> = Vec::new();
+    if selected.n0 {
+        lanes.push(("N0", n0::all(&run_ctx.n0)));
     }
-    if let Some(ctx) = &run_ctx.l2 {
-        lanes.push(("L2", l2::all(ctx)));
+    if let (true, Some(ctx)) = (selected.n1, &run_ctx.n1) {
+        lanes.push(("N1", n1::all(ctx)));
+    }
+    if let (true, Some(ctx)) = (selected.n2, &run_ctx.n2) {
+        lanes.push(("N2", n2::all(ctx)));
     }
     for (lane, checks) in lanes {
         let (out, finds, hard) = run_lane(lane, &checks, obs);
@@ -120,10 +129,10 @@ fn run_lane(lane: &str, checks: &[Check], obs: &ObsLog) -> (Vec<CheckOutcome>, V
 }
 
 /// The deterministic conforming observation log the dry-run baseline reports
-/// on: peer 1 exhibits every L0 contract event (codes 20..=40 plus the named
+/// on: peer 1 exhibits every N0 contract event (codes 20..=40 plus the named
 /// kinds) in an order that satisfies all nine checks.
 pub(crate) fn fabricated_obs_log(reference_block_count: usize) -> ObsLog {
-    use l0::{
+    use n0::{
         ALPN_ACCEPTED, ALPN_BUILDER_OK, ALPN_OFFERED, BUILDERS_ACCEPTED, CE128_FIN_BOTH,
         CE128_MAX_RESPECTED, CE129_BOUNDARY_ORDER, CE129_LEN_PREFIXED, CE129_SIZE_CAP,
         CE129_SORTED, CE133_ON_BUILDER, CERT_ED25519, CERT_KEY_MATCH, CERT_SAN_OK, ENDPOINT_DIALED,
@@ -142,50 +151,50 @@ pub(crate) fn fabricated_obs_log(reference_block_count: usize) -> ObsLog {
         );
         at += 10;
     };
-    push(l0::PEER_1, ObsKind::Accept);
-    push(l0::PEER_1, ObsKind::Other(CERT_ED25519));
-    push(l0::PEER_1, ObsKind::Other(CERT_KEY_MATCH));
-    push(l0::PEER_1, ObsKind::Other(CERT_SAN_OK));
-    push(l0::PEER_1, ObsKind::OpenUp0);
-    push(l0::PEER_1, ObsKind::Other(ALPN_ACCEPTED));
-    push(l0::PEER_1, ObsKind::Other(ALPN_OFFERED));
-    push(l0::PEER_1, ObsKind::Other(ALPN_BUILDER_OK));
-    push(l0::PEER_1, ObsKind::Other(NUT_INITIATED));
-    push(l0::PEER_1, ObsKind::Other(ENDPOINT_DIALED));
-    push(l0::PEER_1, ObsKind::Other(BUILDERS_ACCEPTED));
-    push(l0::PEER_1, ObsKind::Other(CE133_ON_BUILDER));
-    push(l0::PEER_1, ObsKind::Other(UP0_KIND0));
-    push(l0::PEER_1, ObsKind::Other(UP0_FINAL_GENESIS));
-    push(l0::PEER_1, ObsKind::Up0Announce);
-    push(l0::PEER_1, ObsKind::Other(REANNOUNCED));
+    push(n0::PEER_1, ObsKind::Accept);
+    push(n0::PEER_1, ObsKind::Other(CERT_ED25519));
+    push(n0::PEER_1, ObsKind::Other(CERT_KEY_MATCH));
+    push(n0::PEER_1, ObsKind::Other(CERT_SAN_OK));
+    push(n0::PEER_1, ObsKind::OpenUp0);
+    push(n0::PEER_1, ObsKind::Other(ALPN_ACCEPTED));
+    push(n0::PEER_1, ObsKind::Other(ALPN_OFFERED));
+    push(n0::PEER_1, ObsKind::Other(ALPN_BUILDER_OK));
+    push(n0::PEER_1, ObsKind::Other(NUT_INITIATED));
+    push(n0::PEER_1, ObsKind::Other(ENDPOINT_DIALED));
+    push(n0::PEER_1, ObsKind::Other(BUILDERS_ACCEPTED));
+    push(n0::PEER_1, ObsKind::Other(CE133_ON_BUILDER));
+    push(n0::PEER_1, ObsKind::Other(UP0_KIND0));
+    push(n0::PEER_1, ObsKind::Other(UP0_FINAL_GENESIS));
+    push(n0::PEER_1, ObsKind::Up0Announce);
+    push(n0::PEER_1, ObsKind::Other(REANNOUNCED));
     for _ in 0..reference_block_count {
-        push(l0::PEER_1, ObsKind::ServesCe128);
+        push(n0::PEER_1, ObsKind::ServesCe128);
     }
-    push(l0::PEER_1, ObsKind::Other(CE128_FIN_BOTH));
-    push(l0::PEER_1, ObsKind::Other(CE128_MAX_RESPECTED));
-    push(l0::PEER_1, ObsKind::Other(CE129_SORTED));
-    push(l0::PEER_1, ObsKind::Other(CE129_BOUNDARY_ORDER));
-    push(l0::PEER_1, ObsKind::Other(CE129_SIZE_CAP));
-    push(l0::PEER_1, ObsKind::Other(CE129_LEN_PREFIXED));
-    // L1: the NUT announced an authored block.
-    push(l0::PEER_1, ObsKind::AuthorsBlock);
-    // L2: the NUT received its CE 131/132 ticket distributions and the
+    push(n0::PEER_1, ObsKind::Other(CE128_FIN_BOTH));
+    push(n0::PEER_1, ObsKind::Other(CE128_MAX_RESPECTED));
+    push(n0::PEER_1, ObsKind::Other(CE129_SORTED));
+    push(n0::PEER_1, ObsKind::Other(CE129_BOUNDARY_ORDER));
+    push(n0::PEER_1, ObsKind::Other(CE129_SIZE_CAP));
+    push(n0::PEER_1, ObsKind::Other(CE129_LEN_PREFIXED));
+    // N1: the NUT announced an authored block.
+    push(n0::PEER_1, ObsKind::AuthorsBlock);
+    // N2: the NUT received its CE 131/132 ticket distributions and the
     // emulator's sends; the CE 132 broadcast reaches all five emulated peers.
-    push(l0::PEER_1, ObsKind::Other(RECV_CE131));
+    push(n0::PEER_1, ObsKind::Other(RECV_CE131));
     for peer in 1..=5u16 {
         push(peer, ObsKind::Other(RECV_CE132));
     }
-    push(l0::PEER_1, ObsKind::Other(EMU_SENT_131));
-    push(l0::PEER_1, ObsKind::Other(EMU_SENT_132));
-    // L2: the NUT reset the stream carrying the unknown-epoch probe.
-    push(l0::PEER_1, ObsKind::Other(UNKNOWN_EPOCH_RESET));
+    push(n0::PEER_1, ObsKind::Other(EMU_SENT_131));
+    push(n0::PEER_1, ObsKind::Other(EMU_SENT_132));
+    // N2: the NUT reset the stream carrying the unknown-epoch probe.
+    push(n0::PEER_1, ObsKind::Other(UNKNOWN_EPOCH_RESET));
     log
 }
 
-/// The deterministic conforming [`RunCtx`] for the dry-run baseline: the L1
+/// The deterministic conforming [`RunCtx`] for the dry-run baseline: the N1
 /// lane is built around one real reference-authored NUT block (genuine header
 /// and extrinsic types), with its import fact and delivered tickets matching
-/// that block; the L2 lane carries a conforming emulator plan and verified NUT
+/// that block; the N2 lane carries a conforming emulator plan and verified NUT
 /// ticket facts.
 pub(crate) fn fabricated_run_ctx(
     reference_block_count: usize,
@@ -225,11 +234,11 @@ pub(crate) fn fabricated_run_ctx(
     // the harness treats as history here; the node is allowed to be ahead.
     let genesis = chain.genesis_hash();
     let reference_chain: Vec<[u8; 32]> = history.iter().skip(1).map(|(_, hash)| *hash).collect();
-    let probed_blocks: Vec<l0::ProbedBlock> = chain
+    let probed_blocks: Vec<n0::ProbedBlock> = chain
         .chain_blocks()
         .iter()
         .skip(1)
-        .map(|block| l0::ProbedBlock {
+        .map(|block| n0::ProbedBlock {
             slot: block.header.slot,
             hash: block.header.hash().0,
             parent: block.header.parent.0,
@@ -246,10 +255,10 @@ pub(crate) fn fabricated_run_ctx(
         root,
         error: None,
     };
-    let l1 = L1Ctx {
+    let n1 = N1Ctx {
         // The fabricated node's blocks carry only tickets the emulator
         // delivered, so there are none of its own to account for. The
-        // own-ticket allowance is exercised by the L1 lane's own tests.
+        // own-ticket allowance is exercised by the N1 lane's own tests.
         own_ticket_ids: Vec::new(),
         reference_best: first_root,
         reference_block_hashes: history.iter().map(|(_, hash)| *hash).collect(),
@@ -268,7 +277,7 @@ pub(crate) fn fabricated_run_ctx(
             // slots it wins, so the NUT may own the one in between -- and
             // timing the second as `first + one slot period` put its
             // announcement before its slot had begun whenever that happened,
-            // failing `l1_timing_within_slot` for one wall-clock slot in
+            // failing `n1_timing_within_slot` for one wall-clock slot in
             // several. A fabricated baseline must not depend on the clock.
             NutBlock {
                 block: first,
@@ -285,6 +294,7 @@ pub(crate) fn fabricated_run_ctx(
                 id,
                 delivered_at_ms: slot_start(slot) - TICKET_ARRIVAL_LEAD_MS,
                 target_epoch: slot / jam_types::epoch_period() + 1,
+                probe: false,
             })
             .collect(),
         slot_period_ms: SLOT_PERIOD_MS,
@@ -312,6 +322,10 @@ pub(crate) fn fabricated_run_ctx(
         delivery,
         slot: 1,
         target_epoch,
+        // The baseline is a conforming run, so every planned ticket reached
+        // the node on the slot it was planned for: the dry run has nothing to
+        // withhold or delay them for.
+        delivered_at_ms: Some(JAM_COMMON_ERA * 1000 + SLOT_PERIOD_MS),
     };
     // A ticket the node generates during epoch 2 is for epoch 3, so the facts
     // are stamped inside epoch 2 rather than at an arbitrary instant: the
@@ -347,7 +361,7 @@ pub(crate) fn fabricated_run_ctx(
             TicketDelivery::Ce132,
         ));
     }
-    let l2 = L2Ctx {
+    let n2 = N2Ctx {
         target_epoch: FAB_TARGET_EPOCH,
         epoch_start_slot: 0,
         emu_plan: vec![
@@ -375,22 +389,22 @@ pub(crate) fn fabricated_run_ctx(
     Ok(RunCtx {
         // The fabricated log is written for a NUT at index 0, which initiates
         // to every emulated peer and so never needs a fallback dial.
-        l0: l0::L0Ctx {
+        n0: n0::N0Ctx {
             reference_block_count,
             reference_chain: reference_chain.clone(),
             // A conforming node: the ascending walk returns the reference
             // chain itself, within the cap, FIN'd; the state slice is sorted,
             // in range and inside the size cap.
-            ce128_probes: vec![l0::Ce128Probe {
-                peer: l0::PEER_1,
+            ce128_probes: vec![n0::Ce128Probe {
+                peer: n0::PEER_1,
                 max_blocks: 64,
                 from: genesis,
                 returned: probed_blocks,
                 finished: true,
                 error: None,
             }],
-            ce129_probes: vec![l0::Ce129Probe {
-                peer: l0::PEER_1,
+            ce129_probes: vec![n0::Ce129Probe {
+                peer: n0::PEER_1,
                 start: [0u8; 31],
                 end: [0xffu8; 31],
                 max_size: 16 * 1024,
@@ -401,20 +415,20 @@ pub(crate) fn fabricated_run_ctx(
                 decoded: true,
                 error: None,
             }],
-            first_emu_peer: l0::PEER_1,
+            first_emu_peer: n0::PEER_1,
             handshake_completed: true,
             wrong_alpn_rejected: true,
-            builder: Some(l0::BuilderProbeFacts {
+            builder: Some(n0::BuilderProbeFacts {
                 attempted: 21,
                 accepted: 21,
                 ce133_accepted: true,
                 ce133_detail: None,
             }),
-            nut_preferred_peers: vec![l0::PEER_1],
+            nut_preferred_peers: vec![n0::PEER_1],
             emu_preferred_peers: Vec::new(),
         },
-        l1: Some(l1),
-        l2: Some(l2),
+        n1: Some(n1),
+        n2: Some(n2),
     })
 }
 
@@ -423,11 +437,19 @@ mod tests {
 
     use super::*;
 
+    /// Every implemented lane, which is what a run grades unless told
+    /// otherwise.
+    const ALL_LANES: LaneSet = LaneSet {
+        n0: true,
+        n1: true,
+        n2: true,
+    };
+
     #[test]
     fn evaluate_reports_lanes() {
         let run_ctx = fabricated_run_ctx(3).expect("fabricated run ctx builds");
         let log = fabricated_obs_log(3);
-        let eval = evaluate(&log, &run_ctx);
+        let eval = evaluate(&log, &run_ctx, ALL_LANES);
 
         let hard_failures: Vec<&str> = eval
             .outcomes
@@ -439,7 +461,7 @@ mod tests {
             eval.all_hard_passed,
             "fabricated log must pass all lanes; failed: {hard_failures:?}"
         );
-        for lane in ["L0", "L1", "L2"] {
+        for lane in ["N0", "N1", "N2"] {
             let outcomes: Vec<&CheckOutcome> =
                 eval.outcomes.iter().filter(|o| o.lane == lane).collect();
             assert!(!outcomes.is_empty(), "lane {lane} must produce outcomes");
@@ -454,18 +476,18 @@ mod tests {
             );
         }
 
-        // The L1 and L2 verdicts come from the ctx facts, not from markers in
+        // The N1 and N2 verdicts come from the ctx facts, not from markers in
         // the log, so the negative case has to change what the node did: drop
         // every CE 132 frame it sent and the broadcast and forwarding duties
         // both go unmet.
         let mut silent = run_ctx;
-        let l2 = silent
-            .l2
+        let n2 = silent
+            .n2
             .as_mut()
-            .expect("the fabricated run has an L2 lane");
-        l2.nut_tickets
+            .expect("the fabricated run has an N2 lane");
+        n2.nut_tickets
             .retain(|f| f.delivery != m2_scenario::ctx::TicketDelivery::Ce132);
-        let eval = evaluate(&log, &silent);
+        let eval = evaluate(&log, &silent, ALL_LANES);
         assert!(
             !eval.all_hard_passed,
             "a node that broadcast no CE 132 at all must fail the run"
@@ -473,13 +495,13 @@ mod tests {
         let failed: Vec<&str> = eval
             .outcomes
             .iter()
-            .filter(|o| o.lane == "L2" && !o.passed)
+            .filter(|o| o.lane == "N2" && !o.passed)
             .map(|o| o.id.as_str())
             .collect();
         assert!(
             failed
                 .iter()
-                .any(|id| id.contains("l2_proxy_duty_forwarded")),
+                .any(|id| id.contains("n2_proxy_duty_forwarded")),
             "the unforwarded ticket must be named: {failed:?}"
         );
     }

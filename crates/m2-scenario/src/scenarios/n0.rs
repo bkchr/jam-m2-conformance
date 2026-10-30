@@ -1,6 +1,6 @@
-//! L0 — connectivity and sync (DESIGN.md §11 L0).
+//! N0 — connectivity and sync (DESIGN.md §11 N0).
 //!
-//! Nine checks covering the L0 table rows, written with the [`dsl`] scenario
+//! Nine checks covering the N0 table rows, written with the [`dsl`] scenario
 //! DSL. Each is a [`dsl::Check`] whose body reads the `m2-emu` observation log
 //! and returns [`dsl::CheckResult`]s: an expected-answer subsequence plus
 //! embedded [`dsl::log`] assertions.
@@ -10,7 +10,7 @@
 //! The `m2-emu` log records [`dsl::Obs`] events keyed by the emulated peer
 //! (indices `1..=5`; the NUT is index `0`). Beyond the named [`dsl::ObsKind`]
 //! events, this lane uses the [`dsl::ObsKind::Other`] extension slot for the
-//! L0 detail observations the emulator emits (`code()` values below). The
+//! N0 detail observations the emulator emits (`code()` values below). The
 //! runner wires the emulator to emit them.
 //!
 //! | code | meaning |
@@ -268,7 +268,7 @@ pub struct BuilderProbeFacts {
 
 /// UP 0 handshake `simple.md:192-236`: kind byte 0, `u32 LE` framing,
 /// handshake Final = genesis. Duplicate UP 0 handling (greatest stream id
-/// kept) is a robustness fault exercised by the L7 lane, not the L0 happy path.
+/// kept) is a robustness fault exercised by the N7 lane, not the N0 happy path.
 pub fn up0_handshake() -> Check {
     check("up0_handshake", Severity::Hard, |obs| {
         vec![
@@ -650,10 +650,10 @@ fn node_hash(node: &[u8; 64]) -> [u8; 32] {
     out
 }
 
-/// Per-run facts the L0 lane needs, which depend on the validator set rather
+/// Per-run facts the N0 lane needs, which depend on the validator set rather
 /// than on the protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct L0Ctx {
+pub struct N0Ctx {
     /// Blocks the reference chain authored, for the CE 128 coverage check.
     pub reference_block_count: usize,
     /// Reference chain after genesis, in slot order: what an ascending
@@ -679,8 +679,8 @@ pub struct L0Ctx {
     pub emu_preferred_peers: Vec<u16>,
 }
 
-/// All nine L0 checks in dependency order (L0 first; later lanes build on it).
-pub fn all(ctx: &L0Ctx) -> Vec<Check> {
+/// All nine N0 checks in dependency order (N0 first; later lanes build on it).
+pub fn all(ctx: &N0Ctx) -> Vec<Check> {
     vec![
         tls_cert(ctx.handshake_completed),
         alpn(ctx.wrong_alpn_rejected),
@@ -1180,8 +1180,8 @@ mod tests {
     }
 
     #[test]
-    fn all_l0_checks_distinct() {
-        let checks = all(&L0Ctx {
+    fn all_n0_checks_distinct() {
+        let checks = all(&N0Ctx {
             reference_block_count: 2,
             reference_chain: Vec::new(),
             ce128_probes: Vec::new(),

@@ -8,9 +8,11 @@ use tokio::sync::broadcast;
 use jamnp_s::cert::san_for_key;
 use m2_emu::emu::Emulator;
 use m2_reference::chain::RefChain;
-use m2_reference::tickets::{ScheduledTicket, TicketCtx};
+use m2_reference::tickets::{
+    first_delivery_slot, window_can_exercise_forwarding, ScheduledTicket, TicketCtx, TicketDelivery,
+};
 use m2_scenario::dsl::ObsKind;
-use m2_scenario::scenarios::l0;
+use m2_scenario::scenarios::n0;
 
 use crate::cli::{Cli, Preset};
 use crate::connectivity::{self, ConnectivityPlan, ProbeOutcome};
@@ -23,6 +25,10 @@ use crate::real::{
 use crate::report::{self, Finding};
 use crate::scenario::{evaluate, fabricated_obs_log, fabricated_run_ctx, Evaluation, ObsSource};
 use crate::spec;
+
+/// How often the runner re-reads the node's advertised finalized slot while
+/// waiting for it to be able to accept tickets.
+const NODE_READINESS_POLL_MS: u64 = 250;
 
 /// How many emulated slots the dry-run baseline pretends were authored.
 const DRY_RUN_BLOCK_COUNT: usize = 3;
@@ -76,7 +82,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     let genesis_hash = chain_spec.genesis_header.hash().0;
     let spec_id = format!("m2-{}", cli.seed);
     let m2_spec = spec::m2_spec(&spec_id, &chain_spec).map_err(internal)?;
-    spec::write_m2_spec(session_dir, &spec_id, &m2_spec).map_err(internal)?;
+    let m2_spec_path = spec::write_m2_spec(session_dir, &spec_id, &m2_spec).map_err(internal)?;
     let spec_path = spec::write_polkajam_spec(session_dir, &chain_spec).map_err(internal)?;
 
     let nut_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, cli.base_port + nut_index as u16));
@@ -117,18 +123,18 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
 
     let mut nut: Option<NutProcess> = None;
     let mut conn_findings: Vec<Finding> = Vec::new();
-    // L0 facts the connectivity phase establishes. A dry run leaves them at
+    // N0 facts the connectivity phase establishes. A dry run leaves them at
     // the conforming values, since it fabricates a conforming node.
     let mut handshake_completed = true;
     let mut wrong_alpn_rejected = true;
-    let mut builder: Option<l0::BuilderProbeFacts> = Some(l0::BuilderProbeFacts {
+    let mut builder: Option<n0::BuilderProbeFacts> = Some(n0::BuilderProbeFacts {
         attempted: connectivity::BUILDER_CONNECTIONS,
         accepted: connectivity::BUILDER_CONNECTIONS,
         ce133_accepted: true,
         ce133_detail: None,
     });
     if !cli.dry_run {
-        let cfg = launch_config(&keys, &cli, spec_path);
+        let cfg = launch_config(&keys, &cli, spec_path, m2_spec_path);
         // The peer-id is the 53-char text form ("e" + base32 of the Ed25519
         // key) — the same string as the certificate SAN.
         let peer_id = nut_san.clone();
@@ -176,7 +182,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             connectivity::INITIATOR_GRACE,
         )
         .await;
-        builder = Some(l0::BuilderProbeFacts {
+        builder = Some(n0::BuilderProbeFacts {
             attempted: probe.attempted,
             accepted: probe.accepted,
             ce133_accepted: probe.ce133_accepted,
@@ -197,28 +203,15 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         )
     } else {
         let ref_chain = reference.expect("a live run builds the reference chain");
-        // Seeded before the tickets are proved, not after: every slot between
-        // genesis and now has to be filled for the chain to be current, and
-        // the entropy the tickets are sealed against is read from its head.
+        // Seeded before the node is given anything to sync from: every slot
+        // between genesis and now has to be filled for the chain to be
+        // current, and the entropy the tickets are later proved against is
+        // read from its head.
         seed_past_slots(&ref_chain).map_err(internal)?;
         let epoch_contexts: EpochContexts = Arc::new(Mutex::new(Vec::new()));
-        let (ticket_ctx, ticket_plan, target_epoch) =
-            plan_tickets_for_this_run(&ref_chain, nut_index)
-                .await
-                .map_err(internal)?;
-        // Counted from the chain rather than from the seeding, which may have
-        // run twice: the L0 lane compares this against the reference chain the
-        // contexts are built from, and the two have to be the same chain.
-        let count = ref_chain.chain_blocks().len().saturating_sub(1);
-        if ticket_plan.is_empty() {
-            conn_findings.push(empty_ticket_plan_finding(&ref_chain, target_epoch));
-        }
-        let emu = Emulator::l0(emu_indices.clone(), genesis_hash, cli.base_port)
+        let emu = Emulator::n0(emu_indices.clone(), genesis_hash, cli.base_port)
             .await
             .map_err(internal)?;
-        // Each emulated validator's tickets go out on the first connection to
-        // it, whichever side opened it.
-        emu.set_ticket_plans(plans_by_peer(&ticket_plan));
         let obs = emu.obs();
         let trace = emu.trace();
         let nut_blocks = emu.nut_blocks();
@@ -258,10 +251,41 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                 if !connectivity::should_fallback_dial(&lock(&shared.obs), peer) {
                     return;
                 }
-                m2_emu::emu::record(&shared.obs, peer, ObsKind::Other(l0::FALLBACK_DIAL));
+                m2_emu::emu::record(&shared.obs, peer, ObsKind::Other(n0::FALLBACK_DIAL));
                 let _ = m2_emu::emu::dial_nut(index, genesis_hash, nut_addr, nut_san, shared).await;
             }));
         }
+        // Only now is the plan laid out. Until the node has imported and
+        // finalized the chain it was just handed it refuses every ticket, so
+        // the sender holds them back (`ticket_io::node_can_accept_tickets`)
+        // -- and a schedule written before that hold is a schedule of
+        // intentions. `sessions/fwd-1` planned its one proxied ticket for
+        // phase 2 and the gate released it in phase 7, past any forwarding
+        // window, with the plan none the wiser. Planning against a node that
+        // can already accept makes the slots the schedule names the slots the
+        // tickets arrive in.
+        let (ticket_ctx, ticket_plan, target_epoch) = if cli.lanes.needs_tickets() {
+            wait_until_the_node_can_accept_tickets(&shared, cli.observe_secs).await;
+            plan_tickets_for_this_run(&ref_chain, nut_index)
+                .await
+                .map_err(internal)?
+        } else {
+            // Neither ticket lane was asked for. Proving a plan nothing will
+            // grade costs the most expensive seconds in the run, and waiting
+            // for the node to be able to accept tickets costs more still.
+            (ref_chain.ticket_ctx().map_err(internal)?, Vec::new(), 0)
+        };
+        // Counted from the chain rather than from the seeding: by now
+        // `drive_slots` has added blocks of its own, and the N0 lane compares
+        // this against the reference chain the contexts are built from, which
+        // has to be the same chain.
+        let count = ref_chain.chain_blocks().len().saturating_sub(1);
+        if cli.lanes.needs_tickets() && ticket_plan.is_empty() {
+            conn_findings.push(empty_ticket_plan_finding(&ref_chain, target_epoch));
+        }
+        // Each emulated validator's tickets go out on the connection to it,
+        // whichever side opened it; the senders pick the plan up from here.
+        emu.set_ticket_plans(plans_by_peer(&ticket_plan));
         let ce128_probes = emu.ce128_probes();
         let ce129_probes = emu.ce129_probes();
         let real_run = RealRunData {
@@ -322,7 +346,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             build_real_run_ctx(
                 data,
                 &lock(trace),
-                l0::L0Ctx {
+                n0::N0Ctx {
                     reference_block_count,
                     reference_chain,
                     ce128_probes: lock(ce128_probes).clone(),
@@ -342,8 +366,8 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     };
 
     let evaluation = match &source {
-        ObsSource::Emulator { obs, .. } => evaluate(&lock(obs), &run_ctx),
-        ObsSource::Fabricated { log, .. } => evaluate(log, &run_ctx),
+        ObsSource::Emulator { obs, .. } => evaluate(&lock(obs), &run_ctx, cli.lanes),
+        ObsSource::Fabricated { log, .. } => evaluate(log, &run_ctx, cli.lanes),
     };
 
     // §4.6 teardown: kill the NUT (stdout/stderr already collected by `spawn`).
@@ -425,27 +449,80 @@ fn seed_past_slots(chain: &RefChain) -> Result<usize, m2_reference::chain::Chain
 /// Even seeded, proving can still straddle a boundary — it reads the entropy,
 /// proves, and by the time the plan is laid the submission window for the
 /// epoch it generated for may have closed, which leaves *both* ticket lanes
-/// measuring nothing. The second attempt re-seeds, so it reads the entropy of
-/// the epoch the run is now in and has that epoch's whole window ahead of it.
+/// measuring nothing. The second attempt reads the entropy of the epoch the
+/// run is now in and has that epoch's whole window ahead of it.
+///
+/// Neither attempt seeds the chain itself. By the time this runs `drive_slots`
+/// owns authoring, and a second writer racing it for the same slot fails the
+/// whole run with "cannot author slot N: reference chain head is at slot N".
 async fn plan_tickets_for_this_run(
     ref_chain: &RefChain,
     nut_index: usize,
 ) -> Result<(TicketCtx, Vec<ScheduledTicket>, u32), m2_reference::chain::ChainError> {
     let (ticket_ctx, tickets, target_epoch) = generate_tickets(ref_chain)?;
     let plan = schedule_tickets(ref_chain, &tickets, nut_index, target_epoch);
-    if !plan.is_empty() {
+    if !this_epoch_is_a_waste(ref_chain.next_slot(), &plan, target_epoch) {
         return Ok((ticket_ctx, plan, target_epoch));
     }
-    // The window for this epoch's lottery has closed, and nothing within this
-    // epoch can reopen it: tickets are submitted before the tail, and the tail
-    // is where the run started. Waiting it out costs a slot or three and buys
-    // the whole of the next epoch's window; not waiting costs both ticket
-    // lanes, which then measure nothing at all.
+    // The window for this epoch's lottery cannot carry the run, and nothing
+    // within this epoch can change that: tickets are submitted before the
+    // tail, and forwards are owed only early in the lottery. Waiting it out
+    // costs slots before the observation window opens and buys the whole of
+    // the next epoch's window; not waiting costs the lanes that would have
+    // measured something.
     wait_for_next_epoch(ref_chain).await;
-    seed_past_slots(ref_chain)?;
     let (ticket_ctx, tickets, target_epoch) = generate_tickets(ref_chain)?;
     let plan = schedule_tickets(ref_chain, &tickets, nut_index, target_epoch);
     Ok((ticket_ctx, plan, target_epoch))
+}
+
+/// Whether this epoch's remaining window is poor enough to be worth trading
+/// for the next one's.
+///
+/// Two cases. An empty plan is the obvious one: the window has closed
+/// outright, so both ticket lanes measure nothing. The second is a window
+/// that is open but opens late — a CE 131 delivery goes out at its first
+/// slot, and once that slot is past the forwardable phases the node owes no
+/// forward for it, so `n2_proxy_duty` reports "not exercised" however well
+/// the node behaves (`sessions/gate-7`, which planned every CE 131 at phase
+/// 8). Deferring is only worth it when the plan actually proxies something to
+/// the NUT; with no CE 131 entry there is no duty to exercise and the wait
+/// buys nothing.
+fn this_epoch_is_a_waste(now_slot: u32, plan: &[ScheduledTicket], target_epoch: u32) -> bool {
+    if plan.is_empty() {
+        return true;
+    }
+    let proxies_to_the_nut = plan.iter().any(|s| s.delivery == TicketDelivery::Ce131);
+    proxies_to_the_nut
+        && !window_can_exercise_forwarding(first_delivery_slot(now_slot), target_epoch)
+}
+
+/// Block until the NUT is in a state to accept tickets, or until waiting
+/// stops being worth it.
+///
+/// The node refuses every ticket offered to it while its finalized head is
+/// behind the current epoch, which it is for as long as it takes to import
+/// and finalize the chain the harness seeded. The emulator's sender already
+/// holds tickets back for exactly this (`node_can_accept_tickets`), but a
+/// plan written while the node is still catching up names slots the tickets
+/// will not arrive in, and the proxy-forwarding duty is owed only on arrival.
+///
+/// Giving up is deliberate rather than an error: a node that never finalizes
+/// has a defect of its own, and the run should go on to report it from the
+/// lanes rather than hang here. The sender's own gate still withholds, so
+/// nothing is graded against a ticket the node could not have taken.
+async fn wait_until_the_node_can_accept_tickets(shared: &m2_emu::emu::EmuShared, budget_secs: u64) {
+    // Half the observation window, capped at an epoch: past an epoch the
+    // lottery has moved on and the wait has bought nothing.
+    let cap = u64::from(jam_types::epoch_period()) * m2_scenario::ctx::SLOT_PERIOD_MS / 1000;
+    let deadline = Instant::now() + Duration::from_secs((budget_secs / 2).min(cap));
+    while Instant::now() < deadline {
+        let now_slot = m2_reference::chain::wall_clock_slot();
+        if m2_emu::ticket_io::node_can_accept_tickets(shared.nut_final_slot(), now_slot) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(NODE_READINESS_POLL_MS)).await;
+    }
 }
 
 /// Sleep until the start of the next epoch.
@@ -520,7 +597,7 @@ async fn drive_slots(
 /// A soft finding for a run whose ticket plan came out empty: the epoch's
 /// submission window closed before the harness was ready to use it.
 ///
-/// Reported rather than swallowed, because the L1 and L2 ticket checks are
+/// Reported rather than swallowed, because the N1 and N2 ticket checks are
 /// then measuring nothing — the honest reading is "not exercised", not "no
 /// defect found".
 fn empty_ticket_plan_finding(ref_chain: &RefChain, target_epoch: u32) -> Finding {
@@ -597,9 +674,11 @@ fn launch_config(
     keys: &keygen::GeneratedKeys,
     cli: &Cli,
     spec_path: std::path::PathBuf,
+    m2_spec_path: std::path::PathBuf,
 ) -> LaunchConfig {
     LaunchConfig {
         spec_path,
+        m2_spec_path,
         ed25519_secret_hex: keys.nut_ed25519_secret_hex.clone(),
         bandersnatch_secret_hex: keys.nut_bandersnatch_secret_hex.clone(),
         listen: format!("[::]:{}", cli.base_port + cli.validator_index as u16),
@@ -667,6 +746,76 @@ mod tests {
         assert!(
             now - anchor < period,
             "genesis is anchored inside the current epoch: {now} - {anchor} >= {period}"
+        );
+    }
+
+    /// The planner and the lane have to mean the same thing by "early enough
+    /// to forward". They are in different crates and neither can see the
+    /// other's constant, so the phases they admit are compared directly here:
+    /// a planner that ran ahead of the rule would schedule deliveries the
+    /// lane then declines to judge, and one that lagged would wait out epochs
+    /// it had no need to.
+    #[test]
+    fn forwardable_phases_match_the_judged_rule() {
+        jam_types::ProtocolParameters::tiny()
+            .apply()
+            .expect("tiny parameters apply");
+        let period = jam_types::epoch_period();
+        let tail = jam_types::epoch_tail_start();
+        let last =
+            m2_reference::tickets::last_forwardable_phase().expect("tiny leaves room to forward");
+        for phase in 0..period {
+            assert_eq!(
+                phase <= last,
+                m2_scenario::ctx::leaves_room_to_forward(41 * period + phase, period, tail),
+                "phase {phase} is judged one way and planned the other"
+            );
+        }
+    }
+
+    /// A plan that proxies nothing to the NUT has no forwarding duty to
+    /// exercise, so a late window is as good as an early one and waiting an
+    /// epoch for it buys nothing. A plan that does proxy to the NUT is worth
+    /// the wait, because every CE 131 in it goes out at the window's first
+    /// slot and a late first slot owes no forward at all.
+    #[test]
+    fn a_late_window_is_traded_only_when_a_ticket_is_proxied_to_the_nut() {
+        jam_types::ProtocolParameters::tiny()
+            .apply()
+            .expect("tiny parameters apply");
+        let period = jam_types::epoch_period();
+        let target_epoch = 42;
+        let scheduled = |delivery| ScheduledTicket {
+            ticket: m2_reference::tickets::EmulatedTicket {
+                id: [0u8; 32],
+                author: 0,
+                attempt: 0,
+                proof: [0u8; 784],
+                proxy: 0,
+            },
+            delivery,
+            slot: 0,
+            target_epoch,
+        };
+        let proxied = [scheduled(TicketDelivery::Ce131)];
+        let broadcast_only = [scheduled(TicketDelivery::Ce132)];
+
+        assert!(
+            this_epoch_is_a_waste(41 * period, &[], target_epoch),
+            "an empty plan measures nothing whatever the phase"
+        );
+        // Phase 0: the whole lottery is ahead, so nothing is traded.
+        assert!(!this_epoch_is_a_waste(41 * period, &proxied, target_epoch));
+        // Phase 8: still inside the submission window, but a CE 131 landing
+        // there is one no proxy owes a forward for.
+        assert!(this_epoch_is_a_waste(
+            41 * period + 8,
+            &proxied,
+            target_epoch
+        ));
+        assert!(
+            !this_epoch_is_a_waste(41 * period + 8, &broadcast_only, target_epoch),
+            "no CE 131 in the plan means no duty to wait for"
         );
     }
 

@@ -1,4 +1,4 @@
-//! The five emulated validators (P0 L0 subset): JAMNP-S reactive skeletons.
+//! The five emulated validators (P0 N0 subset): JAMNP-S reactive skeletons.
 //!
 //! `m2-emu` executes no core protocol logic: every block is served byte-for-byte
 //! from `m2-reference`'s [`RefChain`] and every decision is made by the
@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex, MutexGuard,
     },
 };
@@ -27,9 +27,9 @@ use m2_reference::chain::RefChain;
 use m2_reference::tickets::ScheduledTicket;
 use m2_scenario::ctx::{DeliveredTicket, NutBlock};
 use m2_scenario::dsl::{Obs, ObsKind, ObsLog};
-use m2_scenario::scenarios::l0;
-use m2_scenario::scenarios::l0::{Ce128Probe, Ce129Probe};
-use tokio::sync::broadcast;
+use m2_scenario::scenarios::n0;
+use m2_scenario::scenarios::n0::{Ce128Probe, Ce129Probe};
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
 use crate::nut_block::{fetch_block, should_fetch};
@@ -75,10 +75,15 @@ pub struct Emulator {
     obs: Arc<Mutex<ObsLog>>,
     nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
     ticket_plans: Arc<Mutex<HashMap<u16, Vec<ScheduledTicket>>>>,
+    /// Published to [`EmuShared::ticket_plans_set`] by `set_ticket_plans`.
+    ticket_plans_set: watch::Sender<bool>,
     deliveries: Arc<Mutex<Vec<DeliveredTicket>>>,
     ce128_probes: Arc<Mutex<Vec<Ce128Probe>>>,
     ce129_probes: Arc<Mutex<Vec<Ce129Probe>>>,
     sync_probe_pending: Arc<AtomicBool>,
+    /// Highest finalized slot the NUT has advertised over UP 0; see
+    /// [`EmuShared::nut_final_slot`].
+    nut_final_slot: Arc<AtomicU32>,
     /// Fan-out for blocks authored after the connections are up (A10).
     ///
     /// Every live UP 0 stream subscribes, so a block announced here reaches
@@ -110,8 +115,16 @@ pub struct EmuShared {
     /// after the harness stopped dialling peers that had already connected,
     /// that was most of them.
     pub ticket_plans: Arc<Mutex<HashMap<u16, Vec<ScheduledTicket>>>>,
+    /// Flips once [`Emulator::set_ticket_plans`] has run.
+    ///
+    /// The plans are laid out after the connections are up, because a
+    /// schedule written while the node is still importing the seeded chain
+    /// names slots the tickets will not arrive in. So a sender cannot read
+    /// its plan at connect time -- it has to wait for one to exist, and an
+    /// empty map at connect time means "not yet", not "nothing to send".
+    pub ticket_plans_set: watch::Receiver<bool>,
     /// Tickets actually put on the wire, with the wall-clock time they were
-    /// sent. The sender knows each ticket's id, so the L1 lane reads this
+    /// sent. The sender knows each ticket's id, so the N1 lane reads this
     /// rather than re-deriving ids from the observation log.
     pub deliveries: Arc<Mutex<Vec<DeliveredTicket>>>,
     /// CE 128 replies the node under test gave the emulator.
@@ -121,7 +134,23 @@ pub struct EmuShared {
     /// Cleared by whichever connection runs the sync probes, so they run once
     /// per run rather than once per peer.
     pub sync_probe_pending: Arc<AtomicBool>,
+    /// Highest finalized slot the NUT has advertised over UP 0, or
+    /// [`NO_ADVERTISED_FINAL`] before it has advertised any.
+    ///
+    /// Every UP 0 message the node sends carries its finalized block
+    /// (`simple.md:192-236`), handshake and announcement alike, so this is the
+    /// one thing the harness knows about the node's internal progress without
+    /// asking it anything. The ticket sender gates on it.
+    pub nut_final_slot: Arc<AtomicU32>,
 }
+
+/// `nut_final_slot` before the NUT has advertised a finalized block.
+///
+/// Zero rather than a sentinel: the run's genesis is anchored at the current
+/// epoch's start, millions of slots in, so no real advertisement can collide
+/// with it — and a node that has told us nothing and a node finalized at slot
+/// zero are equally unready.
+pub const NO_ADVERTISED_FINAL: u32 = 0;
 
 impl EmuShared {
     /// Take `peer`'s ticket plan, leaving nothing behind.
@@ -139,6 +168,21 @@ impl EmuShared {
     pub fn claim_sync_probe(&self) -> bool {
         self.sync_probe_pending.swap(false, Ordering::SeqCst)
     }
+
+    /// Record a finalized slot the NUT advertised, keeping the highest.
+    ///
+    /// Monotonic because the advertisements are not: they arrive on five
+    /// connections at once, and a message that was in flight while another
+    /// overtook it would otherwise walk the watermark backwards.
+    pub fn note_nut_final(&self, slot: u32) {
+        self.nut_final_slot.fetch_max(slot, Ordering::SeqCst);
+    }
+
+    /// The highest finalized slot the NUT has advertised, or
+    /// [`NO_ADVERTISED_FINAL`].
+    pub fn nut_final_slot(&self) -> u32 {
+        self.nut_final_slot.load(Ordering::SeqCst)
+    }
 }
 
 impl Emulator {
@@ -147,7 +191,7 @@ impl Emulator {
     /// The endpoint for validator `i` listens on `127.0.0.1:(base_port + i)`
     /// with the Ed25519 secret `SecretKeyset::trivial(i)` and identifies as a
     /// non-builder peer for `genesis_hash`.
-    pub async fn l0(
+    pub async fn n0(
         emu_indices: Vec<usize>,
         genesis_hash: [u8; 32],
         base_port: u16,
@@ -177,10 +221,12 @@ impl Emulator {
             obs: Arc::new(Mutex::new(ObsLog::new())),
             nut_blocks: Arc::new(Mutex::new(Vec::new())),
             ticket_plans: Arc::new(Mutex::new(HashMap::new())),
+            ticket_plans_set: watch::channel(false).0,
             deliveries: Arc::new(Mutex::new(Vec::new())),
             ce128_probes: Arc::new(Mutex::new(Vec::new())),
             ce129_probes: Arc::new(Mutex::new(Vec::new())),
             sync_probe_pending: Arc::new(AtomicBool::new(true)),
+            nut_final_slot: Arc::new(AtomicU32::new(NO_ADVERTISED_FINAL)),
             announce: broadcast::Sender::new(ANNOUNCE_BUFFER),
         })
     }
@@ -191,6 +237,10 @@ impl Emulator {
     /// peer's plan; see [`EmuShared::ticket_plans`].
     pub fn set_ticket_plans(&self, plans: HashMap<u16, Vec<ScheduledTicket>>) {
         *lock(&self.ticket_plans) = plans;
+        // After the map, never before: a sender woken by this goes straight
+        // to `take_ticket_plan`. `send_replace` rather than `send` so the flag
+        // sticks even when no sender is listening yet.
+        self.ticket_plans_set.send_replace(true);
     }
 
     /// The tickets the emulator put on the wire, with their send times.
@@ -217,10 +267,12 @@ impl Emulator {
             nut_blocks: Arc::clone(&self.nut_blocks),
             announce: self.announce.clone(),
             ticket_plans: Arc::clone(&self.ticket_plans),
+            ticket_plans_set: self.ticket_plans_set.subscribe(),
             deliveries: Arc::clone(&self.deliveries),
             ce128_probes: Arc::clone(&self.ce128_probes),
             ce129_probes: Arc::clone(&self.ce129_probes),
             sync_probe_pending: Arc::clone(&self.sync_probe_pending),
+            nut_final_slot: Arc::clone(&self.nut_final_slot),
         }
     }
 
@@ -257,7 +309,7 @@ impl Emulator {
         Arc::clone(&self.nut_blocks)
     }
 
-    /// Spawn one reactive accept task per endpoint, serving the L0 subset from
+    /// Spawn one reactive accept task per endpoint, serving the N0 subset from
     /// `ref_chain`. The returned handle completes when every accept task ends
     /// (i.e. once the endpoints are closed).
     pub fn accept_loop(&self, ref_chain: Arc<RefChain>) -> JoinHandle<()> {
@@ -303,7 +355,7 @@ pub fn announcement_wire(block: &Block, ref_chain: &RefChain) -> Vec<u8> {
 /// going rather than stalling the driver.
 const ANNOUNCE_BUFFER: usize = 16;
 
-/// Dial the NUT as emulated validator `index` and run the L0 reactive handler
+/// Dial the NUT as emulated validator `index` and run the N0 reactive handler
 /// on the connection: verify the NUT's cert/ALPN (the handshake proves it),
 /// open UP 0 as the connection initiator, then serve the NUT's CE 128 / CE 129
 /// requests. Used where the emulated validator is the preferred initiator
@@ -333,13 +385,13 @@ pub async fn dial_nut(
     )
     .await?;
     let peer = index as u16;
-    // A completed handshake proves the L0 cert + ALPN contract.
-    record(&obs, peer, ObsKind::Other(l0::CERT_ED25519));
-    record(&obs, peer, ObsKind::Other(l0::CERT_KEY_MATCH));
-    record(&obs, peer, ObsKind::Other(l0::CERT_SAN_OK));
-    record(&obs, peer, ObsKind::Other(l0::ALPN_ACCEPTED));
-    record(&obs, peer, ObsKind::Other(l0::ALPN_OFFERED));
-    record(&obs, peer, ObsKind::Other(l0::ENDPOINT_DIALED));
+    // A completed handshake proves the N0 cert + ALPN contract.
+    record(&obs, peer, ObsKind::Other(n0::CERT_ED25519));
+    record(&obs, peer, ObsKind::Other(n0::CERT_KEY_MATCH));
+    record(&obs, peer, ObsKind::Other(n0::CERT_SAN_OK));
+    record(&obs, peer, ObsKind::Other(n0::ALPN_ACCEPTED));
+    record(&obs, peer, ObsKind::Other(n0::ALPN_OFFERED));
+    record(&obs, peer, ObsKind::Other(n0::ENDPOINT_DIALED));
 
     // Open UP 0 as the connection initiator and send the genesis handshake.
     let (mut send, recv) = connection
@@ -357,7 +409,7 @@ pub async fn dial_nut(
     let _ = send.write_all(&wire).await;
 
     // Announce the reference blocks (skip genesis) so the NUT has something to
-    // sync and re-announce (L1 authoring is announced like a real author).
+    // sync and re-announce (N1 authoring is announced like a real author).
     for block in ref_chain.chain_blocks().iter().skip(1) {
         record(&obs, peer, ObsKind::Up0Announce);
         let wire = announcement_wire(block, &ref_chain);
@@ -391,7 +443,7 @@ pub async fn dial_nut(
         shared.clone(),
     ));
 
-    // Deliver the peer's L2 tickets on their own streams, concurrently with
+    // Deliver the peer's N2 tickets on their own streams, concurrently with
     // the handler — unless the accept side already took the plan.
     start_ticket_delivery(&connection, peer, &shared);
     start_sync_probe(&connection, peer, &shared);
@@ -437,7 +489,7 @@ pub fn serve_ce129(_request: &StateRequest) -> StateResponse {
     }
 }
 
-/// Accept-loop for one emulated validator: record accepts and run the L0
+/// Accept-loop for one emulated validator: record accepts and run the N0
 /// reactive handler on each connection.
 async fn endpoint_task(
     endpoint: Arc<Endpoint>,
@@ -454,15 +506,15 @@ async fn endpoint_task(
         let Ok(connection) = connecting.await else {
             continue;
         };
-        // A completed NUT-initiated handshake proves the L0 cert + ALPN
+        // A completed NUT-initiated handshake proves the N0 cert + ALPN
         // contract (simple.md:7-23,48-59): Ed25519 sig alg, key == on-chain,
         // single SAN, and `jamnp-s/1/..` accepted/offered.
-        record(&obs, peer_index, ObsKind::Other(l0::CERT_ED25519));
-        record(&obs, peer_index, ObsKind::Other(l0::CERT_KEY_MATCH));
-        record(&obs, peer_index, ObsKind::Other(l0::CERT_SAN_OK));
-        record(&obs, peer_index, ObsKind::Other(l0::ALPN_ACCEPTED));
-        record(&obs, peer_index, ObsKind::Other(l0::ALPN_OFFERED));
-        record(&obs, peer_index, ObsKind::Other(l0::NUT_INITIATED));
+        record(&obs, peer_index, ObsKind::Other(n0::CERT_ED25519));
+        record(&obs, peer_index, ObsKind::Other(n0::CERT_KEY_MATCH));
+        record(&obs, peer_index, ObsKind::Other(n0::CERT_SAN_OK));
+        record(&obs, peer_index, ObsKind::Other(n0::ALPN_ACCEPTED));
+        record(&obs, peer_index, ObsKind::Other(n0::ALPN_OFFERED));
+        record(&obs, peer_index, ObsKind::Other(n0::NUT_INITIATED));
         // Deliver this peer's tickets on the first connection to it, whichever
         // side opened it: the NUT reaching us first must not cost the peer its
         // whole ticket plan.
@@ -478,19 +530,38 @@ async fn endpoint_task(
     }
 }
 
-/// Spawn the ticket sender for `peer`, if its plan has not been taken yet.
+/// Spawn the ticket sender for `peer` once a plan exists and if its plan has
+/// not been taken yet.
+///
+/// The wait is what makes the connection order and the planning order
+/// independent. Connections come up while the node is still importing the
+/// seeded chain; the plan is written once it can accept tickets. Reading the
+/// map at connect time found it empty and delivered nothing.
 fn start_ticket_delivery(connection: &quinn::Connection, peer: u16, shared: &EmuShared) {
-    let Some(plan) = shared.take_ticket_plan(peer) else {
-        return;
-    };
-    tokio::spawn(spawn_ticket_sender(
-        connection.clone(),
-        plan,
-        Arc::clone(&shared.trace),
-        Arc::clone(&shared.obs),
-        Arc::clone(&shared.deliveries),
-        peer,
-    ));
+    let connection = connection.clone();
+    let mut plans_set = shared.ticket_plans_set.clone();
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        while !*plans_set.borrow_and_update() {
+            // Err only once the `Emulator` is dropped, which ends the run.
+            if plans_set.changed().await.is_err() {
+                return;
+            }
+        }
+        let Some(plan) = shared.take_ticket_plan(peer) else {
+            return;
+        };
+        spawn_ticket_sender(
+            connection,
+            plan,
+            Arc::clone(&shared.trace),
+            Arc::clone(&shared.obs),
+            Arc::clone(&shared.deliveries),
+            Arc::clone(&shared.nut_final_slot),
+            peer,
+        )
+        .await;
+    });
 }
 
 /// Application error code used when the emulator refuses a stream: an unknown
@@ -498,7 +569,7 @@ fn start_ticket_delivery(connection: &quinn::Connection, peer: u16, shared: &Emu
 /// The stream is reset; the connection stays up (DESIGN.md `:477`).
 const STREAM_REFUSED: u32 = 1;
 
-/// Run the L0 reactive handler on one connection, one task per accepted stream.
+/// Run the N0 reactive handler on one connection, one task per accepted stream.
 ///
 /// Streams on a JAMNP-S connection are concurrent and independent, and UP 0 is
 /// *static*: it stays open for the lifetime of the connection, and closing a
@@ -720,7 +791,7 @@ async fn read_dialed_up0(
 }
 
 /// Handle a NUT UP 0 message: an `Announcement` is recorded (`Up0Announce`
-/// plus the L0 re-announce observation — the P0 emulator cannot distinguish
+/// plus the N0 re-announce observation — the P0 emulator cannot distinguish
 /// announce from re-announce) and left unanswered; anything else is a
 /// handshake, answered with our own (recording `OpenUp0`).
 ///
@@ -738,8 +809,9 @@ async fn handle_up0(
 ) {
     let (ref_chain, trace, obs) = (&*shared.ref_chain, &*shared.trace, &*shared.obs);
     if let Ok(announcement) = Announcement::decode(&mut &content[..]) {
+        shared.note_nut_final(announcement.final_block.slot);
         record(obs, peer_index, ObsKind::Up0Announce);
-        record(obs, peer_index, ObsKind::Other(l0::REANNOUNCED));
+        record(obs, peer_index, ObsKind::Other(n0::REANNOUNCED));
         // An announced block outside the reference chain is a NUT-authored
         // block: fetch it over CE 128 and record it (fetch errors leave the
         // announcement recorded and the stream open).
@@ -749,10 +821,11 @@ async fn handle_up0(
         }
         return;
     }
-    record(obs, peer_index, ObsKind::Other(l0::UP0_KIND0));
+    record(obs, peer_index, ObsKind::Other(n0::UP0_KIND0));
     if let Ok(handshake) = Handshake::decode(&mut &content[..]) {
+        shared.note_nut_final(handshake.final_block.slot);
         if handshake.final_block.header_hash == HeaderHash::from(genesis_hash) {
-            record(obs, peer_index, ObsKind::Other(l0::UP0_FINAL_GENESIS));
+            record(obs, peer_index, ObsKind::Other(n0::UP0_FINAL_GENESIS));
         }
         if let Some(send) = send {
             respond_up0(
@@ -847,8 +920,8 @@ async fn serve_block_request(
     let Ok(response) = serve_ce128(&request, &chain) else {
         return;
     };
-    record(obs, peer_index, ObsKind::Other(l0::CE128_FIN_BOTH));
-    record(obs, peer_index, ObsKind::Other(l0::CE128_MAX_RESPECTED));
+    record(obs, peer_index, ObsKind::Other(n0::CE128_FIN_BOTH));
+    record(obs, peer_index, ObsKind::Other(n0::CE128_MAX_RESPECTED));
     let wire = frame_message(&response.encode());
     trace_record(peer_index, CE128, stream_id, &wire, trace, TraceDir::Rx);
     let _ = send.write_all(&wire).await;
@@ -879,10 +952,10 @@ async fn serve_state_request(
     let response = serve_ce129(&request);
     // The P0 CE 129 response is an empty well-formed reply: an empty key range
     // trivially satisfies the sorted/boundary/size/len-prefix rules.
-    record(obs, peer_index, ObsKind::Other(l0::CE129_SORTED));
-    record(obs, peer_index, ObsKind::Other(l0::CE129_BOUNDARY_ORDER));
-    record(obs, peer_index, ObsKind::Other(l0::CE129_SIZE_CAP));
-    record(obs, peer_index, ObsKind::Other(l0::CE129_LEN_PREFIXED));
+    record(obs, peer_index, ObsKind::Other(n0::CE129_SORTED));
+    record(obs, peer_index, ObsKind::Other(n0::CE129_BOUNDARY_ORDER));
+    record(obs, peer_index, ObsKind::Other(n0::CE129_SIZE_CAP));
+    record(obs, peer_index, ObsKind::Other(n0::CE129_LEN_PREFIXED));
     // Two messages, then FIN (`simple.md:300-302`): the boundary nodes first,
     // the key/value pairs second. Both are size-implied sequences, so an empty
     // reply is two *empty* messages — packing them into one, or prefixing
@@ -1025,7 +1098,7 @@ mod tests {
 
     #[tokio::test]
     async fn boots_five_endpoints() -> Result<(), EmuError> {
-        let emu = Emulator::l0(vec![1, 2, 3, 4, 5], [0xaa; 32], 40000).await?;
+        let emu = Emulator::n0(vec![1, 2, 3, 4, 5], [0xaa; 32], 40000).await?;
         let addrs = emu.local_addrs();
         assert_eq!(addrs.len(), 5);
         let ports: HashSet<u16> = addrs.iter().map(|a| a.port()).collect();

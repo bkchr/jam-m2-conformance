@@ -1,4 +1,4 @@
-//! L1 block-import oracle: imports a NUT-authored block into the reference
+//! N1 block-import oracle: imports a NUT-authored block into the reference
 //! chain with fresh execution and reports the outcome (post-state root or
 //! the rejected-import error message).
 
@@ -10,7 +10,7 @@ use crate::chain::RefChain;
 
 /// Outcome of importing a NUT block into the reference chain.
 ///
-/// Carries both state roots the L1 lane needs, which are different quantities
+/// Carries both state roots the N1 lane needs, which are different quantities
 /// and neither of which is the header hash: `declared_parent_root` is what the
 /// block's header claims its parent's posterior root was, and
 /// `reference_parent_root` is what the reference engine computed for that same
@@ -181,7 +181,7 @@ mod tests {
         Ok(())
     }
 
-    /// The two roots the L1 state-root check compares are the header's
+    /// The two roots the N1 state-root check compares are the header's
     /// declared prior root and the reference's own root for the same parent —
     /// never the header hash, which is a different quantity entirely and can
     /// only ever differ.

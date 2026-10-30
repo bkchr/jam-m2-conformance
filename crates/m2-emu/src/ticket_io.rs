@@ -1,11 +1,13 @@
-//! L2 Safrole-ticket I/O for the emulated validators (CE 131/132).
+//! N2 Safrole-ticket I/O for the emulated validators (CE 131/132).
 //!
 //! Inbound: the NUT's ticket streams (`TicketDistribution`, `simple.md:305-349`)
 //! are classified by kind and recorded as observations; an undecodable stream
 //! is treated as a bad-proof signal (soft) — the NUT is the sender, so the
 //! emulator never resets the stream. Outbound: `spawn_ticket_sender` delivers
-//! the runner-computed plan's tickets to the NUT on their slot boundaries.
+//! the runner-computed plan's tickets to the NUT on their slot boundaries,
+//! holding each one back until the node is in a state to accept it.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,8 +21,11 @@ use m2_reference::tickets::{ScheduledTicket, TicketDelivery};
 use m2_scenario::ctx::{DeliveredTicket, TICKET_ARRIVAL_LEAD_MS};
 use m2_scenario::dsl::{ObsKind, ObsLog};
 use m2_scenario::scenarios::obs::{
-    BAD_PROOF_IGNORED, EMU_SENT_131, EMU_SENT_132, RECV_CE131, RECV_CE132, UNKNOWN_EPOCH_RESET,
+    BAD_PROOF_IGNORED, EMU_SENT_131, EMU_SENT_132, RECV_CE131, RECV_CE132, TICKET_WITHHELD,
+    UNKNOWN_EPOCH_RESET,
 };
+
+use crate::emu::NO_ADVERTISED_FINAL;
 
 /// Seconds per slot (JAM common slot period).
 const SLOT_PERIOD_SEC: u64 = 6;
@@ -32,6 +37,13 @@ const SLOT_PERIOD_SEC: u64 = 6;
 /// used to do — is the one time that can never be true: the node is authoring
 /// that same instant, and its next slot is several slots away.
 const DELIVERY_MARGIN_MS: u64 = 500;
+
+/// How often the readiness gate re-reads the node's advertised final slot.
+///
+/// Well under a slot: the gate is usually satisfied within a slot or two of
+/// launch, and a coarse poll would spend most of a ticket's delivery window
+/// asleep after the node was already ready.
+const READINESS_POLL_MS: u64 = 250;
 
 /// An inbound NUT ticket stream, classified by kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,12 +98,18 @@ pub async fn handle_inbound_ticket(kind: u8, payload: &[u8], peer: u16, obs: &Mu
 
 /// Deliver `plan`'s tickets to the NUT over `connection` on their slot
 /// boundaries, recording the send and any NUT stream reset.
+///
+/// A ticket goes out only once the node can act on it; one it cannot is
+/// withheld rather than sent into a refusal, and recorded as
+/// [`TICKET_WITHHELD`] so the lanes report the rule as unexercised instead of
+/// failing the node for it.
 pub async fn spawn_ticket_sender(
     connection: quinn::Connection,
     plan: Vec<ScheduledTicket>,
     trace: Arc<Mutex<Trace>>,
     obs: Arc<Mutex<ObsLog>>,
     deliveries: Arc<Mutex<Vec<DeliveredTicket>>>,
+    nut_final_slot: Arc<AtomicU32>,
     peer: u16,
 ) {
     let Some(first) = plan.first() else {
@@ -104,6 +122,12 @@ pub async fn spawn_ticket_sender(
             TicketDelivery::Ce132 => (CE132, EMU_SENT_132),
         };
         sleep_until_delivery(scheduled.slot).await;
+        if !hold_until_the_node_can_accept(&nut_final_slot, scheduled.target_epoch, plan_epoch)
+            .await
+        {
+            crate::emu::record(&obs, peer, ObsKind::Other(TICKET_WITHHELD));
+            continue;
+        }
         let Ok((mut send, mut recv)) = connection.open_bi().await else {
             continue;
         };
@@ -129,13 +153,16 @@ pub async fn spawn_ticket_sender(
             continue;
         }
         // Recorded only once the bytes are on the wire, and stamped with the
-        // wall clock: the L1 lane compares this against slot starts, which are
+        // wall clock: the N1 lane compares this against slot starts, which are
         // absolute, so a run-relative timestamp would make every ticket look
         // as though it had arrived before the run began.
         crate::emu::lock(&deliveries).push(DeliveredTicket {
             id: scheduled.ticket.id,
             delivered_at_ms: wall_ts(),
             target_epoch: scheduled.target_epoch,
+            // The probe is the one entry naming an epoch other than the
+            // plan's, and the only ticket the node is meant to refuse.
+            probe: scheduled.target_epoch != plan_epoch,
         });
         let _ = send.finish();
         // Await the NUT's decision: a clean FIN accepts the ticket; a stream
@@ -147,6 +174,70 @@ pub async fn spawn_ticket_sender(
         if let Err(quinn::ReadError::Reset(_)) = recv.read(&mut buf).await {
             crate::emu::record(&obs, peer, reset_obs(epoch_index, plan_epoch));
         }
+    }
+}
+
+/// Whether the NUT is in a state to accept a ticket at all.
+///
+/// A node validates an incoming ticket against finalized state, so one whose
+/// finalized head is still behind the current epoch refuses every ticket it is
+/// offered. polkajam says so outright — `ticket_preflight`
+/// (`chain/authoring/ticket_communication.rs`) returns `FinalityLagging` when
+/// `final_slot / epoch_period < curr_slot / epoch_period` — and any client
+/// that checks a ring proof against finalized state has the same gap.
+///
+/// It is the normal state for a second or two after the harness seeds a chain
+/// the node has to import, which is exactly when the first tickets used to go
+/// out. The node refused all of them and the lanes then graded it for not
+/// forwarding or including them: two hard failures per run, both the harness's.
+///
+/// The test is on the *epoch*, not on the seeded head: finality trails the
+/// chain head by a slot or two indefinitely, so waiting for the node's
+/// finalized head to reach the head we seeded can wait for something that will
+/// not happen, while the node has long since been able to accept tickets.
+pub fn node_can_accept_tickets(nut_final_slot: u32, now_slot: u32) -> bool {
+    let period = jam_types::epoch_period();
+    nut_final_slot != NO_ADVERTISED_FINAL && nut_final_slot / period >= now_slot / period
+}
+
+/// Whether a ticket is still worth putting on the wire at `now_slot`.
+///
+/// Holding a ticket is only ever worth doing inside the window where the node
+/// could still act on it. Past the lottery's last submittable phase nothing may
+/// be submitted at all, and a ticket whose target epoch is no longer the next
+/// one is stale — the node is obliged to refuse both, so sending them
+/// manufactures the same false failure the gate exists to prevent.
+///
+/// The unknown-epoch probe (`simple.md:335-337`) names a far epoch on purpose,
+/// so it is exempt from the staleness test; it is the one ticket whose refusal
+/// is the point.
+fn still_worth_sending(now_slot: u32, target_epoch: u32, plan_epoch: u32) -> bool {
+    let period = jam_types::epoch_period();
+    if now_slot % period >= jam_types::epoch_tail_start().saturating_sub(1) {
+        return false;
+    }
+    target_epoch != plan_epoch || now_slot / period + 1 == target_epoch
+}
+
+/// Hold a ticket until the node can accept it, or until it is no longer worth
+/// sending. `true` when it should go out now.
+async fn hold_until_the_node_can_accept(
+    nut_final_slot: &AtomicU32,
+    target_epoch: u32,
+    plan_epoch: u32,
+) -> bool {
+    loop {
+        let now_slot = m2_reference::chain::wall_clock_slot();
+        // Asked before readiness, not after: a node that became ready only
+        // once the window had shut would otherwise be sent a ticket it is
+        // required to refuse.
+        if !still_worth_sending(now_slot, target_epoch, plan_epoch) {
+            return false;
+        }
+        if node_can_accept_tickets(nut_final_slot.load(Ordering::SeqCst), now_slot) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(READINESS_POLL_MS)).await;
     }
 }
 
@@ -243,6 +334,90 @@ mod tests {
             assert_eq!(
                 target,
                 slot_start_ms - TICKET_ARRIVAL_LEAD_MS - DELIVERY_MARGIN_MS
+            );
+        }
+    }
+
+    mod m2_emu_readiness_gate {
+        use super::*;
+
+        /// Epoch-relative so the test holds under any parameter set: these
+        /// are process-wide and whichever test ran first decides them.
+        fn slot_in(epoch: u32, phase: u32) -> u32 {
+            epoch * jam_types::epoch_period() + phase
+        }
+
+        /// The shape of the failure this gate exists for. The node had
+        /// finalized slot 9574199 while the clock was at 9574201 — two slots
+        /// apart, with an epoch boundary between them — refused all four
+        /// tickets with `finality lagging`, and was then graded for not
+        /// forwarding or including them.
+        #[test]
+        fn a_node_whose_finality_is_an_epoch_behind_is_not_ready() {
+            let now = slot_in(100, 1);
+            let lagging = slot_in(99, jam_types::epoch_period() - 1);
+            assert!(
+                !node_can_accept_tickets(lagging, now),
+                "a finalized head in the previous epoch cannot accept tickets"
+            );
+            assert!(
+                node_can_accept_tickets(slot_in(100, 0), now),
+                "a finalized head in the current epoch can"
+            );
+        }
+
+        /// Before the node has said anything, the harness knows nothing about
+        /// its progress — which is not the same as knowing it is ready.
+        #[test]
+        fn a_silent_node_is_not_ready() {
+            assert!(!node_can_accept_tickets(
+                NO_ADVERTISED_FINAL,
+                slot_in(100, 1)
+            ));
+        }
+
+        /// Holding a ticket is only worth doing while the node could still
+        /// act on it; past that, sending manufactures the refusal the gate
+        /// exists to avoid.
+        #[test]
+        fn a_ticket_is_held_only_while_it_could_still_be_submitted() {
+            let plan_epoch = 101;
+            assert!(
+                still_worth_sending(slot_in(100, 1), plan_epoch, plan_epoch),
+                "early in the submission epoch"
+            );
+            assert!(
+                !still_worth_sending(
+                    slot_in(100, jam_types::epoch_tail_start() - 1),
+                    plan_epoch,
+                    plan_epoch
+                ),
+                "the lottery's last submittable phase has passed"
+            );
+            assert!(
+                !still_worth_sending(slot_in(101, 1), plan_epoch, plan_epoch),
+                "the target epoch has begun, so the ticket is stale"
+            );
+        }
+
+        /// The unknown-epoch probe names an epoch no validator can hold
+        /// entropy for, on purpose. Judging it stale would withhold the one
+        /// ticket whose refusal is the thing being tested.
+        #[test]
+        fn the_unknown_epoch_probe_is_not_stale() {
+            let plan_epoch = 101;
+            assert!(still_worth_sending(
+                slot_in(100, 1),
+                plan_epoch + 1,
+                plan_epoch
+            ));
+            assert!(
+                !still_worth_sending(
+                    slot_in(100, jam_types::epoch_tail_start()),
+                    plan_epoch + 1,
+                    plan_epoch
+                ),
+                "but it is still bound by the lottery window"
             );
         }
     }

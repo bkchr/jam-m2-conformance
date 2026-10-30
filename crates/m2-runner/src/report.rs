@@ -174,7 +174,7 @@ mod tests {
         let results = vec![
             CheckOutcome {
                 id: "up0_handshake".into(),
-                lane: "L0".into(),
+                lane: "N0".into(),
                 severity: "hard".into(),
                 passed: true,
                 soft: false,
@@ -182,7 +182,7 @@ mod tests {
             },
             CheckOutcome {
                 id: "preferred_initiator".into(),
-                lane: "L0".into(),
+                lane: "N0".into(),
                 severity: "soft".into(),
                 passed: true,
                 soft: true,
@@ -190,7 +190,7 @@ mod tests {
             },
             CheckOutcome {
                 id: "ce128_fetch".into(),
-                lane: "L0".into(),
+                lane: "N0".into(),
                 severity: "hard".into(),
                 passed: false,
                 soft: false,
@@ -199,9 +199,9 @@ mod tests {
         ];
         write_report(tmp.path(), &results, &[]).unwrap();
         let md = std::fs::read_to_string(tmp.path().join("report/report.md")).unwrap();
-        assert!(md.contains("| L0 | up0_handshake | hard | HARD PASS |"));
-        assert!(md.contains("| L0 | preferred_initiator | soft | SOFT PASS |"));
-        assert!(md.contains("| L0 | ce128_fetch | hard | FAIL |"));
+        assert!(md.contains("| N0 | up0_handshake | hard | HARD PASS |"));
+        assert!(md.contains("| N0 | preferred_initiator | soft | SOFT PASS |"));
+        assert!(md.contains("| N0 | ce128_fetch | hard | FAIL |"));
     }
 
     #[test]

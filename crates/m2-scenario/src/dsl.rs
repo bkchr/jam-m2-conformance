@@ -368,7 +368,7 @@ pub struct Check {
 ///
 /// `detail` carries the values behind a failure — the two state roots that
 /// disagreed, the ticket ids that were owed — so a finding says what went
-/// wrong rather than only which assertion did (DESIGN.md §11 L1 asks for an
+/// wrong rather than only which assertion did (DESIGN.md §11 N1 asks for an
 /// "M1-style diff report"). It is built only on failure and only where the
 /// check has something useful to say, so most results carry `None`.
 #[derive(Clone, Debug, PartialEq, Eq)]

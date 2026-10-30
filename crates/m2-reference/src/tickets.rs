@@ -146,6 +146,41 @@ pub fn submission_window(first_slot: u32, target_epoch: u32) -> Option<(u32, u32
     (start <= end).then_some((start, end))
 }
 
+/// The latest epoch phase at which a ticket's arrival still obliges the
+/// validator it was proxied to to forward it.
+///
+/// A proxy forwards within a window inside the lottery, not at the instant it
+/// receives: it delays to avoid revealing when the generator sent, and stops
+/// well before the tail. Where exactly that window sits belongs to the node,
+/// so the harness takes the lottery's first half — early enough that any
+/// window must still be open. `None` when the lottery is too short for any
+/// phase to qualify.
+///
+/// This is the planning side of the rule `m2_scenario::ctx` judges by; the two
+/// are tied together by `m2-runner`'s `forwardable_phases_match_the_judged_rule`.
+pub fn last_forwardable_phase() -> Option<u32> {
+    (jam_types::epoch_tail_start() / 2).checked_sub(1)
+}
+
+/// Whether the window still open for `target_epoch` can exercise the proxy
+/// forwarding duty at all.
+///
+/// A CE 131 delivery goes out at the window's first slot, which is as early as
+/// the harness can place it. If that slot is already past the forwardable
+/// phases then nothing in this epoch can be, and a run laid out against it
+/// grades the proxy duty as "not exercised" however well the node behaves.
+/// The caller's answer to a `false` here is to wait for the next epoch, which
+/// costs slots and buys the whole of the next lottery.
+pub fn window_can_exercise_forwarding(first_slot: u32, target_epoch: u32) -> bool {
+    let Some(last) = last_forwardable_phase() else {
+        return false;
+    };
+    let Some((start, _)) = submission_window(first_slot, target_epoch) else {
+        return false;
+    };
+    start % jam_types::epoch_period() <= last
+}
+
 /// Schedule delivery of each ticket within the epoch submission window.
 ///
 /// A ticket whose proxy is the NUT goes via CE 131 at the window's first slot;
@@ -352,6 +387,38 @@ mod tests {
                     "slot {} is in the past",
                     s.slot
                 );
+            }
+        }
+        Ok(())
+    }
+
+    /// A window that opens inside the lottery's first half can exercise the
+    /// proxy duty; one that opens later cannot, however much of the
+    /// submission window is still ahead of it. The distinction is the whole
+    /// point: a run starting at phase 8 still delivers tickets the node must
+    /// accept, and still cannot ask it to forward one.
+    #[test]
+    fn forwarding_window_closes_before_the_submission_window() -> Result<(), ChainError> {
+        // Applies the tiny parameters process-wide, which the phase
+        // arithmetic below reads.
+        let _chain = RefChain::tiny(0)?;
+        let period = jam_types::epoch_period();
+        let last = last_forwardable_phase().expect("tiny leaves room to forward");
+        let target_epoch = 42;
+
+        for offset in 0..period {
+            let first = 41 * period + offset;
+            let can = window_can_exercise_forwarding(first, target_epoch);
+            match submission_window(first, target_epoch) {
+                // `first_delivery_slot` is not applied here, so the window
+                // opens at `first` itself.
+                Some((start, _)) => assert_eq!(
+                    can,
+                    start % period <= last,
+                    "offset {offset}: window opens at phase {}",
+                    start % period
+                ),
+                None => assert!(!can, "offset {offset}: a closed window forwards nothing"),
             }
         }
         Ok(())

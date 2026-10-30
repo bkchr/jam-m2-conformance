@@ -1,5 +1,5 @@
-//! Real-run L1/L2 context builders (m2-runner §4.4): reference-chain facts,
-//! NUT-block imports, and ticket deliveries for the L1/L2 scenario lanes.
+//! Real-run N1/N2 context builders (m2-runner §4.4): reference-chain facts,
+//! NUT-block imports, and ticket deliveries for the N1/N2 scenario lanes.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -14,14 +14,14 @@ use m2_reference::tickets::{
     TicketDelivery as ReferenceDelivery,
 };
 use m2_scenario::ctx::{
-    DeliveredTicket, EmuTicket, ImportFact, L1Ctx, L2Ctx, NutBlock, NutTicketFacts,
+    DeliveredTicket, EmuTicket, ImportFact, N1Ctx, N2Ctx, NutBlock, NutTicketFacts,
     TicketDelivery as CtxDelivery, SLOT_PERIOD_MS,
 };
 
 use crate::scenario::RunCtx;
 
-/// Reference-side facts the L1/L2 context builders read after the observation
-/// window: the reference chain, the fetched NUT blocks, and the L2 ticket plan.
+/// Reference-side facts the N1/N2 context builders read after the observation
+/// window: the reference chain, the fetched NUT blocks, and the N2 ticket plan.
 pub(crate) struct RealRunData {
     pub(crate) ref_chain: Arc<RefChain>,
     pub(crate) nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
@@ -80,7 +80,18 @@ pub(crate) fn schedule_tickets(
     )
 }
 
-/// The ticket plan split per emulated validator, keyed by peer index.
+/// The ticket plan split per emulated validator, keyed by peer index, each
+/// peer's tickets in the order they are to be delivered.
+///
+/// The sort is not cosmetic. A peer's sender walks its plan one entry at a
+/// time, sleeping until each ticket's slot, so a ticket listed before one
+/// scheduled earlier holds that earlier one back. The plan is built in ticket
+/// order, and a peer's CE 132 slot is spread by author index while its CE 131
+/// slot is the window's first — so for every author but the first, the ticket
+/// proxied to the NUT sat behind a broadcast scheduled several slots later and
+/// arrived that late. Observed: authors 0, 3 and 4 delivering their CE 131
+/// tickets in epoch phases 3, 6 and 7 against a plan that said 3 for all of
+/// them, which put them past the window any proxy could still forward in.
 pub(crate) fn plans_by_peer(plan: &[ScheduledTicket]) -> HashMap<u16, Vec<ScheduledTicket>> {
     let mut plans: HashMap<u16, Vec<ScheduledTicket>> = HashMap::new();
     for scheduled in plan {
@@ -89,14 +100,17 @@ pub(crate) fn plans_by_peer(plan: &[ScheduledTicket]) -> HashMap<u16, Vec<Schedu
             .or_default()
             .push(scheduled.clone());
     }
+    for peer_plan in plans.values_mut() {
+        peer_plan.sort_by_key(|s| s.slot);
+    }
     plans
 }
 
-/// Build the L1/L2 contexts for a real run from the post-window facts.
+/// Build the N1/N2 contexts for a real run from the post-window facts.
 pub(crate) fn build_real_run_ctx(
     data: &RealRunData,
     trace: &Trace,
-    l0: m2_scenario::scenarios::l0::L0Ctx,
+    n0: m2_scenario::scenarios::n0::N0Ctx,
 ) -> RunCtx {
     let nut_blocks = lock(&data.nut_blocks);
     let contexts = ticket_contexts(data);
@@ -108,17 +122,17 @@ pub(crate) fn build_real_run_ctx(
         .iter()
         .map(|f| m2_reference::tickets::ticket_id(&f.ticket.proof))
         .collect();
-    let l1 = build_l1_ctx(
+    let n1 = build_n1_ctx(
         &data.ref_chain,
         &nut_blocks,
         &lock(&data.deliveries),
         own_ticket_ids.clone(),
     );
-    let l2 = build_l2_ctx(&contexts, data, nut_tickets, &nut_blocks, own_ticket_ids);
+    let n2 = build_n2_ctx(&contexts, data, nut_tickets, &nut_blocks, own_ticket_ids);
     RunCtx {
-        l0,
-        l1: Some(l1),
-        l2: Some(l2),
+        n0,
+        n1: Some(n1),
+        n2: Some(n2),
     }
 }
 
@@ -172,17 +186,17 @@ impl TicketContexts {
     }
 }
 
-/// L1 facts: the reference chain with its slots, the fetched NUT blocks with
+/// N1 facts: the reference chain with its slots, the fetched NUT blocks with
 /// their import outcomes, and the tickets the emulator delivered to the NUT.
 ///
 /// The chain is read before the imports run, so the reference best block is
 /// the one the run actually ended on and not one re-imported here.
-fn build_l1_ctx(
+fn build_n1_ctx(
     ref_chain: &RefChain,
     nut_blocks: &[NutBlock],
     deliveries: &[DeliveredTicket],
     own_ticket_ids: Vec<[u8; 32]>,
-) -> L1Ctx {
+) -> N1Ctx {
     let chain = ref_chain.chain_blocks();
     let reference_best = chain
         .last()
@@ -209,7 +223,7 @@ fn build_l1_ctx(
             }
         })
         .collect();
-    L1Ctx {
+    N1Ctx {
         reference_best,
         reference_block_hashes,
         reference_chain,
@@ -224,15 +238,15 @@ fn build_l1_ctx(
     }
 }
 
-/// L2 facts: the emulator's ticket plan plus every ticket the NUT distributed
+/// N2 facts: the emulator's ticket plan plus every ticket the NUT distributed
 /// back (CE 131/132 frames), and the NUT-authored block's ticket extrinsic.
-fn build_l2_ctx(
+fn build_n2_ctx(
     contexts: &TicketContexts,
     data: &RealRunData,
     nut_tickets: Vec<NutTicketFacts>,
     nut_blocks: &[NutBlock],
     own_ticket_ids: Vec<[u8; 32]>,
-) -> L2Ctx {
+) -> N2Ctx {
     let target_epoch = data.target_epoch;
     let epoch_start_slot = target_epoch * jam_types::epoch_period();
     // Tickets for `target_epoch` can only be submitted during the epoch before
@@ -256,10 +270,10 @@ fn build_l2_ctx(
             (ids, Some(nut.block.header.slot))
         })
         .unwrap_or_default();
-    L2Ctx {
+    N2Ctx {
         target_epoch,
         epoch_start_slot,
-        emu_plan: plan_emu_tickets(&data.plan, contexts.planned()),
+        emu_plan: plan_emu_tickets(&data.plan, contexts.planned(), &lock(&data.deliveries)),
         nut_tickets,
         nut_block_ticket_ids,
         own_ticket_ids,
@@ -274,12 +288,31 @@ fn build_l2_ctx(
     }
 }
 
-/// Map the reference ticket plan onto the L2 lane's [`EmuTicket`] facts.
-fn plan_emu_tickets(plan: &[ScheduledTicket], ticket_ctx: &TicketCtx) -> Vec<EmuTicket> {
+/// Map the reference ticket plan onto the N2 lane's [`EmuTicket`] facts.
+///
+/// `deliveries` is what the emulator actually put on the wire, which is a
+/// subset of the plan: the sender withholds a ticket the node is in no state
+/// to accept, and a connection can die mid-run. The lane needs the difference,
+/// because a rule about a ticket the NUT never received was not exercised
+/// rather than broken.
+fn plan_emu_tickets(
+    plan: &[ScheduledTicket],
+    ticket_ctx: &TicketCtx,
+    deliveries: &[DeliveredTicket],
+) -> Vec<EmuTicket> {
     plan.iter()
         .map(|scheduled| {
             let ticket = &scheduled.ticket;
             EmuTicket {
+                // Keyed on the epoch as well as the id: the unknown-epoch
+                // probe reuses a real ticket's proof, so the two entries share
+                // an id and differ only in the epoch they name. Matching on
+                // the id alone marked the probe delivered whenever the ticket
+                // it borrowed from was.
+                delivered_at_ms: deliveries
+                    .iter()
+                    .find(|d| d.id == ticket.id && d.target_epoch == scheduled.target_epoch)
+                    .map(|d| d.delivered_at_ms),
                 id: ticket.id,
                 author: ticket.author as u16,
                 attempt: ticket.attempt,
@@ -434,7 +467,7 @@ mod tests {
     }
 
     /// Trace convention (`jamnp_s::trace::Direction`): `Tx` is NUT → peer,
-    /// `Rx` is peer → NUT. L2 judges the NUT, so tickets the emulator itself
+    /// `Rx` is peer → NUT. N2 judges the NUT, so tickets the emulator itself
     /// sent (`Rx`) must never be counted as NUT behaviour.
     #[test]
     fn run_collect_nut_tickets_ignores_harness_sent_frames() -> Result<(), ChainError> {
@@ -481,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn run_build_l1_from_nut_blocks() -> Result<(), ChainError> {
+    fn run_build_n1_from_nut_blocks() -> Result<(), ChainError> {
         let ref_chain = RefChain::tiny(0)?;
         let start = ref_chain.next_slot();
         let mut authored = None;
@@ -497,37 +530,37 @@ mod tests {
             block: block.clone(),
             announced_wall_ms: 1000,
         }];
-        let l1 = build_l1_ctx(&ref_chain, &nut_blocks, &[], Vec::new());
+        let n1 = build_n1_ctx(&ref_chain, &nut_blocks, &[], Vec::new());
 
-        assert_eq!(l1.imports.len(), 1, "one import per NUT block");
-        assert!(l1.imports[0].ok, "a re-authored block imports OK");
-        assert_eq!(l1.imports[0].header_root, block.header.hash().0);
-        assert_eq!(l1.imports[0].parent, block.header.parent.0);
+        assert_eq!(n1.imports.len(), 1, "one import per NUT block");
+        assert!(n1.imports[0].ok, "a re-authored block imports OK");
+        assert_eq!(n1.imports[0].header_root, block.header.hash().0);
+        assert_eq!(n1.imports[0].parent, block.header.parent.0);
         assert_eq!(
-            l1.imports[0].reference_parent_root,
-            Some(l1.imports[0].declared_parent_root),
+            n1.imports[0].reference_parent_root,
+            Some(n1.imports[0].declared_parent_root),
             "the reference agrees with the header about the parent's root"
         );
-        assert_eq!(l1.nut_blocks.len(), 1);
-        assert_eq!(l1.slot_period_ms, SLOT_PERIOD_MS);
+        assert_eq!(n1.nut_blocks.len(), 1);
+        assert_eq!(n1.slot_period_ms, SLOT_PERIOD_MS);
         assert_eq!(
-            l1.reference_block_hashes.len(),
+            n1.reference_block_hashes.len(),
             ref_chain.chain_blocks().len(),
             "reference block hashes cover the whole chain"
         );
         assert_eq!(
-            l1.reference_chain.len(),
-            l1.reference_block_hashes.len(),
+            n1.reference_chain.len(),
+            n1.reference_block_hashes.len(),
             "the chain timeline covers the same blocks, with their slots"
         );
         assert!(
-            l1.reference_chain.windows(2).all(|w| w[0].0 < w[1].0),
+            n1.reference_chain.windows(2).all(|w| w[0].0 < w[1].0),
             "the chain timeline is ascending by slot"
         );
         // The block was authored on the chain head, so the head as of its slot
         // is its parent.
         assert_eq!(
-            l1.reference_best_at(block.header.slot),
+            n1.reference_best_at(block.header.slot),
             Some(block.header.parent.0)
         );
         Ok(())
@@ -556,6 +589,13 @@ mod tests {
                 peer_plan.iter().all(|s| s.ticket.author as u16 == *peer),
                 "peer {peer} only delivers its own tickets"
             );
+            // The sender walks the plan in order and sleeps until each slot,
+            // so an out-of-order plan delays every ticket behind the late one.
+            assert!(
+                peer_plan.windows(2).all(|w| w[0].slot <= w[1].slot),
+                "peer {peer}'s plan is in delivery order: {:?}",
+                peer_plan.iter().map(|s| s.slot).collect::<Vec<_>>()
+            );
         }
         Ok(())
     }
@@ -567,10 +607,38 @@ mod tests {
         let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
         let nut_index = 5;
         let plan = plan_tickets(&tickets, nut_index, 1001, 84);
+        // Only the first ticket reached the wire: the rest stand for the ones
+        // the sender withheld, and the lane must be able to tell them apart.
+        let deliveries = vec![DeliveredTicket {
+            id: plan[0].ticket.id,
+            delivered_at_ms: 1,
+            target_epoch: plan[0].target_epoch,
+            probe: false,
+        }];
 
-        let emu_plan = plan_emu_tickets(&plan, &ticket_ctx);
+        let emu_plan = plan_emu_tickets(&plan, &ticket_ctx, &deliveries);
 
         assert_eq!(emu_plan.len(), plan.len());
+        assert_eq!(
+            emu_plan[0].delivered_at_ms,
+            Some(1),
+            "the delivered ticket carries the time it went out"
+        );
+        assert!(
+            emu_plan[1..].iter().all(|t| !t.delivered()),
+            "a planned ticket the emulator never sent is not marked delivered"
+        );
+        // The probe borrows the first ticket's proof and so shares its id,
+        // differing only in the epoch it names. Delivering the ticket must not
+        // mark the probe delivered too, or a run that withheld the probe would
+        // still demand the stream reset it never asked for.
+        let probe = emu_plan.last().expect("the plan ends with the probe");
+        assert_eq!(
+            probe.id, emu_plan[0].id,
+            "the probe reuses the first ticket"
+        );
+        assert_ne!(probe.target_epoch, emu_plan[0].target_epoch);
+        assert!(!probe.delivered(), "the probe was not delivered");
         for (emu, scheduled) in emu_plan.iter().zip(&plan) {
             assert_eq!(emu.id, scheduled.ticket.id);
             assert_eq!(emu.author as usize, scheduled.ticket.author);

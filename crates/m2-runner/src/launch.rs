@@ -7,8 +7,15 @@ use tokio::process::Child;
 
 /// Configuration for a NUT launch: everything the command templates reference.
 pub struct LaunchConfig {
-    /// Path to the generated spec file.
+    /// Path to the generated spec file in polkajam's native format.
+    ///
+    /// Only the polkajam preset reads this; a third-party image has no reason
+    /// to parse it.
     pub spec_path: PathBuf,
+    /// Path to the generated spec file in the M2 standard format
+    /// (`spec-m2.json`), which is what the environment contract hands a
+    /// third-party node.
+    pub m2_spec_path: PathBuf,
     /// Hex of the NUT's 32-byte Ed25519 secret.
     pub ed25519_secret_hex: String,
     /// Hex of the NUT's 32-byte Bandersnatch secret.
@@ -23,7 +30,7 @@ pub struct LaunchConfig {
     pub log_level: String,
 }
 
-/// Replaces the DESIGN.md §7 placeholders `{spec} {ed25519_secret}
+/// Replaces the DESIGN.md §7 placeholders `{spec} {m2_spec} {ed25519_secret}
 /// {bandersnatch_secret} {listen} {public_addr} {data} {log_level}` with `cfg`
 /// values. Unknown placeholders are rejected.
 ///
@@ -50,6 +57,7 @@ pub fn substitute(template: &str, cfg: &LaunchConfig) -> Result<String, LaunchEr
 fn value_of<'a>(name: &str, cfg: &'a LaunchConfig) -> Result<&'a str, LaunchError> {
     match name {
         "spec" => path_str(&cfg.spec_path),
+        "m2_spec" => path_str(&cfg.m2_spec_path),
         "ed25519_secret" => Ok(&cfg.ed25519_secret_hex),
         "bandersnatch_secret" => Ok(&cfg.bandersnatch_secret_hex),
         "listen" => Ok(&cfg.listen),
@@ -92,7 +100,12 @@ pub fn preset_polkajam(cfg: &LaunchConfig) -> String {
 /// initiate connections under the preferred-initiator rule). Config values are
 /// substituted; `{image}` is left for the caller to fill in.
 pub fn preset_docker(cfg: &LaunchConfig) -> String {
-    let spec = cfg.spec_path.display();
+    // `spec-m2.json`, not polkajam's native `spec.json`. The environment
+    // contract (§5.3) is the one thing a third-party node is told to parse,
+    // and handing it the oracle's internal format asked it to read a file it
+    // has no reason to understand. Both are written to the session directory
+    // either way, so the interim workaround was to go and find the right one.
+    let spec = cfg.m2_spec_path.display();
     let ed25519_secret = &cfg.ed25519_secret_hex;
     let bandersnatch_secret = &cfg.bandersnatch_secret_hex;
     let listen = &cfg.listen;
@@ -214,6 +227,7 @@ mod tests {
     fn test_config() -> LaunchConfig {
         LaunchConfig {
             spec_path: PathBuf::from("/tmp/m2-test/spec.json"),
+            m2_spec_path: PathBuf::from("/tmp/m2-test/spec-m2.json"),
             ed25519_secret_hex: "ab".repeat(32),
             bandersnatch_secret_hex: "cd".repeat(32),
             listen: "[::]:3000".to_string(),
@@ -355,7 +369,11 @@ mod tests {
         assert!(cmd.contains("docker run"));
         assert!(cmd.contains("--network host"));
         assert!(cmd.contains("JAM_M2=1"));
-        assert!(cmd.contains("JAM_M2_SPEC"));
+        assert!(cmd.contains("JAM_M2_SPEC=/tmp/m2-test/spec-m2.json"));
+        assert!(
+            !cmd.contains("/tmp/m2-test/spec.json"),
+            "the docker contract hands over the M2 spec, never polkajam's own"
+        );
         assert!(cmd.contains("JAM_M2_ED25519_SECRET"));
     }
 

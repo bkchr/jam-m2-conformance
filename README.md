@@ -10,14 +10,14 @@ artefact the NUT produces against the polkajam `hazmat` reference engine.
 
 ## Status
 
-**Implemented and green (2026-09):** P0 infrastructure complete plus conformance lanes **L0**
-(connectivity/sync), **L1** (block authoring), and **L2** (Safrole tickets). See [DESIGN.md](DESIGN.md)
+**Implemented and green (2026-09):** P0 infrastructure complete plus conformance lanes **N0**
+(connectivity/sync), **N1** (block authoring), and **N2** (Safrole tickets). See [DESIGN.md](DESIGN.md)
 for the design; this README documents the current implementation state.
 
-- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **348 passed / 0 failed** ✓,
+- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **363 passed / 0 failed** ✓,
   `cargo fmt --all --check` ✓, no `unwrap`/`panic`/`expect`/`todo!` in non-test code.
 - Dry-run baseline: `cargo run -p m2-runner -- --preset mock --dry-run --session-dir /tmp/x`
-  exits 0 with **all L0+L1+L2 checks HARD PASS** — the harness's own expectations are satisfiable.
+  exits 0 with **all N0+N1+N2 checks HARD PASS** — the harness's own expectations are satisfiable.
 
 ## Crates
 
@@ -25,9 +25,9 @@ for the design; this README documents the current implementation state.
 |---|---|
 | `jamnp-s` | Independent JAMNP-S: QUIC/TLS endpoint (quinn 0.11 + rustls), Ed25519 cert + custom SAN, ALPN `jamnp-s/1/<8hex>[/builder]`, preferred-initiator rule, kind-once stream framing (`u32 LE` messages), typed codecs for every UP/CE protocol (UP 0, CE 128–148), message trace recorder. |
 | `m2-reference` | Reference oracle over polkajam `hazmat`: `RefChain` (tiny 6-validator chain, deterministic authoring of emulated slots), NUT-block import + state diff (`import.rs`/`state.rs`), ticket generation/planning/verification (`tickets.rs`). |
-| `m2-emu` | Five emulated validators (skeletons — no core logic; all values/decisions injected from `m2-reference`): UP 0 announce, CE 128/129 serve, NUT-block fetch (L1), CE 131/132 ticket send/receive (L2). |
-| `m2-scenario` | The §5 DSL (`check`/`expect_subseq`/`log::check`) + hard-coded lanes: `l0.rs` (9 checks), `l1.rs` (6), `l2.rs` (5). |
-| `m2-runner` | CLI: keygen → spec → NUT launch (docker/polkajam presets) → connectivity → scenario (L0/L1/L2) → `report.md`/`findings.json`/trace → exit code. |
+| `m2-emu` | Five emulated validators (skeletons — no core logic; all values/decisions injected from `m2-reference`): UP 0 announce, CE 128/129 serve, NUT-block fetch (N1), CE 131/132 ticket send/receive (N2). |
+| `m2-scenario` | The §5 DSL (`check`/`expect_subseq`/`log::check`) + hard-coded lanes: `n0.rs` (9 checks), `n1.rs` (6), `n2.rs` (5). |
+| `m2-runner` | CLI: keygen → spec → NUT launch (docker/polkajam presets) → connectivity → scenario (N0/N1/N2) → `report.md`/`findings.json`/trace → exit code. |
 
 ## Build and run
 
@@ -47,25 +47,64 @@ cargo run -p m2-runner -- --seed 1 --validator-index 5 --base-port 40000 \
 
 CLI: `--seed` (run seed), `--validator-index` (default 5 — index 0 is degenerate for the
 preferred-initiator rule), `--base-port`, `--preset` (`polkajam`/`docker`/`mock`),
-`--session-dir`, `--startup-timeout`, `--observe-secs` (observation window), `--dry-run`.
+`--session-dir`, `--startup-timeout`, `--observe-secs` (observation window),
+`--lanes` (which lanes to grade, default `n0,n1,n2`; a lane left out is neither graded nor
+exercised, and `--lanes n0` skips ticket proving entirely), `--dry-run`.
 
 ## Real-surface results vs polkajam-as-NUT (2026-10)
 
 The harness runs end-to-end against the polkajam NUT and produces a genuine conformance
-report (`sessions/<id>/report/{report.md,findings.json}`, `traces/jamnp.{bin,json}`):
+report (`sessions/<id>/report/{report.md,findings.json}`, `traces/jamnp.{bin,json}`).
+`M2-status.md` records the milestone evidence in full, and how to point the suite at a
+third-party node. Latest runs, `sessions/fwd-3` and `sessions/fwd-4`: **130 and 107 checks,
+two hard findings each, both of them node defects.**
 
 - **N0 connectivity and sync**: 26/27 HARD PASS — real TLS 1.3 mutual handshake, Ed25519 cert +
   SAN, ALPN `jamnp-s/1/…` with a mismatched ALPN refused, preferred-initiator split, 21 `/builder`
   connections accepted, UP 0 handshake with genesis Final, and the node's own CE 128 and CE 129
   replies graded. One hard finding: `ce129_boundary_parent_before_child`.
 - **N1 authoring**: the node authors, the harness imports and grades each block — parent,
-  seal, prior and posterior state roots. One hard finding: a block that left an owed ticket
-  out with room to carry it (`l1_extrinsic_includes_delivered`).
+  seal, prior and posterior state roots. No hard findings in the latest runs.
 - **N2 Safrole tickets**: the node accepts the emulator's tickets, runs its own lottery and
   distributes to proxies; proofs, target epochs, attempt ranges, per-epoch caps, proxy
   routing and inclusion are all graded. One hard finding: a ticket for an epoch past the
-  node's horizon is rejected but the stream is not reset (`l2_unknown_epoch_reset_observed`).
-- Runner exits 1 (correct — hard findings exist).
+  node's horizon is rejected but the stream is not reset (`n2_unknown_epoch_reset_observed`).
+  The proxy-forwarding duty (`n2_proxy_duty_forwarded`) now passes — five times in `fwd-4`.
+- Runner exits 1 (correct — hard failures exist).
+
+**Every hard failure the harness has ever reported against this node but those two was its
+own.** Five have been found and closed, and they are one defect in five shapes: *the harness
+grading the node against its own intentions rather than against what happened on the wire.*
+
+- Ticket delivery ran on slot arithmetic with no readiness gate, so the first batch went out
+  while the node was still finalizing the chain it had just been seeded. polkajam refused those
+  tickets — `Error processing incoming ticket: finality lagging` — and the harness then graded
+  it for not forwarding or including them. The sender now holds each ticket until the node's
+  advertised finalized head is in the current epoch, and withholds one it cannot accept in
+  time. `finality lagging` has not appeared in a run since.
+- The lanes read the *plan* rather than the deliveries, so a ticket the emulator withheld was
+  still demanded of the node. A ticket that never went out is now *not exercised*, not a failure.
+- N1 demanded inclusion of the unknown-epoch probe — the one ticket the node is required to
+  refuse.
+- Each peer's plan was delivered out of slot order, so the ticket proxied to the NUT sat
+  behind a broadcast scheduled several slots later and arrived past any forwarding window.
+- **The CE 131/132 decoder rejected any ticket attempt above 1.** Under tiny a validator makes
+  four attempts, so every ticket numbered 2 or 3 failed to decode and was dropped silently —
+  a frame that will not decode is skipped, not reported. The node had sent it, the harness
+  never saw it, and the lane recorded that the node had not sent it. This is what
+  `n2_proxy_duty_forwarded` had been failing on all along: in `sessions/fwd-2` the node
+  forwarded its one proxied ticket to all five validators one slot after receiving it and was
+  graded as reaching none of them. A range the protocol parameters set does not belong in a
+  decoder; the N2 lane judges it as `n2_gen_attempt_in_range`, where an out-of-range attempt is
+  a reportable failure instead of an invisible one.
+
+**A single run is not a baseline.** Check counts range from 82 to 130 across runs, because which
+slots the node wins and when a proxied ticket arrives decide which rules can be demanded at all.
+The run now waits for the node to be able to accept tickets before laying the plan out, and
+trades a lottery it cannot exercise the proxy duty in for the next one, which makes the spread
+narrower — but it does not remove it. Grade a client over several runs, read the soft
+"not exercised" rows as coverage gaps rather than passes, and check a hard failure against the
+node's own log before reporting it upstream.
 
 **On reading the lanes.** Every check asserts what the *node* does. Several used to be recorded by
 the emulator's own serve path — the harness answering the node, then entering a pass for itself —
@@ -137,15 +176,15 @@ and pins `PvmBackend::Interpreter`.
 
 | Phase | Content | Status |
 |---|---|---|
-| P0 | `jamnp-s`, runner skeleton, L0 | ✅ implemented |
-| P1 | `m2-reference` wrapper, L1 authoring, L2 tickets | ✅ implemented |
-| P2 | L3 guaranteeing, L4 availability (erasure export) | ⏳ next |
-| P3 | L5 auditing/disputes, L6 preimages | ⏳ |
-| P4 | L7 adversarial, index rotation, IPv6, web UI | ⏳ |
+| P0 | `jamnp-s`, runner skeleton, N0 | ✅ implemented |
+| P1 | `m2-reference` wrapper, N1 authoring, N2 tickets | ✅ implemented |
+| P2 | N3 guaranteeing, N4 availability (erasure export) | ⏳ next |
+| P3 | N5 auditing/disputes, N6 preimages | ⏳ |
+| P4 | N7 adversarial, index rotation, IPv6, web UI | ⏳ |
 
 Iterate-later items: full 2-epoch observation + epoch-boundary alignment of the ticket window;
 independent (non-`import_block`) seal/entropy VRF re-verification; full M1-style keyvals diff on
-state-root mismatch; emulator↔emulator links; `polkajam-fuzz` reuse for L3+ (provisioners still
+state-root mismatch; emulator↔emulator links; `polkajam-fuzz` reuse for N3+ (provisioners still
 private).
 
 References:

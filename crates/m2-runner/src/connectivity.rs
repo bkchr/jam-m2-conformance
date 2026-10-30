@@ -1,5 +1,5 @@
 //! Connectivity probing and preferred-initiator planning (DESIGN.md §4 step 3,
-//! §11 L0 `preferred initiator` row). P0: probe the NUT's QUIC port, split the
+//! §11 N0 `preferred initiator` row). P0: probe the NUT's QUIC port, split the
 //! emulated validators by who dials first, and orchestrate the phase timing.
 
 use std::net::SocketAddr;
@@ -9,7 +9,7 @@ use ed25519_consensus::SigningKey;
 use jamnp_s::endpoint::{Endpoint, EndpointConfig, EndpointError};
 use jamnp_s::preferred::preferred_initiator;
 use m2_scenario::dsl::{ObsKind, ObsLog};
-use m2_scenario::scenarios::l0;
+use m2_scenario::scenarios::n0;
 
 /// How long the runner waits for the NUT's QUIC port to come up (§4 step 2).
 pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -101,7 +101,7 @@ pub fn plan_connectivity(emu_keys: &[[u8; 32]], nut_key: &[u8; 32]) -> Connectiv
 /// using it here would let one node-initiated connection suppress the fallback
 /// dial for every other peer too.
 pub fn should_fallback_dial(obs: &ObsLog, peer: u16) -> bool {
-    obs.first_from(peer, ObsKind::Other(l0::NUT_INITIATED))
+    obs.first_from(peer, ObsKind::Other(n0::NUT_INITIATED))
         .is_none()
 }
 
@@ -153,7 +153,7 @@ pub async fn run_connectivity(
 /// node's capacity rather than about how many we bothered to open.
 pub const BUILDER_CONNECTIONS: usize = 21;
 
-/// What the node did with the builder-role surface (DESIGN §11 L0).
+/// What the node did with the builder-role surface (DESIGN §11 N0).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuilderProbe {
     pub attempted: usize,
@@ -410,7 +410,7 @@ mod tests {
 
     #[test]
     fn no_fallback_once_the_nut_connected_to_that_peer() {
-        let obs = obs_with(&[(2, l0::NUT_INITIATED)]);
+        let obs = obs_with(&[(2, n0::NUT_INITIATED)]);
         assert!(!should_fallback_dial(&obs, 2));
     }
 
@@ -419,7 +419,7 @@ mod tests {
     /// every other peer, leaving them unconnected for the whole run.
     #[test]
     fn another_peers_connection_does_not_suppress_the_dial() {
-        let obs = obs_with(&[(1, l0::NUT_INITIATED)]);
+        let obs = obs_with(&[(1, n0::NUT_INITIATED)]);
         assert!(
             should_fallback_dial(&obs, 2),
             "peer 2 has no connection of its own and must still be dialled"
@@ -430,7 +430,7 @@ mod tests {
     /// its own activity on a peer must not read as the NUT having dialled.
     #[test]
     fn unrelated_observations_do_not_count_as_a_connection() {
-        let obs = obs_with(&[(2, l0::ENDPOINT_DIALED), (2, l0::CERT_SAN_OK)]);
+        let obs = obs_with(&[(2, n0::ENDPOINT_DIALED), (2, n0::CERT_SAN_OK)]);
         assert!(should_fallback_dial(&obs, 2));
     }
 

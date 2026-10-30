@@ -1,4 +1,4 @@
-//! L1 state snapshot/diff oracle: dumps the reference chain's storage trie at
+//! N1 state snapshot/diff oracle: dumps the reference chain's storage trie at
 //! a block hash as a typed `State` and diffs two states key-by-key.
 
 use std::collections::HashMap;

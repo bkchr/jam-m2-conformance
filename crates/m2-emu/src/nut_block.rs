@@ -1,4 +1,4 @@
-//! L1 block-fetch behavior: when the NUT announces a block that is not in the
+//! N1 block-fetch behavior: when the NUT announces a block that is not in the
 //! reference chain, the emulator fetches it over CE 128 and records it.
 
 use std::sync::Mutex;
@@ -109,7 +109,7 @@ pub async fn fetch_block(
 /// had a reason to build on.
 ///
 /// A refused import is not an error here — the block simply stays a fork, and
-/// `l1_header_seal` reports the refusal with its reason.
+/// `n1_header_seal` reports the refusal with its reason.
 fn adopt(ref_chain: &RefChain, block: &Block) {
     let _ = ref_chain.import_nut_block(block);
 }

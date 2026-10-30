@@ -16,7 +16,7 @@ use jamnp_s::{
     framing::{frame, FrameReader, CE128, CE129},
     trace::{Direction as TraceDir, Trace},
 };
-use m2_scenario::scenarios::l0::{Ce128Probe, Ce129Probe, ProbedBlock};
+use m2_scenario::scenarios::n0::{Ce128Probe, Ce129Probe, ProbedBlock};
 
 use crate::emu::{trace_record, EmuError, EmuShared};
 

@@ -31,7 +31,7 @@ pub struct GeneratedKeys {
 ///
 /// The default NUT index is 5 (not 0): the preferred-initiator rule
 /// (`simple.md:70-80`) is degenerate for trivial keys at index 0 — the NUT is
-/// never the preferred initiator, so NUT-initiated L0 checks can never fire.
+/// never the preferred initiator, so NUT-initiated N0 checks can never fire.
 pub fn generate(seed: u64, nut_index: usize, validator_count: usize) -> GeneratedKeys {
     // A run always has the NUT, so `validator_count > nut_index`.
     let keysets: Vec<SecretKeyset> = (0..validator_count)
