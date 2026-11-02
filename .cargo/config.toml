@@ -1,0 +1,8 @@
+# polkajam is a private repository, and cargo's built-in git transport cannot
+# authenticate to it in the environments this workspace is built in, while the
+# git CLI can -- it picks up the ssh agent, the `insteadOf` rewrites and the
+# credential helper that cargo's transport does not. Without this every build
+# fails at the fetch, which is why `CARGO_NET_GIT_FETCH_WITH_CLI=true` had to
+# be in each developer's environment. It belongs with the dependency it serves.
+[net]
+git-fetch-with-cli = true

@@ -150,6 +150,32 @@ impl ObsLog {
             .map(|(_, o)| o)
     }
 
+    /// First record of `kind` from `peer`, in observation order.
+    ///
+    /// [`ObsLog::first`] ignores the peer, which is wrong for any per-connection
+    /// decision: one peer's observation would answer for all of them.
+    pub fn first_from<K: Into<ObsKind>>(&self, peer: u16, kind: K) -> Option<&Obs> {
+        let kind = kind.into();
+        self.records
+            .iter()
+            .find(|(_, o)| o.peer == peer && o.kind == kind)
+            .map(|(_, o)| o)
+    }
+
+    /// Every peer with a record of `kind`, ascending and deduplicated.
+    pub fn peers_with<K: Into<ObsKind>>(&self, kind: K) -> Vec<u16> {
+        let kind = kind.into();
+        let mut peers: Vec<u16> = self
+            .records
+            .iter()
+            .filter(|(_, o)| o.kind == kind)
+            .map(|(_, o)| o.peer)
+            .collect();
+        peers.sort_unstable();
+        peers.dedup();
+        peers
+    }
+
     /// Last record of `kind`, in observation order.
     pub fn last<K: Into<ObsKind>>(&self, kind: K) -> Option<&Obs> {
         let kind = kind.into();
@@ -339,10 +365,17 @@ pub struct Check {
 }
 
 /// One assertion within a check.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `detail` carries the values behind a failure — the two state roots that
+/// disagreed, the ticket ids that were owed — so a finding says what went
+/// wrong rather than only which assertion did (DESIGN.md §11 N1 asks for an
+/// "M1-style diff report"). It is built only on failure and only where the
+/// check has something useful to say, so most results carry `None`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckResult {
     pub name: &'static str,
     pub outcome: Outcome,
+    pub detail: Option<String>,
 }
 
 /// Build a [`Check`] from an id, its fail severity, and the check closure.
@@ -370,7 +403,31 @@ pub mod log {
         } else {
             Outcome::Fail(severity)
         };
-        CheckResult { name, outcome }
+        CheckResult {
+            name,
+            outcome,
+            detail: None,
+        }
+    }
+
+    /// [`check`], plus a detail string describing *why* it failed.
+    ///
+    /// `detail` runs only on failure, so a check may format hashes or ticket
+    /// ids there without paying for it on the passing path.
+    pub fn check_detail(
+        name: &'static str,
+        pass: bool,
+        severity: Severity,
+        detail: impl FnOnce() -> String,
+    ) -> CheckResult {
+        if pass {
+            return check(name, pass, severity);
+        }
+        CheckResult {
+            name,
+            outcome: Outcome::Fail(severity),
+            detail: Some(detail()),
+        }
     }
 }
 
@@ -513,23 +570,40 @@ mod tests {
             log::check("x", false, Severity::Hard),
             CheckResult {
                 name: "x",
-                outcome: Outcome::Fail(Severity::Hard)
+                outcome: Outcome::Fail(Severity::Hard),
+                detail: None,
             }
         );
         assert_eq!(
             log::check("x", true, Severity::Hard),
             CheckResult {
                 name: "x",
-                outcome: Outcome::Pass
+                outcome: Outcome::Pass,
+                detail: None,
             }
         );
         assert_eq!(
             log::check("x", false, Severity::Soft),
             CheckResult {
                 name: "x",
-                outcome: Outcome::Fail(Severity::Soft)
+                outcome: Outcome::Fail(Severity::Soft),
+                detail: None,
             }
         );
+    }
+
+    /// A detail is built only on failure, and reaches the result verbatim.
+    #[test]
+    fn log_check_detail_only_on_failure() {
+        let passed = log::check_detail("x", true, Severity::Hard, || {
+            panic!("detail must not be built for a passing check")
+        });
+        assert_eq!(passed.outcome, Outcome::Pass);
+        assert_eq!(passed.detail, None);
+
+        let failed = log::check_detail("x", false, Severity::Hard, || "roots differ".to_string());
+        assert_eq!(failed.outcome, Outcome::Fail(Severity::Hard));
+        assert_eq!(failed.detail.as_deref(), Some("roots differ"));
     }
 
     #[test]

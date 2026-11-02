@@ -15,12 +15,23 @@
 //! | Kind | Decodes to |
 //! |------|------------|
 //! | UP 0 | `Handshake` (first message; announcements are separate) |
-//! | CE 128/129/136/137/138/139/140/143/147/148 | request side; falls back to the server-response side when the payload is a response |
+//! | CE 128/136/137/138/139/140/143/147/148 | request side; falls back to the server-response side when the payload is a response |
+//! | CE 129 | request side; else the response's **first** message (`BoundaryNodes`) when the payload is a whole number of 64-byte nodes, else its second (`KeyValues`) |
 //! | CE 133 | `initial` (`WorkPackageSubmission::decode_initial`) |
 //! | CE 134 | `SharingContext` (message 1; bundle/reply are separate) |
 //!
 //! Kinds 130 and 149..=152 are spec-known but refused ([`ProtoError::RefusedKind`]);
 //! any other byte is [`ProtoError::UnknownKind`].
+//!
+//! ## CE 129's two response messages
+//!
+//! A CE 129 response is two messages (`simple.md:300-302`), and both are
+//! size-implied sequences, so which one a payload is depends on its **position
+//! on the stream**, not its content. From `(kind, payload)` alone the two are
+//! not always separable: an empty payload is read as `BoundaryNodes` (the first
+//! message), and a `KeyValues` payload whose length happens to be a multiple of
+//! 64 is read the same way. A scanner that tracks stream state should classify
+//! by message index instead of calling this.
 
 use codec::Decode;
 use std::fmt;
@@ -36,7 +47,10 @@ pub enum Message {
     Ce128BlockRequest(ce128_129::BlockRequest),
     Ce128BlockResponse(ce128_129::BlockResponse),
     Ce129StateRequest(ce128_129::StateRequest),
-    Ce129StateResponse(ce128_129::StateResponse),
+    /// CE 129 response, message 1 (`simple.md:300`).
+    Ce129BoundaryNodes(ce128_129::BoundaryNodes),
+    /// CE 129 response, message 2 (`simple.md:301`).
+    Ce129KeyValues(ce128_129::KeyValues),
     Ce131Ticket(ce131_136::TicketDistribution),
     Ce132Ticket(ce131_136::TicketDistribution),
     Ce133Submission(ce131_136::WorkPackageSubmission),
@@ -77,7 +91,9 @@ impl Message {
         match self {
             Message::Up0Handshake(_) | Message::Up0Announcement(_) => UP,
             Message::Ce128BlockRequest(_) | Message::Ce128BlockResponse(_) => CE128,
-            Message::Ce129StateRequest(_) | Message::Ce129StateResponse(_) => CE129,
+            Message::Ce129StateRequest(_)
+            | Message::Ce129BoundaryNodes(_)
+            | Message::Ce129KeyValues(_) => CE129,
             Message::Ce131Ticket(_) => CE131,
             Message::Ce132Ticket(_) => CE132,
             Message::Ce133Submission(_) => CE133,
@@ -111,7 +127,8 @@ pub fn encode_message(msg: &Message) -> Result<(u8, Vec<u8>), ProtoError> {
         Message::Ce128BlockRequest(m) => m.encode(),
         Message::Ce128BlockResponse(m) => m.encode(),
         Message::Ce129StateRequest(m) => m.encode(),
-        Message::Ce129StateResponse(m) => m.encode(),
+        Message::Ce129BoundaryNodes(m) => m.encode(),
+        Message::Ce129KeyValues(m) => m.encode(),
         Message::Ce131Ticket(m) | Message::Ce132Ticket(m) => m.encode(),
         Message::Ce133Submission(m) => m.encode_initial(),
         Message::Ce134SharingContext(m) => m.encode(),
@@ -148,7 +165,14 @@ pub fn from_kind_and_payload(kind: u8, payload: &[u8]) -> Result<Message, ProtoE
     match kind {
         framing::UP => decode_full::<up0::Handshake>(payload).map(Up0Handshake),
         framing::CE128 => decode_pair(payload, Ce128BlockRequest, Ce128BlockResponse),
-        framing::CE129 => decode_pair(payload, Ce129StateRequest, Ce129StateResponse),
+        framing::CE129 => decode_full::<ce128_129::StateRequest>(payload)
+            .map(Ce129StateRequest)
+            .or_else(|_| {
+                // Both response messages are size-implied sequences, so only a
+                // whole number of 64-byte nodes can be the boundary-node one.
+                decode_full::<ce128_129::BoundaryNodes>(payload).map(Ce129BoundaryNodes)
+            })
+            .or_else(|_| decode_full::<ce128_129::KeyValues>(payload).map(Ce129KeyValues)),
         framing::CE131 => decode_full::<ce131_136::TicketDistribution>(payload).map(Ce131Ticket),
         framing::CE132 => decode_full::<ce131_136::TicketDistribution>(payload).map(Ce132Ticket),
         framing::CE133 => ce131_136::WorkPackageSubmission::decode_initial(&mut &payload[..])
@@ -250,7 +274,10 @@ impl std::error::Error for ProtoError {}
 mod tests {
     use super::*;
     use crate::codec::{
-        ce128_129::{BlockRequest, BlockResponse, Direction, StateRequest, StateResponse},
+        ce128_129::{
+            BlockRequest, BlockResponse, BoundaryNode, BoundaryNodes, Direction, KeyValue,
+            KeyValues, StateRequest,
+        },
         ce131_136::{
             GuaranteedWorkReport, SharingBundle, SharingContext, SharingReply, Ticket,
             TicketDistribution, WorkPackageSubmission, WorkReportReply, WorkReportRequest,
@@ -308,15 +335,18 @@ mod tests {
                 hash: [0u8; 32].into(),
                 len: 0,
                 erasure_root: [0u8; 32].into(),
+                erasure_shards: 0,
                 exports_root: [0u8; 32].into(),
                 exports_count: 0,
             },
             context: RefineContext {
                 anchor: [0u8; 32].into(),
+                anchor_slot: 0,
                 state_root: [0u8; 32].into(),
                 beefy_root: [0u8; 32].into(),
                 lookup_anchor: [0u8; 32].into(),
                 lookup_anchor_slot: 0,
+                lookup_anchor_state_root: [0u8; 32].into(),
                 prerequisites: Default::default(),
             },
             core_index: 0,
@@ -357,10 +387,13 @@ mod tests {
                 end: [0x22; 31],
                 max_size: 4096,
             }),
-            Ce129StateResponse(StateResponse {
-                boundary_nodes: vec![],
-                entries: vec![],
-            }),
+            // Both samples must be unambiguous from the payload alone: one
+            // 64-byte node, and a key/value whose length is not a multiple of 64.
+            Ce129BoundaryNodes(BoundaryNodes(vec![BoundaryNode([0x5a; 64])])),
+            Ce129KeyValues(KeyValues(vec![KeyValue {
+                key: [0x33; 31],
+                value: vec![0xde, 0xad, 0xbe, 0xef],
+            }])),
             Ce131Ticket(TicketDistribution {
                 epoch_index: 42,
                 ticket: ticket(),

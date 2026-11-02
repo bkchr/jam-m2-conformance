@@ -1,6 +1,8 @@
 # JAM M2 Conformance Harness — Design
 
-Status: draft for review, 2026-09-03. Implementation now exists for P0 + L0/L1/L2 (see README.md); this document remains the design contract.
+Status: draft for review, 2026-09-03. Implementation now exists for P0 + N0/N1/N2 (see README.md); this document remains the design contract.
+
+**Lane naming.** The M2 lanes are **N0–N7** (`N` for network). They were called L0–L7 in the first draft of this document and in the code, which collides with M1's L0–L3 — a different axis that already appears in the published conformance matrix. The reports this harness emits go to the same teams that read that matrix, so the names had to differ. The one L0–L3 left in this document, under §1, is M1's and stays as it is.
 
 ## 1. Goals and non-goals
 
@@ -124,7 +126,7 @@ expression power of code. Rust is also the language a conformance reviewer alrea
 // src/scenarios/l3.rs — one function per scenario
 use crate::{check, log, stimulus::{self, *}, expect::Seq as *};
 
-/// L3: a work-package is submitted to the NUT; it must refine, share (CE 134 ×2)
+/// N3: a work-package is submitted to the NUT; it must refine, share (CE 134 ×2)
 /// with its co-guarantors and report (CE 135) to all validators.
 pub fn wp_refine_and_report(net: &mut Net, sched: &mut Scheduler) -> CheckId {
     check("wp_refine_and_report", sched, |obs| {
@@ -257,7 +259,7 @@ executes their checks and renders a coverage table (§11 row ↔ scenario module
 - Default tolerances (soft in v1): NUT block announced within `[slot_start, slot_start + 4 s]`;
   assurance received within `[slot_start − 4 s, slot_start]`; CE 135 within 2 slots of the CE 133
   submission; tickets delivered before slot 10 of the epoch. Ordering and validity are hard.
-- Lane sizing: L0 one epoch; most lanes two to three epochs so that epoch transitions and the
+- Lane sizing: N0 one epoch; most lanes two to three epochs so that epoch transitions and the
   rotation period (4 slots) are exercised.
 
 ## 7. Node-under-test contract
@@ -295,14 +297,16 @@ Bandersnatch secrets, BLS optional (zero placeholder as in polkajam `keyset.rs:7
 | variable | meaning |
 |---|---|
 | `JAM_M2=1` | enable M2 conformance mode |
-| `JAM_M2_SPEC` | path to the spec file above |
+| `JAM_M2_SPEC` | path to the spec file above, in the M2 standard format (`spec-m2.json`) |
 | `JAM_M2_ED25519_SECRET`, `JAM_M2_BANDERSNATCH_SECRET` | hex, 32 bytes each |
 | `JAM_M2_LISTEN` | `[::]:<port>` |
 | `JAM_M2_PUBLIC_ADDR` | `<ipv6>:<port>` as carried in genesis metadata |
 | `JAM_M2_DATA_PATH`, `JAM_M2_LOG_LEVEL` | as in M1 |
 
-**Launch.** Command template with placeholders `{spec} {ed25519_secret} {bandersnatch_secret}
-{listen} {public_addr} {data} {log_level}`. Presets: `docker` (host network, because QUIC is UDP and
+**Launch.** Command template with placeholders `{spec} {m2_spec} {ed25519_secret}
+{bandersnatch_secret} {listen} {public_addr} {data} {log_level}`. `{spec}` is polkajam's native
+format and `{m2_spec}` the M2 standard one; a preset passes whichever its node reads, and only
+the `polkajam` preset reads the former. Presets: `docker` (host network, because QUIC is UDP and
 the NUT must be able to *initiate* connections under the preferred-initiator rule) and `polkajam`
 (`polkajam --chain {spec} run --key-seed-file … --listen-ip … --port … --mode validator`, once the
 spec adapter exists).
@@ -375,7 +379,7 @@ substitute for the catalogue.
 
 - ALPN: polkajam emits `jamnp-s/0/…` (`node/src/net/mod.rs:99-105`); the spec says version `1`
   (`:51-53`). Polkajam's prefix `u32::from_be_bytes(first 4 bytes)` formatted `{:08x}` equals "first
-  8 nibbles". Polkajam as NUT fails L0 until it bumps the version.
+  8 nibbles". Polkajam as NUT fails N0 until it bumps the version.
 - Polkajam defines CE 149–152 (GRANDPA vote/commit/state/catch-up), absent from the spec. The harness
   refuses unknown kinds; a NUT opening an unknown kind is a soft finding.
 - Finality is unspecified in jam-np (polkajam default `FinalityMode::Dummy`, `node/src/node/config.rs:404`).
@@ -390,7 +394,7 @@ substitute for the catalogue.
 
 Line numbers refer to `jam-np/simple.md`. Severity is hard unless marked *(soft)*.
 
-### L0 — connectivity and sync (1 epoch)
+### N0 — connectivity and sync (1 epoch)
 
 | Check | Emulated side | Assertions on NUT | Faults → expected |
 |---|---|---|---|
@@ -405,7 +409,7 @@ Line numbers refer to `jam-np/simple.md`. Severity is hard unless marked *(soft)
 | CE 128 fetch | reply to NUT requests | after an announcement of an unknown block the NUT fetches missing parents; never re-fetches known blocks *(soft)* | wrong-parent block → not announced; reset → retry another peer *(soft)* |
 | CE 129 `:267-303` | ranges with various Max Size | 31-byte sorted keys in range; boundary nodes parent-before-child, no duplicates `:275-281`; size cap `:283-285`; `len++` values | unknown hash → reset |
 
-### L1 — block authoring, fuzzer-validated (2 epochs)
+### N1 — block authoring, fuzzer-validated (2 epochs)
 
 | Check | Assertions | Faults |
 |---|---|---|
@@ -416,7 +420,7 @@ Line numbers refer to `jam-np/simple.md`. Severity is hard unless marked *(soft)
 | Extrinsic completeness | includes every valid ticket/guarantee/assurance/preimage/judgment delivered ≥2 s before the slot; excludes every injected-invalid item; assurance anchor = parent | item delivered 200 ms before the slot → inclusion optional *(soft)* |
 | Skipped slots | emulated author skips → NUT's next block has the gap and the correct parent | — |
 
-### L2 — Safrole tickets, CE 131/132 `:305-349` (2 epochs)
+### N2 — Safrole tickets, CE 131/132 `:305-349` (2 epochs)
 
 | Check | Assertions | Faults |
 |---|---|---|
@@ -426,7 +430,7 @@ Line numbers refer to `jam-np/simple.md`. Severity is hard unless marked *(soft)
 | Inclusion | NUT block has all valid received tickets, sorted, deduplicated; empty extrinsic when slot ≥ 10 | duplicate → once |
 | Unknown epoch | ticket for epoch+2 → reset `:335-337` | — |
 
-### L3 — guaranteeing, CE 133/146/134/135/148 (2–3 epochs)
+### N3 — guaranteeing, CE 133/146/134/135/148 (2–3 epochs)
 
 | Check | Assertions | Faults |
 |---|---|---|
@@ -438,7 +442,7 @@ Line numbers refer to `jam-np/simple.md`. Severity is hard unless marked *(soft)
 | CE 135 receive → inclusion | NUT includes reference-signed reports in its next block | one signature; unassigned signer; stale slot; duplicate core → excluded |
 | CE 148 `:650-673` | serves `[Segment] ++ [Import-Proof]` for own bundles; prefers 148 over 139/140 *(soft)*; ≤3072 per stream | corrupt segment → fallback to 139/140 `:660` |
 
-### L4 — availability, CE 137/138/139/140/141 (2 epochs)
+### N4 — availability, CE 137/138/139/140/141 (2 epochs)
 
 | Check | Assertions | Faults |
 |---|---|---|
@@ -450,7 +454,7 @@ Line numbers refer to `jam-np/simple.md`. Severity is hard unless marked *(soft)
 | CE 139/140 serve `:597-648` | 139 `[SegShard]`; 140 adds justification discriminator 0/1/2 `:637`; ≤2·3072 | over limit → reset |
 | CE 139/140 fetch | NUT reconstructs imports from 2 shards; 139 first, 140 on inconsistency `:625-630` | one corrupt shard → retries via 140 and completes |
 
-### L5 — auditing and disputes, CE 136/144/145/147 (2–3 epochs)
+### N5 — auditing and disputes, CE 136/144/145/147 (2–3 epochs)
 
 | Check | Assertions | Faults |
 |---|---|---|
@@ -461,7 +465,7 @@ Line numbers refer to `jam-np/simple.md`. Severity is hard unless marked *(soft)
 | CE 136 `:487-504` | serves held reports; on an unknown negatively-judged report requests it from the judging peer `:494-495` | — |
 | Later tranches | two or more emulated auditors no-show → NUT sends a tranche-n announcement 8 s later with `[sₙ(w) ++ len++[No-Show]]` `:769-775` | — |
 
-### L6 — preimages, CE 142/143 (1–2 epochs)
+### N6 — preimages, CE 142/143 (1–2 epochs)
 
 | Check | Assertions | Faults |
 |---|---|---|
@@ -470,7 +474,7 @@ Line numbers refer to `jam-np/simple.md`. Severity is hard unless marked *(soft)
 | Serve | returns the bytes, FIN | unknown → reset |
 | Inclusion | in the next NUT block, sorted; lookups updated | no longer requested → excluded |
 
-### L7 — adversarial and robustness (cross-cutting)
+### N7 — adversarial and robustness (cross-cutting)
 
 | Fault | Expected |
 |---|---|
@@ -493,17 +497,17 @@ Out of scope: GRANDPA/BEEFY (no JAMNP-S spec). Finality is emulated by the harne
 3. Is finality/GRANDPA in scope for M2? → no; harness-defined finality, documented.
 4. Which jam-np timings are normative? → soft in v1; ordering and validity hard.
 5. Required protocols → CE 129 required; CE 147/148 optional (fallback to 138/139 verified);
-   CE 136 required only in L5.
+   CE 136 required only in N5.
 6. jam-np has no tags → pin the commit hash in every report; ask for tagging.
-7. NUT index → 0 in all lanes; L7 rotates it.
+7. NUT index → 0 in all lanes; N7 rotates it.
 8. Clock → shared host clock, NTP-synced, 250 ms drift budget.
 
 ## 13. Roadmap
 
 | phase | content |
 |---|---|
-| P0 | polkajam prerequisite PRs (§8); `jamnp-s` crate (endpoint, cert, ALPN, framing, all codecs); runner skeleton; L0 |
-| P1 | `m2-reference` wrapper; L1 authoring validation; L2 tickets |
-| P2 | L3 guaranteeing; L4 availability (erasure coding export) |
-| P3 | L5 auditing/disputes; L6 preimages |
-| P4 | L7 adversarial, index rotation, IPv6 variant; fuzz web UI integration; public trace format |
+| P0 | polkajam prerequisite PRs (§8); `jamnp-s` crate (endpoint, cert, ALPN, framing, all codecs); runner skeleton; N0 |
+| P1 | `m2-reference` wrapper; N1 authoring validation; N2 tickets |
+| P2 | N3 guaranteeing; N4 availability (erasure coding export) |
+| P3 | N5 auditing/disputes; N6 preimages |
+| P4 | N7 adversarial, index rotation, IPv6 variant; fuzz web UI integration; public trace format |

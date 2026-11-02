@@ -10,6 +10,7 @@ use jam_std_common::{
 use crate::chain::{ChainError, RefChain};
 
 /// Ticket context for a target epoch.
+#[derive(Clone)]
 pub struct TicketCtx {
     /// Serialized bandersnatch public keys of the designated validators.
     pub pks: Vec<[u8; 32]>,
@@ -53,8 +54,15 @@ pub struct ScheduledTicket {
 
 impl RefChain {
     /// Ticket context for the current head state: serialized bandersnatch
-    /// public keys of the designated validators and the tickets entropy
-    /// (entropy buffer entry 1, current after the upcoming epoch change).
+    /// public keys of the designated validators and the tickets entropy.
+    ///
+    /// The entropy is buffer entry *2*, which is what a node checks a
+    /// submitted ticket against. Entry 1 looks plausible -- it is what entry 2
+    /// becomes after the next epoch change -- and it is what this read, so
+    /// every ticket the emulator ever offered was rejected with "invalid
+    /// ticket signature". It went unnoticed because the two agree whenever an
+    /// epoch boundary happens to fall between proving and delivery, which a
+    /// genesis anchored far enough in the past made likely.
     pub fn ticket_ctx(&self) -> Result<TicketCtx, ChainError> {
         let storage = self.harness().storage(None);
         let validators = storage
@@ -63,13 +71,13 @@ impl RefChain {
         let pks = validators.iter().map(|v| v.bandersnatch.0).collect();
         let entropy = storage
             .entropy()
-            .map_err(|e| ChainError::Tickets(format!("entropy: {e}")))?[1]
+            .map_err(|e| ChainError::Tickets(format!("entropy: {e}")))?[2]
             .0;
         Ok(TicketCtx { pks, entropy })
     }
 
     /// Generate tickets for every keystore-backed author (the emulated set,
-    /// excluding the NUT), one per attempt up to `tickets_attempts_number()`.
+    /// excluding the NUT), one per attempt up to `tickets_per_validator(max_val_count())`.
     pub fn generate_tickets(&self, ctx: &TicketCtx) -> Result<Vec<EmulatedTicket>, ChainError> {
         let pks: Vec<bandersnatch::Public> =
             ctx.pks.iter().map(|p| bandersnatch::Public(*p)).collect();
@@ -80,7 +88,7 @@ impl RefChain {
                 continue;
             }
             let prover = ring_vrf::RingContext::prover(&pks, author);
-            for attempt in 0..jam_types::tickets_attempts_number() {
+            for attempt in 0..jam_types::tickets_per_validator(jam_types::max_val_count()) {
                 let message = bandersnatch::Message::TicketSeal(Entropy(ctx.entropy), attempt);
                 let signature = keystore
                     .bandersnatch_ring_sign(pk, &message, &[], &prover)
@@ -121,37 +129,138 @@ pub fn first_delivery_slot(now_slot: u32) -> u32 {
     }
 }
 
+/// The slots in which a ticket for `target_epoch` may still be submitted,
+/// given that the earliest the emulator can deliver is `first_slot`.
+///
+/// Tickets for epoch `e` are submitted during epoch `e - 1` and only before
+/// its tail (`epoch_tail_start`). `None` when that window has already closed —
+/// the honest answer when ticket generation ran long enough to miss it, and
+/// better than scheduling deliveries the node is obliged to refuse.
+pub fn submission_window(first_slot: u32, target_epoch: u32) -> Option<(u32, u32)> {
+    let period = jam_types::epoch_period();
+    let epoch_start = target_epoch.checked_sub(1)?.checked_mul(period)?;
+    let start = first_slot.max(epoch_start);
+    // `epoch_tail_start` is the first slot of the tail, so the last slot that
+    // still accepts tickets is the one before it.
+    let end = epoch_start + jam_types::epoch_tail_start() - 1;
+    (start <= end).then_some((start, end))
+}
+
+/// The latest epoch phase at which a ticket's arrival still obliges the
+/// validator it was proxied to to forward it.
+///
+/// A proxy forwards within a window inside the lottery, not at the instant it
+/// receives: it delays to avoid revealing when the generator sent, and stops
+/// well before the tail. Where exactly that window sits belongs to the node,
+/// so the harness takes the lottery's first half — early enough that any
+/// window must still be open. `None` when the lottery is too short for any
+/// phase to qualify.
+///
+/// This is the planning side of the rule `m2_scenario::ctx` judges by; the two
+/// are tied together by `m2-runner`'s `forwardable_phases_match_the_judged_rule`.
+pub fn last_forwardable_phase() -> Option<u32> {
+    (jam_types::epoch_tail_start() / 2).checked_sub(1)
+}
+
+/// Whether the window still open for `target_epoch` can exercise the proxy
+/// forwarding duty at all.
+///
+/// A CE 131 delivery goes out at the window's first slot, which is as early as
+/// the harness can place it. If that slot is already past the forwardable
+/// phases then nothing in this epoch can be, and a run laid out against it
+/// grades the proxy duty as "not exercised" however well the node behaves.
+/// The caller's answer to a `false` here is to wait for the next epoch, which
+/// costs slots and buys the whole of the next lottery.
+pub fn window_can_exercise_forwarding(first_slot: u32, target_epoch: u32) -> bool {
+    let Some(last) = last_forwardable_phase() else {
+        return false;
+    };
+    let Some((start, _)) = submission_window(first_slot, target_epoch) else {
+        return false;
+    };
+    start % jam_types::epoch_period() <= last
+}
+
 /// Schedule delivery of each ticket within the epoch submission window.
 ///
-/// A ticket whose proxy is the NUT goes via CE 131 at `epoch_start + 1`; any
-/// other ticket is delivered via CE 132 at a deterministic slot in
-/// `[epoch_start + 1, epoch_start + 5]` (round-robin by author index).
+/// A ticket whose proxy is the NUT goes via CE 131 at the window's first slot;
+/// any other ticket is delivered via CE 132 at a deterministic slot spread
+/// across the window (round-robin by author index).
+///
+/// The schedule is clamped to [`submission_window`], so no delivery lands in
+/// the epoch tail or after the target epoch has already begun. The old
+/// schedule ran `first_slot..first_slot + 5` unconditionally, which in a run
+/// that started late in an epoch put most deliveries past the tail and the
+/// rest inside the target epoch itself, where every one of them is correctly
+/// refused.
 pub fn plan_tickets(
     tickets: &[EmulatedTicket],
     nut_index: usize,
     first_slot: u32,
     target_epoch: u32,
 ) -> Vec<ScheduledTicket> {
-    tickets
+    let Some((start, end)) = submission_window(first_slot, target_epoch) else {
+        return Vec::new();
+    };
+    let span = end - start + 1;
+    let mut scheduled: Vec<ScheduledTicket> = tickets
         .iter()
         .map(|t| {
             if t.proxy == nut_index {
                 ScheduledTicket {
                     ticket: t.clone(),
                     delivery: TicketDelivery::Ce131,
-                    slot: first_slot,
+                    slot: start,
                     target_epoch,
                 }
             } else {
                 ScheduledTicket {
                     ticket: t.clone(),
                     delivery: TicketDelivery::Ce132,
-                    slot: first_slot + (t.author % 5) as u32,
+                    slot: start + (t.author as u32 % span),
                     target_epoch,
                 }
             }
         })
-        .collect()
+        .collect();
+    scheduled.extend(unknown_epoch_probe(tickets, target_epoch, end));
+    scheduled
+}
+
+/// The unknown-epoch probe (`simple.md:335-337`): one ticket labelled for an
+/// epoch past the node's horizon, which it must answer by resetting the
+/// stream.
+///
+/// It reuses a real ticket's proof, so no second round of ring-VRF proving is
+/// needed: the node rejects the distribution on its epoch before the proof is
+/// ever in question. Delivered last, in the window's final slot, so a node
+/// that answered by dropping the connection instead cannot cost the run its
+/// legitimate deliveries. Without it nothing in a run exercises the rule, and
+/// a check over a rule nothing exercised reports coverage the run never had.
+fn unknown_epoch_probe(
+    tickets: &[EmulatedTicket],
+    target_epoch: u32,
+    last_slot: u32,
+) -> Option<ScheduledTicket> {
+    // `target_epoch` is already the epoch after the current one, so `+ 1` is
+    // the first epoch no validator can hold the entropy for yet.
+    let unknown = target_epoch.checked_add(1)?;
+    Some(ScheduledTicket {
+        ticket: tickets.first()?.clone(),
+        delivery: TicketDelivery::Ce132,
+        slot: last_slot,
+        target_epoch: unknown,
+    })
+}
+
+/// The ticket id carried by a ring signature: its VRF output.
+///
+/// A ticket announced over CE 131/132 is just an attempt index and a proof;
+/// the id a block's extrinsic is keyed by is derived from the proof, so the
+/// harness can recognise the node's own tickets in its own blocks without
+/// having been told them.
+pub fn ticket_id(proof: &[u8; 784]) -> [u8; 32] {
+    ring_vrf::Signature(*proof).vrf_output().0
 }
 
 /// Verify a ticket's ring signature against the context's validator ring.
@@ -178,13 +287,13 @@ mod tests {
 
     #[test]
     fn tickets_generate_and_verify() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(1..6)?;
+        let chain = RefChain::tiny(0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         assert!(!tickets.is_empty(), "expected emulated tickets");
         assert_eq!(
             tickets.len(),
-            5 * jam_types::tickets_attempts_number() as usize
+            5 * jam_types::tickets_per_validator(jam_types::max_val_count()) as usize
         );
         for t in &tickets {
             assert!(
@@ -199,7 +308,7 @@ mod tests {
 
     #[test]
     fn ticket_wrong_attempt_fails_verify() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(1..6)?;
+        let chain = RefChain::tiny(0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         let t = &tickets[0];
@@ -221,42 +330,171 @@ mod tests {
 
     #[test]
     fn plan_slots_within_window() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(1..6)?;
+        let chain = RefChain::tiny(0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         let nut_index = 0;
-        let first = 1001;
-        let plan = plan_tickets(&tickets, nut_index, first, 42);
+        let period = jam_types::epoch_period();
+        let target_epoch = 42;
+        // Early in epoch 41, so the whole submission window is still ahead.
+        let first = 41 * period + 1;
+        let (start, end) = submission_window(first, target_epoch).expect("window is open");
+        let plan = plan_tickets(&tickets, nut_index, first, target_epoch);
         assert!(!plan.is_empty());
         for s in &plan {
             assert!(
-                (first..first + 5).contains(&s.slot),
-                "slot {} outside submission window",
+                (start..=end).contains(&s.slot),
+                "slot {} outside submission window {start}..={end}",
                 s.slot
             );
-            assert_eq!(s.target_epoch, 42);
+            if s.target_epoch != target_epoch {
+                // The unknown-epoch probe, which is the one entry deliberately
+                // labelled for an epoch outside the plan's.
+                continue;
+            }
             if s.ticket.proxy == nut_index {
                 assert_eq!(s.delivery, TicketDelivery::Ce131);
-                assert_eq!(s.slot, first);
+                assert_eq!(s.slot, start);
             } else {
                 assert_eq!(s.delivery, TicketDelivery::Ce132);
             }
         }
-        let plan2 = plan_tickets(&tickets, nut_index, first, 42);
+        let plan2 = plan_tickets(&tickets, nut_index, first, target_epoch);
         assert_eq!(plan, plan2);
         Ok(())
     }
 
+    /// Every planned slot must be one in which the node may still accept a
+    /// ticket: inside the epoch before the target, and before that epoch's
+    /// tail. A schedule that violates either is a harness fault reported as a
+    /// node one.
     #[test]
-    fn entropy_from_storage_index_1() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(1..6)?;
+    fn plan_never_schedules_past_the_tail_or_into_the_target_epoch() -> Result<(), ChainError> {
+        let chain = RefChain::tiny(0)?;
+        let ctx = chain.ticket_ctx()?;
+        let tickets = chain.generate_tickets(&ctx)?;
+        let period = jam_types::epoch_period();
+        let tail = jam_types::epoch_tail_start();
+        let target_epoch = 42;
+
+        for offset in 0..period {
+            let plan = plan_tickets(&tickets, 0, 41 * period + offset, target_epoch);
+            for s in &plan {
+                assert_eq!(s.slot / period, 41, "slot {} left epoch 41", s.slot);
+                assert!(s.slot % period < tail, "slot {} is in the tail", s.slot);
+                assert!(
+                    s.slot >= 41 * period + offset,
+                    "slot {} is in the past",
+                    s.slot
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A window that opens inside the lottery's first half can exercise the
+    /// proxy duty; one that opens later cannot, however much of the
+    /// submission window is still ahead of it. The distinction is the whole
+    /// point: a run starting at phase 8 still delivers tickets the node must
+    /// accept, and still cannot ask it to forward one.
+    #[test]
+    fn forwarding_window_closes_before_the_submission_window() -> Result<(), ChainError> {
+        // Applies the tiny parameters process-wide, which the phase
+        // arithmetic below reads.
+        let _chain = RefChain::tiny(0)?;
+        let period = jam_types::epoch_period();
+        let last = last_forwardable_phase().expect("tiny leaves room to forward");
+        let target_epoch = 42;
+
+        for offset in 0..period {
+            let first = 41 * period + offset;
+            let can = window_can_exercise_forwarding(first, target_epoch);
+            match submission_window(first, target_epoch) {
+                // `first_delivery_slot` is not applied here, so the window
+                // opens at `first` itself.
+                Some((start, _)) => assert_eq!(
+                    can,
+                    start % period <= last,
+                    "offset {offset}: window opens at phase {}",
+                    start % period
+                ),
+                None => assert!(!can, "offset {offset}: a closed window forwards nothing"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Every plan carries exactly one ticket for an epoch past the node's
+    /// horizon, so each run exercises the reset rule (`simple.md:335-337`).
+    /// It is delivered last and reuses a real proof, costing no extra
+    /// ring-VRF work and no legitimate delivery.
+    #[test]
+    fn plan_carries_one_unknown_epoch_probe() -> Result<(), ChainError> {
+        let chain = RefChain::tiny(0)?;
+        let ctx = chain.ticket_ctx()?;
+        let tickets = chain.generate_tickets(&ctx)?;
+        let period = jam_types::epoch_period();
+        let target_epoch = 42;
+        let first = 41 * period + 1;
+        let (_, end) = submission_window(first, target_epoch).expect("window is open");
+
+        let plan = plan_tickets(&tickets, 0, first, target_epoch);
+        let probes: Vec<&ScheduledTicket> = plan
+            .iter()
+            .filter(|s| s.target_epoch != target_epoch)
+            .collect();
+        assert_eq!(probes.len(), 1, "exactly one probe");
+        assert!(
+            probes[0].target_epoch > target_epoch,
+            "the probe names an epoch past the one being submitted into"
+        );
+        assert_eq!(probes[0].slot, end, "the probe is delivered last");
+        assert_eq!(probes[0].delivery, TicketDelivery::Ce132);
+        assert_eq!(
+            plan.first().map(|s| s.target_epoch),
+            Some(target_epoch),
+            "the plan still opens on a real ticket, which is what the \
+             emulator reads the plan's own epoch from"
+        );
+        Ok(())
+    }
+
+    /// Generation that overruns the submission window yields no plan at all,
+    /// rather than deliveries the node must refuse.
+    #[test]
+    fn plan_is_empty_once_the_window_has_closed() -> Result<(), ChainError> {
+        let chain = RefChain::tiny(0)?;
+        let ctx = chain.ticket_ctx()?;
+        let tickets = chain.generate_tickets(&ctx)?;
+        let period = jam_types::epoch_period();
+        let tail = jam_types::epoch_tail_start();
+
+        // The first slot of the tail: nothing may still be submitted.
+        let first = 41 * period + tail;
+        assert_eq!(submission_window(first, 42), None);
+        assert!(plan_tickets(&tickets, 0, first, 42).is_empty());
+        // And the slot before it still has room for exactly one.
+        assert_eq!(
+            submission_window(first - 1, 42),
+            Some((first - 1, first - 1))
+        );
+        Ok(())
+    }
+
+    /// A submitted ticket is checked against entropy buffer entry 2, so that
+    /// is what it must be sealed with. This test previously asserted entry 1
+    /// -- pinning the defect in place rather than catching it -- and the node
+    /// rejected every ticket the emulator offered.
+    #[test]
+    fn tickets_are_sealed_with_the_entropy_a_node_checks_them_against() -> Result<(), ChainError> {
+        let chain = RefChain::tiny(0)?;
         let ctx = chain.ticket_ctx()?;
         assert_eq!(ctx.entropy.len(), 32);
         let storage = chain.harness().storage(None);
         let entropy = storage
             .entropy()
             .map_err(|e| ChainError::Tickets(e.to_string()))?;
-        assert_eq!(ctx.entropy, entropy[1].0);
+        assert_eq!(ctx.entropy, entropy[2].0);
         Ok(())
     }
 
