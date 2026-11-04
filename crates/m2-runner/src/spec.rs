@@ -169,21 +169,61 @@ pub fn m2_spec(id: &str, chain_spec: &ChainSpec) -> Result<M2Spec, SpecError> {
     }
     Ok(M2Spec {
         id: id.to_string(),
-        parameters: serde_json::json!({
-            "validators": 6,
-            "cores": 2,
-            "epoch_length": 12,
-            "ticket_submission_end": 10,
-            "tickets_per_validator": 3,
-            "rotation_period": 4,
-            "max_lookup_anchor_age": 24,
-            "min_turnaround_period": 32,
-            "slot_period_sec": 6,
-        }),
+        parameters: named_parameters(),
         genesis_header,
         genesis_state: serde_json::Value::Object(genesis_state),
         bootnodes: Vec::new(),
     })
+}
+
+/// The §7 named parameters, read from the protocol parameters this run is
+/// operating under rather than written out as literals.
+///
+/// They were literals, and one of them disagreed with the run around it:
+/// `tickets_per_validator` said 3 while the harness, the reference engine and
+/// the node under test all used 4. The spec file is the environment contract,
+/// so a third-party node configured from it would have made three ticket
+/// attempts an epoch and been graded against four — and the fourth attempt of
+/// every emulated author, which the harness does send, would have looked to it
+/// like a ticket over the cap.
+///
+/// Deriving them closes the only way the contract and the behaviour can
+/// disagree, for the same reason `prepare-nut.sh` reads its revision from
+/// `Cargo.toml` rather than carrying a copy.
+///
+/// `tiny_spec` applies [`jam_types::ProtocolParameters::tiny`], and those
+/// parameters are process-wide, so every caller that reaches here through it
+/// reads the tiny set.
+fn named_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "validators": jam_types::max_val_count(),
+        "cores": jam_types::core_count(),
+        "epoch_length": jam_types::epoch_period(),
+        "ticket_submission_end": jam_types::epoch_tail_start(),
+        "tickets_per_validator": attempts_per_validator(),
+        "rotation_period": jam_types::rotation_period(),
+        "max_lookup_anchor_age": jam_types::max_lookup_anchor_age(),
+        "min_turnaround_period": jam_types::min_turnaround_period(),
+        "slot_period_sec": jam_types::slot_period_sec(),
+    })
+}
+
+/// Ticket attempts one validator may make per epoch — 4 under tiny.
+///
+/// Not a declared parameter but a quantity derived from two that are,
+/// `(2 × epoch_period) ÷ val_count` rounded up, which the node applies as the
+/// cap at all three points it matters: generation, the CE 131 attempt check,
+/// and the Safrole state transition.
+///
+/// It was a declared `tickets_attempts_number` of 3 until GP 0.8.0 replaced it
+/// with this derivation (polkajam `7b7993c8`, #1024). The pin is after that
+/// change and so is upstream, so 4 is the live figure; DESIGN §2's `N = 3` is
+/// the pre-0.8.0 one. Worth re-reading on a re-pin all the same, because it is
+/// the number a parameter rework would move most quietly —
+/// `m2_spec_parameters_match_the_engine` is what fails if it does. See
+/// DESIGN §10.
+fn attempts_per_validator() -> jam_types::TicketAttempt {
+    jam_types::tickets_per_validator(jam_types::max_val_count())
 }
 
 /// Writes `dir/spec-m2.json` and returns its path. The id is taken from `spec`.
@@ -242,20 +282,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The named parameters the node is handed are the ones the run uses.
+    ///
+    /// Both halves matter and they fail differently. Against `jam_types`: a
+    /// parameter that drifts from the engine makes the contract a lie, which
+    /// is what `tickets_per_validator: 3` was while everything around it used
+    /// 4. Against the literals: those are tiny as this revision defines it, so
+    /// a re-pin that moves one says so here rather than in a live run — see
+    /// `attempts_per_validator`, the one most likely to move.
+    #[test]
+    fn m2_spec_parameters_match_the_engine() {
+        let chain_spec = tiny_spec(&loopback_ips(), &ports(), 0).expect("tiny spec builds");
+        let spec = m2_spec("m2-test", &chain_spec).expect("m2 spec builds");
+        let param = |name: &str| {
+            spec.parameters[name]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{name} is a number"))
+        };
+
+        assert_eq!(param("validators"), u64::from(jam_types::max_val_count()));
+        assert_eq!(param("cores"), u64::from(jam_types::core_count()));
+        assert_eq!(param("epoch_length"), u64::from(jam_types::epoch_period()));
+        assert_eq!(
+            param("ticket_submission_end"),
+            u64::from(jam_types::epoch_tail_start())
+        );
+        assert_eq!(
+            param("tickets_per_validator"),
+            u64::from(super::attempts_per_validator())
+        );
+        assert_eq!(
+            param("rotation_period"),
+            u64::from(jam_types::rotation_period())
+        );
+        assert_eq!(
+            param("max_lookup_anchor_age"),
+            u64::from(jam_types::max_lookup_anchor_age())
+        );
+        assert_eq!(
+            param("min_turnaround_period"),
+            u64::from(jam_types::min_turnaround_period())
+        );
+        assert_eq!(param("slot_period_sec"), jam_types::slot_period_sec());
+
+        // Tiny at the pinned revision. A re-pin that moves one of these is a
+        // deliberate act (Cargo.toml's re-pin policy) and must be recorded.
+        assert_eq!(param("validators"), 6);
+        assert_eq!(param("cores"), 2);
+        assert_eq!(param("epoch_length"), 12);
+        assert_eq!(param("ticket_submission_end"), 10);
+        assert_eq!(
+            param("tickets_per_validator"),
+            4,
+            "tiny derives four attempts from (2 x 12) / 6; it was a declared 3 \
+             before GP 0.8.0, so this is the parameter a re-pin moves most quietly"
+        );
+        assert_eq!(param("rotation_period"), 4);
+        assert_eq!(param("max_lookup_anchor_age"), 24);
+        assert_eq!(param("min_turnaround_period"), 32);
+        assert_eq!(param("slot_period_sec"), 6);
+    }
+
+    /// The attempt cap the harness generates against is the one the node
+    /// enforces, so no emulated author offers a ticket over the cap.
+    ///
+    /// `m2-reference`'s generator and `m2-runner`'s two context builders all
+    /// read `tickets_per_validator(max_val_count())`; this holds the spec file
+    /// handed to a third-party node to the same quantity.
+    #[test]
+    fn the_declared_attempt_cap_is_the_one_tickets_are_generated_against() {
+        let chain_spec = tiny_spec(&loopback_ips(), &ports(), 0).expect("tiny spec builds");
+        let spec = m2_spec("m2-test", &chain_spec).expect("m2 spec builds");
+
+        let declared = spec.parameters["tickets_per_validator"]
+            .as_u64()
+            .expect("the attempt cap is a number");
+        let generated = jam_types::tickets_per_validator(jam_types::max_val_count());
+
+        assert_eq!(
+            declared,
+            u64::from(generated),
+            "the spec file declares {declared} attempt(s) per validator and the \
+             harness generates {generated}; a node configured from the file would \
+             be graded against a cap it was never told"
+        );
+    }
+
     #[test]
     fn m2_spec_shape_and_consistency() {
         let chain_spec = tiny_spec(&loopback_ips(), &ports(), 0).expect("tiny spec builds");
         let spec = m2_spec("m2-test", &chain_spec).expect("m2 spec builds");
-
-        assert_eq!(spec.parameters["validators"], 6);
-        assert_eq!(spec.parameters["cores"], 2);
-        assert_eq!(spec.parameters["epoch_length"], 12);
-        assert_eq!(spec.parameters["ticket_submission_end"], 10);
-        assert_eq!(spec.parameters["tickets_per_validator"], 3);
-        assert_eq!(spec.parameters["rotation_period"], 4);
-        assert_eq!(spec.parameters["max_lookup_anchor_age"], 24);
-        assert_eq!(spec.parameters["min_turnaround_period"], 32);
-        assert_eq!(spec.parameters["slot_period_sec"], 6);
 
         assert!(spec.genesis_header.starts_with("0x"));
         let bytes = hex::decode(&spec.genesis_header[2..]).expect("valid hex header");
@@ -281,6 +397,15 @@ mod tests {
     /// header and authoring fails with `BestBlockChanged`.
     #[test]
     fn genesis_is_anchored_to_the_current_epoch() {
+        // Before the anchor is computed, not after. `current_epoch_start_slot`
+        // divides by `epoch_period()`, which is the full 600 until the tiny
+        // parameters are applied, and `tiny_spec` applies them several lines
+        // too late to help. The test passed only when another test in the same
+        // process had already applied them, so it failed whenever it ran alone
+        // or first — a race on process-wide state, not a flake.
+        jam_types::ProtocolParameters::tiny()
+            .apply()
+            .expect("tiny parameters apply");
         let anchor = m2_reference::chain::current_epoch_start_slot();
         let chain_spec = tiny_spec(&loopback_ips(), &ports(), anchor).expect("tiny spec builds");
         let period = jam_types::epoch_period();

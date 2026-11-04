@@ -6,16 +6,17 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use codec::Decode;
 use jamnp_s::codec::ce131_136::TicketDistribution;
-use jamnp_s::framing::{CE131, CE132};
+use jamnp_s::codec::up0::{Announcement, Handshake};
+use jamnp_s::framing::{CE131, CE132, UP};
 use jamnp_s::trace::{Direction as TraceDir, Trace};
 use m2_reference::chain::RefChain;
 use m2_reference::tickets::{
     first_delivery_slot, plan_tickets, verify_ticket, EmulatedTicket, ScheduledTicket, TicketCtx,
-    TicketDelivery as ReferenceDelivery,
+    TicketDelivery as ReferenceDelivery, TicketFault as ReferenceFault,
 };
 use m2_scenario::ctx::{
-    DeliveredTicket, EmuTicket, ImportFact, N1Ctx, N2Ctx, NutBlock, NutTicketFacts,
-    TicketDelivery as CtxDelivery, SLOT_PERIOD_MS,
+    DeliveredTicket, EmuTicket, ImportFact, N1Ctx, N2Ctx, NutBlock, NutBlockTickets, NutFinal,
+    NutTicketFacts, TicketDelivery as CtxDelivery, TicketFault as CtxFault, SLOT_PERIOD_MS,
 };
 
 use crate::scenario::RunCtx;
@@ -80,6 +81,24 @@ pub(crate) fn schedule_tickets(
     )
 }
 
+/// Map the reference crate's fault kind onto the lane's mirror of it.
+///
+/// The two enums are deliberate duplicates: `m2-scenario` cannot name
+/// `m2-reference`'s, which it holds only as a dev-dependency. This function is
+/// the single place they meet, so a variant added to one and not the other
+/// fails to compile here rather than silently grading the wrong thing.
+pub(crate) fn map_fault(fault: ReferenceFault) -> CtxFault {
+    match fault {
+        ReferenceFault::BadProof => CtxFault::BadProof,
+        ReferenceFault::WrongProxy => CtxFault::WrongProxy,
+        ReferenceFault::StaleEpoch => CtxFault::StaleEpoch,
+        ReferenceFault::BadAttempt => CtxFault::BadAttempt,
+        ReferenceFault::Duplicate => CtxFault::Duplicate,
+        ReferenceFault::Late => CtxFault::Late,
+        ReferenceFault::UnknownEpoch => CtxFault::UnknownEpoch,
+    }
+}
+
 /// The ticket plan split per emulated validator, keyed by peer index, each
 /// peer's tickets in the order they are to be delivered.
 ///
@@ -115,6 +134,7 @@ pub(crate) fn build_real_run_ctx(
     let nut_blocks = lock(&data.nut_blocks);
     let contexts = ticket_contexts(data);
     let nut_tickets = collect_nut_tickets(trace, &contexts);
+    let nut_finals = collect_nut_finals(trace);
     // Every ticket the node announced is one it legitimately held, whether it
     // ran the lottery for it or is forwarding it as proxy. Both lanes need
     // this to tell "the node invented a ticket" from "the node is a validator".
@@ -128,7 +148,14 @@ pub(crate) fn build_real_run_ctx(
         &lock(&data.deliveries),
         own_ticket_ids.clone(),
     );
-    let n2 = build_n2_ctx(&contexts, data, nut_tickets, &nut_blocks, own_ticket_ids);
+    let n2 = build_n2_ctx(
+        &contexts,
+        data,
+        nut_tickets,
+        nut_finals,
+        &nut_blocks,
+        own_ticket_ids,
+    );
     RunCtx {
         n0,
         n1: Some(n1),
@@ -244,6 +271,7 @@ fn build_n2_ctx(
     contexts: &TicketContexts,
     data: &RealRunData,
     nut_tickets: Vec<NutTicketFacts>,
+    nut_finals: Vec<NutFinal>,
     nut_blocks: &[NutBlock],
     own_ticket_ids: Vec<[u8; 32]>,
 ) -> N2Ctx {
@@ -255,29 +283,35 @@ fn build_n2_ctx(
     // could not legally have carried -- a check no node could pass once a run
     // outlived the epoch it generated for.
     let submission_epoch = target_epoch.saturating_sub(1);
-    let (nut_block_ticket_ids, nut_block_slot) = nut_blocks
+    // Every block of that epoch, ascending. Taking only the newest left the
+    // lane's prohibitions -- no faulted ticket, nothing the harness never
+    // sent -- asserted of one block out of however many the node authored.
+    let mut blocks: Vec<&NutBlock> = nut_blocks
         .iter()
         .filter(|nut| nut.block.header.slot / jam_types::epoch_period() == submission_epoch)
-        .max_by_key(|nut| nut.block.header.slot)
-        .map(|nut| {
-            let ids = nut
+        .collect();
+    blocks.sort_by_key(|nut| nut.block.header.slot);
+    let nut_blocks_in_epoch: Vec<NutBlockTickets> = blocks
+        .into_iter()
+        .map(|nut| NutBlockTickets {
+            slot: nut.block.header.slot,
+            ticket_ids: nut
                 .block
                 .extrinsic
                 .tickets
                 .iter()
                 .map(|t| t.id().0)
-                .collect();
-            (ids, Some(nut.block.header.slot))
+                .collect(),
         })
-        .unwrap_or_default();
+        .collect();
     N2Ctx {
         target_epoch,
         epoch_start_slot,
         emu_plan: plan_emu_tickets(&data.plan, contexts.planned(), &lock(&data.deliveries)),
         nut_tickets,
-        nut_block_ticket_ids,
+        nut_blocks: nut_blocks_in_epoch,
+        nut_finals,
         own_ticket_ids,
-        nut_block_slot,
         nut_index: data.nut_index as u16,
         emulated_peers: data.emu_indices.iter().map(|&i| i as u16).collect(),
         slot_period_ms: SLOT_PERIOD_MS,
@@ -303,16 +337,23 @@ fn plan_emu_tickets(
     plan.iter()
         .map(|scheduled| {
             let ticket = &scheduled.ticket;
+            // By plan index, not by `(id, epoch)`. Three faults reuse an
+            // honest ticket's proof, so they share its id, and `Duplicate`
+            // shares its epoch too -- the pair stopped identifying a delivery
+            // the moment the catalogue grew past the one probe it was widened
+            // for.
+            let delivery = deliveries
+                .iter()
+                .find(|d| d.plan_index == scheduled.plan_index);
             EmuTicket {
                 // Keyed on the epoch as well as the id: the unknown-epoch
                 // probe reuses a real ticket's proof, so the two entries share
                 // an id and differ only in the epoch they name. Matching on
                 // the id alone marked the probe delivered whenever the ticket
                 // it borrowed from was.
-                delivered_at_ms: deliveries
-                    .iter()
-                    .find(|d| d.id == ticket.id && d.target_epoch == scheduled.target_epoch)
-                    .map(|d| d.delivered_at_ms),
+                delivered_at_ms: delivery.map(|d| d.delivered_at_ms),
+                refused: delivery.is_some_and(|d| d.refused),
+                fault: scheduled.fault.map(map_fault),
                 id: ticket.id,
                 author: ticket.author as u16,
                 attempt: ticket.attempt,
@@ -346,6 +387,10 @@ fn collect_nut_tickets(trace: &Trace, contexts: &TicketContexts) -> Vec<NutTicke
             Some(NutTicketFacts {
                 epoch,
                 ticket,
+                // The wire carries attempt and proof; the id is the proof's
+                // VRF output, and the lane needs it to judge the proxy the
+                // node chose.
+                id: m2_reference::tickets::ticket_id(&ticket.proof),
                 peer: rec.peer_index,
                 // The stream kind the node chose, not a guess from the peer
                 // it reached: CE 131 names a proxy, CE 132 names everyone.
@@ -355,6 +400,37 @@ fn collect_nut_tickets(trace: &Trace, contexts: &TicketContexts) -> Vec<NutTicke
                 },
                 verified: contexts.verify(epoch, ticket.attempt, &ticket.proof),
                 received_at_ms: rec.wall_ts,
+            })
+        })
+        .collect()
+}
+
+/// Every `Final` the NUT advertised over UP 0, in the order it sent them.
+///
+/// Both UP 0 message shapes carry one: the handshake that opens the stream
+/// and every announcement after it. They are told apart the way the
+/// emulator's own UP 0 handler tells them apart (`m2-emu`'s `handle_up0`) --
+/// an announcement is a header followed by the `Final`, a handshake is the
+/// `Final` followed by the leaves, and only one of the two decodes -- so a
+/// frame that is neither is skipped rather than guessed at.
+fn collect_nut_finals(trace: &Trace) -> Vec<NutFinal> {
+    trace
+        .records()
+        .iter()
+        .filter(|rec| rec.direction == TraceDir::Tx && rec.stream_kind == UP)
+        .filter_map(|rec| {
+            let slot = match Announcement::decode(&mut &rec.bytes[..]) {
+                Ok(announcement) => announcement.final_block.slot,
+                Err(_) => {
+                    Handshake::decode(&mut &rec.bytes[..])
+                        .ok()?
+                        .final_block
+                        .slot
+                }
+            };
+            Some(NutFinal {
+                at_ms: rec.wall_ts,
+                slot,
             })
         })
         .collect()
@@ -463,6 +539,52 @@ mod tests {
         let facts = collect_nut_tickets(&trace, &contexts_for(7, ticket_ctx));
         assert_eq!(facts[0].verified, None, "epoch 9 has no context");
         assert_eq!(facts[0].delivery, CtxDelivery::Ce132);
+        Ok(())
+    }
+
+    /// The NUT's own account of finality, which only UP 0 carries. Both
+    /// message shapes hold a `Final` and the collector tells them apart by
+    /// which one decodes, so a handshake must not be read as an
+    /// announcement -- the two put the `Final` at opposite ends.
+    #[test]
+    fn run_collect_nut_finals_reads_both_up0_shapes() -> Result<(), ChainError> {
+        use jam_types::HeaderHash;
+        use jamnp_s::codec::up0::Final;
+
+        let chain = RefChain::tiny(0)?;
+        let start = chain.next_slot();
+        let block = (start..start + 24)
+            .find_map(|slot| chain.author_block(slot).ok().flatten())
+            .ok_or_else(|| ChainError::Chain("no emulated slot in 24 slots".into()))?;
+        let final_at = |slot| Final {
+            header_hash: HeaderHash::from([slot as u8; 32]),
+            slot,
+        };
+        let handshake = Handshake {
+            final_block: final_at(7),
+            leaves: vec![],
+        };
+        let announcement = Announcement {
+            header: (**block.header).clone(),
+            final_block: final_at(9),
+        };
+
+        let mut trace = Trace::default();
+        trace.push(record(TraceDir::Tx, 2, UP, handshake.encode(), 1000));
+        trace.push(record(TraceDir::Tx, 2, UP, announcement.encode(), 2000));
+        // The emulator's own announcements travel the same stream, and they
+        // say what the *harness* finalized.
+        trace.push(record(TraceDir::Rx, 2, UP, announcement.encode(), 3000));
+        trace.push(record(TraceDir::Tx, 2, UP, vec![0xde, 0xad], 4000));
+
+        let finals = collect_nut_finals(&trace);
+
+        assert_eq!(
+            finals.iter().map(|f| (f.at_ms, f.slot)).collect::<Vec<_>>(),
+            vec![(1000, 7), (2000, 9)],
+            "both NUT-sent shapes are read, in wire order; the harness's own \
+             announcement and the undecodable frame are not"
+        );
         Ok(())
     }
 
@@ -607,13 +729,15 @@ mod tests {
         let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
         let nut_index = 5;
         let plan = plan_tickets(&tickets, nut_index, 1001, 84);
-        // Only the first ticket reached the wire: the rest stand for the ones
+        // Only the first entry reached the wire: the rest stand for the ones
         // the sender withheld, and the lane must be able to tell them apart.
         let deliveries = vec![DeliveredTicket {
+            plan_index: plan[0].plan_index,
             id: plan[0].ticket.id,
             delivered_at_ms: 1,
             target_epoch: plan[0].target_epoch,
             probe: false,
+            refused: false,
         }];
 
         let emu_plan = plan_emu_tickets(&plan, &ticket_ctx, &deliveries);
@@ -622,37 +746,84 @@ mod tests {
         assert_eq!(
             emu_plan[0].delivered_at_ms,
             Some(1),
-            "the delivered ticket carries the time it went out"
+            "the delivered entry carries the time it went out"
         );
         assert!(
             emu_plan[1..].iter().all(|t| !t.delivered()),
             "a planned ticket the emulator never sent is not marked delivered"
         );
-        // The probe borrows the first ticket's proof and so shares its id,
-        // differing only in the epoch it names. Delivering the ticket must not
-        // mark the probe delivered too, or a run that withheld the probe would
-        // still demand the stream reset it never asked for.
-        let probe = emu_plan.last().expect("the plan ends with the probe");
-        assert_eq!(
-            probe.id, emu_plan[0].id,
-            "the probe reuses the first ticket"
-        );
-        assert_ne!(probe.target_epoch, emu_plan[0].target_epoch);
-        assert!(!probe.delivered(), "the probe was not delivered");
         for (emu, scheduled) in emu_plan.iter().zip(&plan) {
             assert_eq!(emu.id, scheduled.ticket.id);
             assert_eq!(emu.author as usize, scheduled.ticket.author);
             assert_eq!(emu.proxy as usize, scheduled.ticket.proxy);
             assert_eq!(emu.slot, scheduled.slot);
-            assert!(emu.valid, "generated tickets verify");
-            let ce131 = scheduled.delivery == ReferenceDelivery::Ce131;
-            assert_eq!(
-                ce131,
-                scheduled.ticket.proxy == nut_index,
-                "Ce131 iff proxy is the NUT"
+            assert_eq!(emu.fault.is_some(), scheduled.fault.is_some());
+            // `valid` is the ring-signature verdict and nothing else. Two
+            // faults fail it: the corrupted proof, and -- less obviously --
+            // the bad attempt, because the attempt is part of the message the
+            // ring signs, so relabelling it invalidates the proof for the new
+            // value. That is not a second defect in the ticket: the node
+            // checks the attempt bound before it looks at the proof, and
+            // refuses it on the attempt. Every other fault verifies perfectly
+            // well, which is exactly why `valid` cannot stand in for `fault`.
+            let signature_breaks = matches!(
+                scheduled.fault,
+                Some(ReferenceFault::BadProof) | Some(ReferenceFault::BadAttempt)
             );
-            assert_eq!(emu.delivery == CtxDelivery::Ce131, ce131);
+            assert_eq!(
+                emu.valid, !signature_breaks,
+                "{:?} verification",
+                scheduled.fault
+            );
         }
+        Ok(())
+    }
+
+    /// Deliveries are matched to plan entries by plan index. Ids do not
+    /// serve: three faults reuse an honest ticket's proof, and the duplicate
+    /// fault shares its target epoch as well, so the `(id, epoch)` pair this
+    /// used to key on picks out two entries at once.
+    #[test]
+    fn deliveries_are_matched_by_plan_index_not_by_ticket_id() -> Result<(), ChainError> {
+        let ref_chain = RefChain::tiny(0)?;
+        let ticket_ctx = ref_chain.ticket_ctx()?;
+        let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
+        let plan = plan_tickets(&tickets, 5, 1001, 84);
+
+        let duplicate = plan
+            .iter()
+            .find(|s| s.fault == Some(ReferenceFault::Duplicate))
+            .expect("the plan injects a duplicate");
+        let twin = plan
+            .iter()
+            .find(|s| s.fault.is_none() && s.ticket.id == duplicate.ticket.id)
+            .expect("whose honest delivery is still in the plan");
+        assert_eq!(
+            twin.target_epoch, duplicate.target_epoch,
+            "the two share an id and an epoch, which is what made the old key fail"
+        );
+
+        // Deliver only the duplicate.
+        let deliveries = vec![DeliveredTicket {
+            plan_index: duplicate.plan_index,
+            id: duplicate.ticket.id,
+            delivered_at_ms: 7,
+            target_epoch: duplicate.target_epoch,
+            probe: false,
+            refused: false,
+        }];
+
+        let emu_plan = plan_emu_tickets(&plan, &ticket_ctx, &deliveries);
+
+        assert_eq!(
+            emu_plan[duplicate.plan_index].delivered_at_ms,
+            Some(7),
+            "the entry that was delivered is marked delivered"
+        );
+        assert!(
+            !emu_plan[twin.plan_index].delivered(),
+            "and its twin, which shares id and epoch, is not"
+        );
         Ok(())
     }
 }

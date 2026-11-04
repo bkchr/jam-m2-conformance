@@ -389,6 +389,17 @@ substitute for the catalogue.
   the harness offers only `jamnp-s/1/…`.
 - CE 134's explicit `Shard Count` is the newest spec change (jam-np commit `06a2fe9`); verify
   polkajam's `WorkPackageSharing` sends it before using it as reference.
+- Ticket attempts per validator: §2 records tiny `N = 3` from the `w3f/jamtestvectors` README, and
+  that figure predates GP 0.8.0. Polkajam carried an explicit `tickets_attempts_number` (tiny = 3)
+  until `7b7993c8 GP 0.8.0 (#1024)` replaced it with a quantity derived from two parameters that
+  remain, `tickets_per_validator(val_count) = ⌈2·E / V⌉ = ⌈24/6⌉ = `**`4`**, applied as the cap at
+  all three points it matters — generation, the CE 131 attempt check, and the Safrole STF. This
+  harness targets GP 0.8.0 (§2) and pins a revision after that change, so **4 is the live figure**:
+  it generates and judges against 4, and `spec-m2.json` declares 4. §2's `N = 3` is the stale one
+  and is kept only as the provenance of the number. Confirm with the conformance group that the
+  tiny vector set has followed GP 0.8.0 here; if it has not, a node built to the vectors will make
+  three attempts where the harness expects four, and `m2-runner`'s
+  `m2_spec_parameters_match_the_engine` is where that surfaces.
 
 ## 11. Lanes and check catalogue
 
@@ -424,11 +435,68 @@ Line numbers refer to `jam-np/simple.md`. Severity is hard unless marked *(soft)
 
 | Check | Assertions | Faults |
 |---|---|---|
-| Generation, step 1 (NUT → proxy, CE 131) | ≤3 tickets per epoch; proxy from the next-epoch list; from slot ≥ epoch_start+1; `Epoch(next) ++ Attempt(<3) ++ [u8;784]` `:340-346`; proof verifies against ring root and η'₂ | — |
-| Self-proxy (CE 132) | tickets whose proxy is the NUT go directly to all current validators `:322-325` | — |
-| Proxy duty (accept 131, send 132) | verify, then forward to all five emulated; earliest slot ≥ epoch_start+1, spread until slot 5 `:329-332`; stop after finalized inclusion *(soft)* | bad proof / wrong proxy / wrong epoch → no forward, no inclusion; slot ≥ 10 → not included |
-| Inclusion | NUT block has all valid received tickets, sorted, deduplicated; empty extrinsic when slot ≥ 10 | duplicate → once |
+| Generation, step 1 (NUT → proxy, CE 131) | ≤ `A` tickets per epoch; proxy drawn from the next-epoch validator set, by the selection rule below *(soft)*; from slot ≥ epoch_start+1; `Epoch(next) ++ Attempt(<A) ++ [u8;784]` `:340-346`; proof verifies against ring root and η'₂ | — |
+| Self-proxy (CE 132) | tickets the NUT generated **and** is itself the proxy for go directly to all current validators `:322-325`. A ticket it forwards as another validator's proxy is the row below, not this one | — |
+| Proxy duty (accept 131, send 132) | verify, then forward to all five emulated; the forward is not before the arrival and lands inside the lottery (phase < `Y`); window per the formula below *(soft)*; stop after finalized inclusion *(soft)* | bad proof / wrong proxy / wrong epoch → no forward, no inclusion; slot ≥ `Y` → not included |
+| Inclusion | NUT blocks have all valid received tickets, sorted, deduplicated; empty extrinsic when slot ≥ 10 | duplicate → once |
 | Unknown epoch | ticket for epoch+2 → reset `:335-337` | — |
+
+`A` is the per-validator attempt cap, `tickets_per_validator(V) = ⌈2·E / V⌉` — **4** under
+tiny, not the `N = 3` of §2, which predates GP 0.8.0 (§10). `Y` is `epoch_tail_start`, 10
+under tiny.
+
+**Proxy selection.** `proxy_index(ticket_id, V) = u32::from_be(ticket_id[28..32]) mod V`,
+over the *next-epoch* validator set. Whether this is normative or implementation-defined is
+§12 question 9; the harness grades it soft until that is settled. Note that set membership
+on its own is not gradable with this topology — the harness holds endpoints only for
+validators, so a CE 131 sent to a non-validator cannot be observed.
+
+**Forward window.** The proxy delays before forwarding, to avoid exposing when the
+generator sent:
+
+| phase | formula | full (E=600) | tiny (E=12) |
+|---|---|---|---|
+| forward start | `conn + max(E/20, 1)` | 50 | 2 |
+| forward end | `min(Y, max(Y/2, start + m))` | 250 | 7 |
+| lottery end | `Y` | 500 | 10 |
+
+with `conn = max(E/30, 1)` and `m = 5` (polkajam's `MIN_FORWARD_WINDOW`). Earlier revisions
+of this table said "spread until slot 5", which is the nominal `Y/2` and correct at full
+spec; under tiny the minimum-window clamp legitimately carries the end to 7, so a hard
+bound at 5 would fail a conforming node. Only `phase < Y` is asserted hard.
+
+**The stopping rule.** "Stop after finalized inclusion" is judged against the node's *own*
+account of finality, not the harness's: §10 defines depth ≥ 2 for the rules the harness
+applies, but this one is a decision the node makes, and it publishes what it considers
+final in the `Final` of every UP 0 message. A forwarded ticket is finalized-included from
+the first moment the node advertised a `Final` at or past the slot of its own block
+carrying it. Two silences would otherwise read as obedience, so two controls gate the row:
+the run must have watched on past that moment — a node still advertising a slot later
+could have forwarded again — and the node must repeat a forward *somewhere* in the run.
+polkajam sends exactly one CE 132 frame per ticket per peer, so against it the rule holds
+however it is written and the row reports itself unexercised, which is the expected
+verdict and not a defect in either the node or the rule. A node that re-gossips is the one
+it bites.
+
+**Which blocks.** The subject is every block the NUT authored in the epoch its tickets were
+submittable in, not that epoch's newest. The tail rule, sortedness and "carried nothing the
+harness never sent" are properties of a block on its own and are reported once per block;
+"no faulted ticket" is a property of the epoch, since a node could otherwise bury one in
+any block but the last. Coverage is judged once, against what the node held by its last
+chance to include — the arrival lead of the N1 Extrinsic-completeness row — because a block
+sealed before a ticket arrived is owed nothing, and a ticket carried early is on chain and
+owed by no later block. Strict per-block completeness is the N1 row's; this lane does not
+repeat it.
+
+**Faults.** The prohibitions above are negatives, and are reported only alongside the
+control that makes them mean something: a node that forwards nothing and authors nothing
+satisfies every "must not" without deciding anything. "No forward" is further assertable
+only for the faults delivered over CE 131 — a node forwards what it is *proxy* for and
+does not rebroadcast a CE 132 arrival, so against a broadcast fault the rule holds in
+every run and tests nothing. The wrong-epoch and late faults reach the node over CE 132
+(sending them over CE 131 from a ticket the NUT does not proxy would make each of them a
+wrong-proxy case too, and no verdict could say which defect the node answered), so for
+those the assertion is "not included" alone.
 
 ### N3 — guaranteeing, CE 133/146/134/135/148 (2–3 epochs)
 
@@ -501,6 +569,11 @@ Out of scope: GRANDPA/BEEFY (no JAMNP-S spec). Finality is emulated by the harne
 6. jam-np has no tags → pin the commit hash in every report; ask for tagging.
 7. NUT index → 0 in all lanes; N7 rotates it.
 8. Clock → shared host clock, NTP-synced, 250 ms drift budget.
+9. Is the ticket proxy *selection* rule normative, or only the requirement that the proxy
+   come from the next-epoch set? → membership normative, selection implementation-defined;
+   the harness reports a mismatch against `proxy_index` as soft (§11 N2). Polkajam enforces
+   its own rule with `Error::NotCorrectProxy`, so a client that selects differently is
+   refused by it today.
 
 ## 13. Roadmap
 

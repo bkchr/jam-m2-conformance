@@ -9,13 +9,13 @@ use jamnp_s::trace::Trace;
 use m2_emu::emu::Emulator;
 use m2_reference::chain::RefChain;
 use m2_scenario::ctx::{
-    DeliveredTicket, EmuTicket, ImportFact, N1Ctx, N2Ctx, NutBlock, NutTicketFacts, TicketDelivery,
-    SLOT_PERIOD_MS, TICKET_ARRIVAL_LEAD_MS,
+    DeliveredTicket, EmuTicket, ImportFact, N1Ctx, N2Ctx, NutBlock, NutBlockTickets, NutFinal,
+    NutTicketFacts, TicketDelivery, SLOT_PERIOD_MS, TICKET_ARRIVAL_LEAD_MS,
 };
 use m2_scenario::dsl::{Check, Obs, ObsKind, ObsLog, Outcome, Scheduler, Severity};
 use m2_scenario::scenarios::n0::{Ce128Probe, Ce129Probe};
 use m2_scenario::scenarios::obs::{
-    EMU_SENT_131, EMU_SENT_132, RECV_CE131, RECV_CE132, UNKNOWN_EPOCH_RESET,
+    EMU_SENT_131, EMU_SENT_132, RECV_CE131, RECV_CE132, TICKET_REFUSED,
 };
 use m2_scenario::scenarios::{n0, n1, n2};
 
@@ -92,10 +92,10 @@ fn run_lane(lane: &str, checks: &[Check], obs: &ObsLog) -> (Vec<CheckOutcome>, V
     for check in checks {
         for result in scheduler.fire(check, obs) {
             let passed = result.outcome == Outcome::Pass;
-            let soft = match result.outcome {
-                Outcome::Pass => check.severity == Severity::Soft,
-                Outcome::Fail(severity) => severity == Severity::Soft,
-            };
+            // The row's own severity, not the parent check's. A passing row
+            // used to inherit the parent's, so a soft row under a hard check
+            // printed `hard` on exactly the runs where it passed.
+            let soft = result.severity == Severity::Soft;
             if !passed && !soft {
                 all_hard_passed = false;
             }
@@ -187,7 +187,9 @@ pub(crate) fn fabricated_obs_log(reference_block_count: usize) -> ObsLog {
     push(n0::PEER_1, ObsKind::Other(EMU_SENT_131));
     push(n0::PEER_1, ObsKind::Other(EMU_SENT_132));
     // N2: the NUT reset the stream carrying the unknown-epoch probe.
-    push(n0::PEER_1, ObsKind::Other(UNKNOWN_EPOCH_RESET));
+    // Which ticket it refused is carried by that ticket's plan entry, below;
+    // this records only that a refusal happened, for the report.
+    push(n0::PEER_1, ObsKind::Other(TICKET_REFUSED));
     log
 }
 
@@ -290,11 +292,15 @@ pub(crate) fn fabricated_run_ctx(
         ],
         delivered_tickets: included_ids
             .into_iter()
-            .map(|id| DeliveredTicket {
+            .enumerate()
+            .map(|(plan_index, id)| DeliveredTicket {
+                plan_index,
                 id,
                 delivered_at_ms: slot_start(slot) - TICKET_ARRIVAL_LEAD_MS,
                 target_epoch: slot / jam_types::epoch_period() + 1,
                 probe: false,
+                // A conforming node accepts every ticket owed to it.
+                refused: false,
             })
             .collect(),
         slot_period_ms: SLOT_PERIOD_MS,
@@ -322,6 +328,10 @@ pub(crate) fn fabricated_run_ctx(
         delivery,
         slot: 1,
         target_epoch,
+        // Set per entry below: the baseline's node refuses the unknown-epoch
+        // probe, as it must, and nothing else.
+        refused: false,
+        fault: None,
         // The baseline is a conforming run, so every planned ticket reached
         // the node on the slot it was planned for: the dry run has nothing to
         // withhold or delay them for.
@@ -330,37 +340,83 @@ pub(crate) fn fabricated_run_ctx(
     // A ticket the node generates during epoch 2 is for epoch 3, so the facts
     // are stamped inside epoch 2 rather than at an arbitrary instant: the
     // lane derives the epoch it expects from the moment the frame went out.
+    // Phase 1, not 0 -- generation starts at `epoch_start + 1` (DESIGN §11
+    // N2), and a baseline that sits on the boundary would assert the node may
+    // do what the catalogue says it may not.
     let sent_in_epoch_2 =
-        JAM_COMMON_ERA * 1000 + u64::from(2 * jam_types::epoch_period()) * SLOT_PERIOD_MS;
+        JAM_COMMON_ERA * 1000 + u64::from(2 * jam_types::epoch_period() + 1) * SLOT_PERIOD_MS;
     let sent =
-        |attempt: u8, proof: [u8; 784], peer: u16, delivery: TicketDelivery| NutTicketFacts {
-            epoch: FAB_TARGET_EPOCH,
-            ticket: Ce131Ticket { attempt, proof },
+        |attempt: u8, proof: [u8; 784], id: [u8; 32], peer: u16, delivery: TicketDelivery| {
+            NutTicketFacts {
+                epoch: FAB_TARGET_EPOCH,
+                ticket: Ce131Ticket { attempt, proof },
+                id,
+                peer,
+                delivery,
+                verified: Some(true),
+                received_at_ms: sent_in_epoch_2,
+            }
+        };
+    // A ticket's proxy follows from its id, so a baseline that sends one to
+    // an arbitrary peer claims a conforming node may ignore the rule. For a
+    // uniform id byte `k` the rule reduces to `k mod validators`, because
+    // `0x01010101 ≡ 1 (mod 6)`; the bytes below are chosen to designate the
+    // peer each ticket is actually sent to, and stay in the high range that
+    // separates the node's own tickets from the emulator's.
+    let own = |attempt: u8, id_byte: u8, peer: u16, delivery: TicketDelivery| {
+        sent(
+            attempt,
+            [0x80 + attempt; 784],
+            [id_byte; 32],
             peer,
             delivery,
-            verified: Some(true),
-            received_at_ms: sent_in_epoch_2,
-        };
-    let own = |attempt: u8, peer: u16, delivery: TicketDelivery| {
-        sent(attempt, [0x80 + attempt; 784], peer, delivery)
+        )
     };
+    // The block the fabricated node authors in the epoch its tickets are
+    // submitted in, a slot after the last of its forwards.
+    let fab_block_slot = 2 * jam_types::epoch_period() + 3;
     let proxied_to_the_nut = emu(1, FAB_NUT_INDEX, TicketDelivery::Ce131, FAB_TARGET_EPOCH);
     // Two tickets of its own proxied to one validator each, one it proxies
     // for itself and so broadcasts, and the forward of the ticket another
     // validator proxied to it.
     let mut nut_tickets = vec![
-        own(0, 1, TicketDelivery::Ce131),
-        own(1, 2, TicketDelivery::Ce131),
+        // 0x85 mod 6 == 1 and 0x86 mod 6 == 2: each goes to the validator the
+        // proxy rule names for it.
+        own(0, 0x85, 1, TicketDelivery::Ce131),
+        own(1, 0x86, 2, TicketDelivery::Ce131),
     ];
     for &peer in &emu_peers {
-        nut_tickets.push(own(2, peer, TicketDelivery::Ce132));
+        // 0x84 mod 6 == 0, the fabricated NUT's own index: this is the one
+        // ticket it proxies for itself, and so the one CE 132 broadcast that
+        // `n2_self_proxy` judges.
+        nut_tickets.push(own(2, 0x84, peer, TicketDelivery::Ce132));
+        // The forward of the ticket another validator proxied to it, which is
+        // `n2_proxy_duty`'s to judge and not the self-proxy row's.
         nut_tickets.push(sent(
             proxied_to_the_nut.attempt,
             proxied_to_the_nut.proof,
+            proxied_to_the_nut.id,
             peer,
             TicketDelivery::Ce132,
         ));
     }
+    // A second forward of that ticket to one peer, a slot later. The baseline
+    // has to carry one for the same reason it has to carry a fault: a node
+    // that never repeats a forward satisfies "it stopped forwarding once the
+    // ticket was final" without having stopped anything, so without this the
+    // baseline reports `n2_forward_stops_at_finality` unexercised. It is a
+    // conforming repeat -- before the node declared the block carrying the
+    // ticket final, which is where the rule bites.
+    nut_tickets.push(NutTicketFacts {
+        received_at_ms: sent_in_epoch_2 + SLOT_PERIOD_MS,
+        ..sent(
+            proxied_to_the_nut.attempt,
+            proxied_to_the_nut.proof,
+            proxied_to_the_nut.id,
+            emu_peers[0],
+            TicketDelivery::Ce132,
+        )
+    });
     let n2 = N2Ctx {
         target_epoch: FAB_TARGET_EPOCH,
         epoch_start_slot: 0,
@@ -368,15 +424,52 @@ pub(crate) fn fabricated_run_ctx(
             proxied_to_the_nut,
             emu(2, 1, TicketDelivery::Ce132, FAB_TARGET_EPOCH),
             // The unknown-epoch probe (`simple.md:335-337`): an epoch the
-            // node cannot know yet, which it must reset the stream on.
-            emu(3, 1, TicketDelivery::Ce132, FAB_TARGET_EPOCH + 2),
+            // node cannot know yet, which it must reset the stream on -- and
+            // in the baseline, does.
+            EmuTicket {
+                refused: true,
+                fault: Some(m2_scenario::ctx::TicketFault::UnknownEpoch),
+                ..emu(3, 1, TicketDelivery::Ce132, FAB_TARGET_EPOCH + 2)
+            },
+            // A ticket proxied to the node over CE 131 that is not its to
+            // proxy. A conforming node refuses it, and the baseline has to
+            // carry one: `n2_fault_not_forwarded` is a negative rule, and
+            // without a CE 131 fault beside the honest forward above there is
+            // nothing for it to judge and the run reports it unexercised.
+            EmuTicket {
+                refused: true,
+                fault: Some(m2_scenario::ctx::TicketFault::WrongProxy),
+                ..emu(4, 1, TicketDelivery::Ce131, FAB_TARGET_EPOCH)
+            },
         ],
         nut_tickets,
         // Two delivered tickets plus one of the node's own: a validator's own
         // ticket belongs in its own block, and the baseline says so.
-        nut_block_ticket_ids: vec![[1u8; 32], [2u8; 32], [9u8; 32]],
+        //
+        // The slot is inside the epoch those tickets are submitted in -- the
+        // one before `FAB_TARGET_EPOCH` -- and after the slot the node
+        // forwarded them in, so the baseline tells one coherent story:
+        // received, forwarded, included, declared final.
+        nut_blocks: vec![NutBlockTickets {
+            slot: fab_block_slot,
+            ticket_ids: vec![[1u8; 32], [2u8; 32], [9u8; 32]],
+        }],
+        // The node calls its own block final two slots after authoring it,
+        // and is still advertising a slot after that. Both halves matter:
+        // without the first there is no moment for the stopping rule to be
+        // judged against, and without the second a pass would only say the
+        // run ended.
+        nut_finals: vec![
+            NutFinal {
+                at_ms: slot_start(fab_block_slot + 2),
+                slot: fab_block_slot,
+            },
+            NutFinal {
+                at_ms: slot_start(fab_block_slot + 3),
+                slot: fab_block_slot + 1,
+            },
+        ],
         own_ticket_ids: vec![[9u8; 32]],
-        nut_block_slot: Some(12),
         nut_index: FAB_NUT_INDEX,
         emulated_peers: emu_peers,
         slot_period_ms: SLOT_PERIOD_MS,

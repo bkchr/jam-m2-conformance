@@ -66,6 +66,12 @@ pub struct ImportFact {
 /// ticket look as if it had been delivered before the run began.
 #[derive(Clone, Debug)]
 pub struct DeliveredTicket {
+    /// Position of this delivery in the plan it came from.
+    ///
+    /// The identity. A ticket id does not serve: three faults reuse an honest
+    /// ticket's proof and so share its id, and the duplicate fault shares its
+    /// target epoch as well, so `(id, epoch)` stopped picking out one entry.
+    pub plan_index: usize,
     pub id: [u8; 32],
     pub delivered_at_ms: u64,
     /// Epoch the ticket is *for*; it may only be included in a block of the
@@ -81,6 +87,15 @@ pub struct DeliveredTicket {
     /// into the run has exactly that epoch as its submittable one, and N1
     /// charged the node for leaving out the ticket it was obliged to reject.
     pub probe: bool,
+    /// Whether the NUT reset the stream this ticket went out on, which is how
+    /// it refuses one (`simple.md:329-337`).
+    ///
+    /// Per delivery, because a reset carries no reason and the lanes need to
+    /// know *which* ticket was refused. The emulator used to record refusals
+    /// into the observation log alone, and guess the cause by comparing the
+    /// ticket's epoch to the plan's -- an inference that holds only while the
+    /// unknown-epoch probe is the single ticket the node is meant to reject.
+    pub refused: bool,
 }
 
 /// Facts the N1 (block authoring) lane reads.
@@ -166,6 +181,44 @@ impl N1Ctx {
     }
 }
 
+/// A defect the harness injected into a planned delivery on purpose.
+///
+/// Mirrors `m2_reference::tickets::TicketFault`, which the lane cannot name:
+/// `m2-scenario` holds `m2-reference` only as a dev-dependency. The runner,
+/// which depends on both, maps one to the other — the same arrangement
+/// [`TicketDelivery`] already has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TicketFault {
+    BadProof,
+    WrongProxy,
+    StaleEpoch,
+    BadAttempt,
+    Duplicate,
+    Late,
+    UnknownEpoch,
+}
+
+impl TicketFault {
+    /// Whether the node may still carry this ticket in a block — only
+    /// [`TicketFault::Duplicate`], and then exactly once.
+    pub fn still_owed_inclusion(&self) -> bool {
+        matches!(self, TicketFault::Duplicate)
+    }
+
+    /// What the harness did to this ticket, for a finding's detail line.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            TicketFault::BadProof => "its ring signature was corrupted",
+            TicketFault::WrongProxy => "the NUT is not its designated proxy",
+            TicketFault::StaleEpoch => "it names an epoch that has already closed",
+            TicketFault::BadAttempt => "its attempt is at the per-validator cap",
+            TicketFault::Duplicate => "it was delivered a second time",
+            TicketFault::Late => "it arrived after the submission window shut",
+            TicketFault::UnknownEpoch => "it names an epoch past the node's horizon",
+        }
+    }
+}
+
 /// Which distribution step carried a ticket (`simple.md:314-316`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TicketDelivery {
@@ -201,6 +254,16 @@ pub struct EmuTicket {
     /// on this: grading the plan instead charged the node both for tickets it
     /// was never sent and for ones that arrived too late to act on.
     pub delivered_at_ms: Option<u64>,
+    /// Whether the NUT refused this ticket by resetting its stream. See
+    /// [`DeliveredTicket::refused`]; `false` for a ticket never delivered.
+    pub refused: bool,
+    /// The defect the harness injected into this delivery, if any.
+    ///
+    /// `valid` does not cover this and must not be confused with it: `valid`
+    /// is the ring-signature verdict alone, and a wrong-proxy, stale-epoch or
+    /// late ticket verifies perfectly well. Every fault but
+    /// [`TicketFault::Duplicate`] is one the node must leave no trace of.
+    pub fault: Option<TicketFault>,
 }
 
 impl EmuTicket {
@@ -220,6 +283,13 @@ impl EmuTicket {
 pub struct NutTicketFacts {
     pub epoch: u32,
     pub ticket: jamnp_s::codec::ce131_136::Ticket,
+    /// The ticket id, which is the proof's VRF output.
+    ///
+    /// The wire never carries it — CE 131/132 send an attempt and a proof —
+    /// but the proxy a ticket is destined for is a function of it, so the lane
+    /// cannot judge the proxy choice without it. Derived by the runner, which
+    /// already does so for `own_ticket_ids`.
+    pub id: [u8; 32],
     pub peer: u16,
     /// Which common entry carried it: CE 131 (to the proxy) or CE 132
     /// (broadcast). Read off the stream kind, never inferred from `peer`.
@@ -239,6 +309,28 @@ impl NutTicketFacts {
     }
 }
 
+/// One block the NUT authored in the epoch N2 judges, and the ticket ids its
+/// extrinsic carried.
+#[derive(Clone, Debug)]
+pub struct NutBlockTickets {
+    pub slot: u32,
+    pub ticket_ids: Vec<[u8; 32]>,
+}
+
+/// One `Final` the NUT advertised over UP 0, and when it advertised it.
+///
+/// The node names its own finalized head in every UP 0 handshake and
+/// announcement -- both carry a `Final` (DESIGN §11) -- so what the *node*
+/// treats as final is on the wire and does not have to be inferred. DESIGN
+/// §10 defines finality for the harness's own rules; the rule these facts
+/// feed -- stop forwarding a ticket once it is finalized -- is about what
+/// the node knew, so it reads the node's claim instead.
+#[derive(Clone, Debug)]
+pub struct NutFinal {
+    pub at_ms: u64,
+    pub slot: u32,
+}
+
 /// Facts the N2 (Safrole tickets) lane reads.
 ///
 /// `Clone` lets a `dsl::Check` closure (which must be `'static`) capture an
@@ -249,17 +341,27 @@ pub struct N2Ctx {
     pub epoch_start_slot: u32,
     pub emu_plan: Vec<EmuTicket>,
     pub nut_tickets: Vec<NutTicketFacts>,
-    /// Ticket ids in the NUT's authored block's ticket extrinsic.
-    pub nut_block_ticket_ids: Vec<[u8; 32]>,
+    /// Every block the NUT authored in the epoch the lane's tickets were
+    /// submittable in, ascending by slot. Empty when it authored none.
+    ///
+    /// All of them, not the newest alone. The prohibitions this lane carries
+    /// -- a faulted ticket appears in no block, a block carries nothing the
+    /// harness never sent -- are statements about the epoch, and grading one
+    /// block let a node bury a ticket it had to refuse in any of the others.
+    /// The run that prompted this authored eight blocks and N2 read one.
+    ///
+    /// There is no sentinel slot meaning "no block": judging a block that
+    /// does not exist credits or blames the node for something it never did,
+    /// which is why this is a list and not a slot.
+    pub nut_blocks: Vec<NutBlockTickets>,
+    /// Every `Final` the NUT advertised over UP 0, in the order it sent them.
+    ///
+    /// Empty when the node advertised none, which is the same answer as "the
+    /// harness cannot say what this node considers final": the rules that
+    /// read it report themselves unexercised rather than assuming a slot.
+    pub nut_finals: Vec<NutFinal>,
     /// Ids of tickets the NUT itself announced -- see [`N1Ctx::own_ticket_ids`].
     pub own_ticket_ids: Vec<[u8; 32]>,
-    /// Slot of the NUT block judged for inclusion, or `None` when the NUT
-    /// authored no block in the epoch the tickets were submittable in.
-    ///
-    /// Not a sentinel slot: there is no slot value that means "no block", and
-    /// judging a block that does not exist credits or blames the node for
-    /// something it never did.
-    pub nut_block_slot: Option<u32>,
     /// Validator index of the node under test.
     pub nut_index: u16,
     /// Validator indices the harness emulates — every validator but the NUT.
@@ -275,6 +377,68 @@ pub struct N2Ctx {
 }
 
 impl N2Ctx {
+    /// Whether `ticket` reached the node in time for a block at `slot`:
+    /// [`TICKET_ARRIVAL_LEAD_MS`] before that slot started, the same margin
+    /// N1 grades extrinsic completeness on
+    /// ([`N1Ctx::expected_tickets_for_slot`]).
+    ///
+    /// Inclusion cannot be judged against the epoch's whole delivery set. A
+    /// run whose only block falls at phase 2 held almost nothing when it
+    /// authored, and charging it for the tickets that arrived over the rest
+    /// of the lottery blames the node for the run's timing.
+    pub fn in_hand_for_slot(&self, ticket: &EmuTicket, slot: u32) -> bool {
+        let cutoff = (JAM_COMMON_ERA * 1000 + u64::from(slot) * self.slot_period_ms)
+            .saturating_sub(TICKET_ARRIVAL_LEAD_MS);
+        ticket.delivered_at_ms.is_some_and(|ms| ms <= cutoff)
+    }
+
+    /// Whether any block the NUT authored in the epoch carried `id`.
+    ///
+    /// The form every prohibition in this lane takes: a ticket the node had
+    /// to refuse must be absent from the epoch, not merely from its last
+    /// block.
+    pub fn any_block_carried(&self, id: &[u8; 32]) -> bool {
+        self.nut_blocks.iter().any(|b| b.ticket_ids.contains(id))
+    }
+
+    /// The last block of the epoch that could still carry a ticket: the
+    /// node's final chance to include one. `None` when it authored no block
+    /// outside the tail, where the extrinsic must be empty anyway.
+    pub fn last_chance_to_include(&self) -> Option<&NutBlockTickets> {
+        self.nut_blocks
+            .iter()
+            .rev()
+            .find(|b| !self.slot_in_tail(b.slot))
+    }
+
+    /// When the NUT first advertised a finalized head at or past `slot`:
+    /// the moment a block of its own at that slot became, by its own
+    /// account, final.
+    ///
+    /// Slot order stands in for ancestry. The node could in principle
+    /// advertise a final on a branch that does not contain the block in
+    /// question, but a node that walked away from a block it authored is
+    /// already a finding in N1, which grades every NUT block's parent
+    /// against the reference best chain.
+    pub fn declared_final_at_or_past(&self, slot: u32) -> Option<u64> {
+        self.nut_finals
+            .iter()
+            .find(|f| f.slot >= slot)
+            .map(|f| f.at_ms)
+    }
+
+    /// Whether the NUT was still advertising a slot after `ms`.
+    ///
+    /// "It did not do X again" claims nothing if the run ended at `ms`. UP 0
+    /// advertisements are the evidence that the node was still talking and
+    /// the harness still listening, and they travel on a stream the act being
+    /// forbidden would not have used.
+    pub fn still_advertising_after(&self, ms: u64) -> bool {
+        self.nut_finals
+            .iter()
+            .any(|f| f.at_ms >= ms.saturating_add(self.slot_period_ms))
+    }
+
     /// Whether `ticket` was proxied to the NUT itself (proxy == NUT index).
     pub fn proxy_is_nut(&self, ticket: &EmuTicket) -> bool {
         ticket.proxy == self.nut_index
@@ -321,6 +485,41 @@ impl N2Ctx {
     pub fn leaves_room_to_forward(&self, slot: u32) -> bool {
         leaves_room_to_forward(slot, self.epoch_period, self.epoch_tail_start)
     }
+
+    /// Size of the validator set: the emulated validators plus the NUT.
+    ///
+    /// Derived rather than carried, because the two could then disagree and
+    /// `emulated_peers` is defined as every validator but the NUT.
+    pub fn validator_count(&self) -> usize {
+        self.emulated_peers.len() + 1
+    }
+
+    /// The validator index designated to proxy the ticket with this id.
+    pub fn designated_proxy(&self, id: &[u8; 32]) -> u16 {
+        proxy_index(id, self.validator_count())
+    }
+
+    /// The epoch phase of `slot`.
+    pub fn phase_of(&self, slot: u32) -> u32 {
+        slot % self.epoch_period
+    }
+}
+
+/// The validator index designated to proxy the ticket with `id`, over a set of
+/// `val_count` validators: the big-endian last four bytes of the id, modulo
+/// the set size (DESIGN.md §11 N2, "Proxy selection").
+///
+/// Free-standing and duplicated from `m2_reference::tickets::proxy_index`
+/// because `m2-scenario` holds `m2-reference` only as a dev-dependency, and
+/// the lane has to judge the choice the node made. `m2-runner`'s
+/// `proxy_rule_matches_the_reference` holds the two copies in step, the same
+/// way `forwardable_phases_match_the_judged_rule` does for the forward window.
+///
+/// Whether this rule is normative is DESIGN §12 question 9; the lane grades it
+/// soft until that is settled.
+pub fn proxy_index(id: &[u8; 32], val_count: usize) -> u16 {
+    let last4 = [id[28], id[29], id[30], id[31]];
+    (u32::from_be_bytes(last4) as usize % val_count) as u16
 }
 
 /// Whether a ticket reaching a proxy in `slot` leaves it room to forward
@@ -369,16 +568,20 @@ mod tests {
         let mut ctx = base_l1();
         ctx.delivered_tickets = vec![
             DeliveredTicket {
+                plan_index: 0,
                 id: [1u8; 32],
                 delivered_at_ms: jam_types::JAM_COMMON_ERA * 1000 - 2000,
                 target_epoch: 1,
                 probe: false,
+                refused: false,
             },
             DeliveredTicket {
+                plan_index: 0,
                 id: [2u8; 32],
                 delivered_at_ms: jam_types::JAM_COMMON_ERA * 1000 - 500,
                 target_epoch: 1,
                 probe: false,
+                refused: false,
             },
         ];
 
@@ -405,16 +608,20 @@ mod tests {
         let mut ctx = base_l1();
         ctx.delivered_tickets = vec![
             DeliveredTicket {
+                plan_index: 0,
                 id: [1u8; 32],
                 delivered_at_ms: 0,
                 target_epoch: 1,
                 probe: false,
+                refused: false,
             },
             DeliveredTicket {
+                plan_index: 0,
                 id: [2u8; 32],
                 delivered_at_ms: 0,
                 target_epoch: 1,
                 probe: true,
+                refused: false,
             },
         ];
 
@@ -432,10 +639,12 @@ mod tests {
         let mut ctx = base_l1();
         let long_ago = 0;
         ctx.delivered_tickets = vec![DeliveredTicket {
+            plan_index: 0,
             id: [1u8; 32],
             delivered_at_ms: long_ago,
             target_epoch: 1,
             probe: false,
+            refused: false,
         }];
 
         assert_eq!(
@@ -506,10 +715,12 @@ mod tests {
                 error: None,
             }],
             delivered_tickets: vec![DeliveredTicket {
+                plan_index: 0,
                 id: [5u8; 32],
                 delivered_at_ms: 500,
                 target_epoch: 1,
                 probe: false,
+                refused: false,
             }],
             own_ticket_ids: Vec::new(),
             slot_period_ms: SLOT_PERIOD_MS,
@@ -540,6 +751,10 @@ mod tests {
             slot: 10,
             target_epoch: 3,
             delivered_at_ms: Some(JAM_COMMON_ERA * 1000 + 10 * SLOT_PERIOD_MS),
+            // The node accepted it; the refusing cases are built where
+            // they are tested.
+            refused: false,
+            fault: None,
         };
         let n2 = N2Ctx {
             target_epoch: 3,
@@ -551,14 +766,18 @@ mod tests {
                     attempt: 0,
                     proof: [0u8; 784],
                 },
+                id: [0u8; 32],
                 peer: 1,
                 delivery: TicketDelivery::Ce131,
                 verified: Some(true),
                 received_at_ms: 2000,
             }],
-            nut_block_ticket_ids: vec![[6u8; 32]],
+            nut_blocks: vec![NutBlockTickets {
+                slot: 12,
+                ticket_ids: vec![[6u8; 32]],
+            }],
+            nut_finals: Vec::new(),
             own_ticket_ids: Vec::new(),
-            nut_block_slot: Some(12),
             nut_index: NUT_INDEX,
             emulated_peers: (0..NUT_INDEX).collect(),
             slot_period_ms: SLOT_PERIOD_MS,
@@ -584,8 +803,10 @@ mod tests {
         assert_eq!(n2.nut_tickets[0].verified, Some(true));
         assert_eq!(n2.nut_tickets[0].delivery, TicketDelivery::Ce131);
         assert_eq!(n2.nut_tickets[0].received_at_ms, 2000);
-        assert_eq!(n2.nut_block_ticket_ids, vec![[6u8; 32]]);
-        assert_eq!(n2.nut_block_slot, Some(12));
+        assert_eq!(n2.nut_blocks[0].ticket_ids, vec![[6u8; 32]]);
+        assert_eq!(n2.nut_blocks[0].slot, 12);
+        assert!(n2.any_block_carried(&[6u8; 32]));
+        assert!(!n2.any_block_carried(&[7u8; 32]));
 
         assert!(n2.proxy_is_nut(&emu), "proxy == NUT index is the NUT");
         assert!(

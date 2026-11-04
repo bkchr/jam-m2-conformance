@@ -773,6 +773,41 @@ mod tests {
         }
     }
 
+    /// The lane grades which validator the node proxied a ticket to, and the
+    /// reference assigns which validator the emulator proxies to. They are in
+    /// different crates -- `m2-scenario` holds `m2-reference` only as a
+    /// dev-dependency, so the lane carries its own copy of the rule -- and a
+    /// drift between them would have the harness send a ticket to one
+    /// validator while faulting the node for not choosing another.
+    #[test]
+    fn proxy_rule_matches_the_reference() {
+        jam_types::ProtocolParameters::tiny()
+            .apply()
+            .expect("tiny parameters apply");
+        let val_count = usize::from(jam_types::max_val_count());
+        // Ids that exercise the whole modulus, the boundaries of the four
+        // bytes the rule reads, and bytes outside them that it must ignore.
+        let mut ids: Vec<[u8; 32]> = (0u8..=32).map(|b| [b; 32]).collect();
+        for tail in [
+            [0u8, 0, 0, 0],
+            [0xff, 0xff, 0xff, 0xff],
+            [1, 0, 0, 7],
+            [0, 0, 0, 5],
+        ] {
+            let mut id = [0xa5u8; 32];
+            id[28..32].copy_from_slice(&tail);
+            ids.push(id);
+        }
+        for id in ids {
+            assert_eq!(
+                usize::from(m2_scenario::ctx::proxy_index(&id, val_count)),
+                m2_reference::tickets::proxy_index(&id, val_count),
+                "the lane and the reference disagree about the proxy for {:02x?}",
+                &id[28..32],
+            );
+        }
+    }
+
     /// A plan that proxies nothing to the NUT has no forwarding duty to
     /// exercise, so a late window is as good as an early one and waiting an
     /// epoch for it buys nothing. A plan that does proxy to the NUT is worth
@@ -794,6 +829,8 @@ mod tests {
                 proxy: 0,
             },
             delivery,
+            fault: None,
+            plan_index: 0,
             slot: 0,
             target_epoch,
         };

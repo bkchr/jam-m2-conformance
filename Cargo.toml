@@ -24,10 +24,10 @@ repository = "https://github.com/paritytech/jam-m2-conformance"
 # in four weeks -- so move it at most once per milestone, in a commit of its own
 # that records what changed in the genesis writer and the hazmat exports.
 [workspace.dependencies]
-jam-types = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "940ef56c7a2a601bccfd2a8d2375be48dc0fb941" }
-jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "940ef56c7a2a601bccfd2a8d2375be48dc0fb941" }
-jam-node = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "940ef56c7a2a601bccfd2a8d2375be48dc0fb941", features = ["hazmat"] }
-polkajam-fuzz = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "940ef56c7a2a601bccfd2a8d2375be48dc0fb941" }
+jam-types = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a" }
+jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a" }
+jam-node = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a", features = ["hazmat"] }
+polkajam-fuzz = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a" }
 
 quinn = { version = "0.11", features = ["rustls", "runtime-tokio", "log"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

@@ -14,7 +14,7 @@ artefact the NUT produces against the polkajam `hazmat` reference engine.
 (connectivity/sync), **N1** (block authoring), and **N2** (Safrole tickets). See [DESIGN.md](DESIGN.md)
 for the design; this README documents the current implementation state.
 
-- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **363 passed / 0 failed** ✓,
+- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **404 passed / 0 failed** ✓,
   `cargo fmt --all --check` ✓, no `unwrap`/`panic`/`expect`/`todo!` in non-test code.
 - Dry-run baseline: `cargo run -p m2-runner -- --preset mock --dry-run --session-dir /tmp/x`
   exits 0 with **all N0+N1+N2 checks HARD PASS** — the harness's own expectations are satisfiable.
@@ -26,7 +26,7 @@ for the design; this README documents the current implementation state.
 | `jamnp-s` | Independent JAMNP-S: QUIC/TLS endpoint (quinn 0.11 + rustls), Ed25519 cert + custom SAN, ALPN `jamnp-s/1/<8hex>[/builder]`, preferred-initiator rule, kind-once stream framing (`u32 LE` messages), typed codecs for every UP/CE protocol (UP 0, CE 128–148), message trace recorder. |
 | `m2-reference` | Reference oracle over polkajam `hazmat`: `RefChain` (tiny 6-validator chain, deterministic authoring of emulated slots), NUT-block import + state diff (`import.rs`/`state.rs`), ticket generation/planning/verification (`tickets.rs`). |
 | `m2-emu` | Five emulated validators (skeletons — no core logic; all values/decisions injected from `m2-reference`): UP 0 announce, CE 128/129 serve, NUT-block fetch (N1), CE 131/132 ticket send/receive (N2). |
-| `m2-scenario` | The §5 DSL (`check`/`expect_subseq`/`log::check`) + hard-coded lanes: `n0.rs` (9 checks), `n1.rs` (6), `n2.rs` (5). |
+| `m2-scenario` | The §5 DSL (`check`/`expect_subseq`/`log::check`) + hard-coded lanes: `n0.rs` (9 checks), `n1.rs` (6), `n2.rs` (7). |
 | `m2-runner` | CLI: keygen → spec → NUT launch (docker/polkajam presets) → connectivity → scenario (N0/N1/N2) → `report.md`/`findings.json`/trace → exit code. |
 
 ## Build and run
@@ -56,8 +56,9 @@ exercised, and `--lanes n0` skips ticket proving entirely), `--dry-run`.
 The harness runs end-to-end against the polkajam NUT and produces a genuine conformance
 report (`sessions/<id>/report/{report.md,findings.json}`, `traces/jamnp.{bin,json}`).
 `M2-status.md` records the milestone evidence in full, and how to point the suite at a
-third-party node. Latest runs, `sessions/fwd-3` and `sessions/fwd-4`: **130 and 107 checks,
-two hard findings each, both of them node defects.**
+third-party node. Latest run, `sessions/unitB-9` (a 300 s window): **278 checks, two hard
+findings, both of them node defects**, plus two soft rows — one of them a second instance
+of a known defect, the other a coverage gap this node cannot close.
 
 - **N0 connectivity and sync**: 26/27 HARD PASS — real TLS 1.3 mutual handshake, Ed25519 cert +
   SAN, ALPN `jamnp-s/1/…` with a mismatched ALPN refused, preferred-initiator split, 21 `/builder`
@@ -67,9 +68,15 @@ two hard findings each, both of them node defects.**
   seal, prior and posterior state roots. No hard findings in the latest runs.
 - **N2 Safrole tickets**: the node accepts the emulator's tickets, runs its own lottery and
   distributes to proxies; proofs, target epochs, attempt ranges, per-epoch caps, proxy
-  routing and inclusion are all graded. One hard finding: a ticket for an epoch past the
-  node's horizon is rejected but the stream is not reset (`n2_unknown_epoch_reset_observed`).
-  The proxy-forwarding duty (`n2_proxy_duty_forwarded`) now passes — five times in `fwd-4`.
+  routing, inclusion and the six deliberately-broken tickets are all graded. One hard
+  finding: a ticket for an epoch past the node's horizon is rejected but the stream is not
+  reset (`n2_unknown_epoch_reset_observed`). The proxy-forwarding duty
+  (`n2_proxy_duty_forwarded`) passes — four times in `unitB-9`. Two soft rows there:
+  the node refuses a bad-proof ticket (`invalid ticket signature` in its own log) without
+  resetting the stream either, which is the same defect in a second place
+  (`n2_proxy_duty_bad_proof_ignored`); and the stopping rule
+  (`n2_forward_stops_at_finality`) reports itself unexercised, because polkajam sends each
+  ticket to each peer exactly once and so never had a forward to stop.
 - Runner exits 1 (correct — hard failures exist).
 
 **Every hard failure the harness has ever reported against this node but those two was its
@@ -98,8 +105,9 @@ grading the node against its own intentions rather than against what happened on
   decoder; the N2 lane judges it as `n2_gen_attempt_in_range`, where an out-of-range attempt is
   a reportable failure instead of an invisible one.
 
-**A single run is not a baseline.** Check counts range from 82 to 130 across runs, because which
-slots the node wins and when a proxied ticket arrives decide which rules can be demanded at all.
+**A single run is not a baseline.** Check counts range from 82 to 278 across runs — the window
+length sets the ceiling and the lottery sets the rest, since which slots the node wins and when
+a proxied ticket arrives decide which rules can be demanded at all.
 The run now waits for the node to be able to accept tickets before laying the plan out, and
 trades a lottery it cannot exercise the proxy duty in for the next one, which makes the spread
 narrower — but it does not remove it. Grade a client over several runs, read the soft
