@@ -8,4 +8,5 @@
 
 pub mod emu;
 pub mod nut_block;
+pub mod sync_probe;
 pub mod ticket_io;

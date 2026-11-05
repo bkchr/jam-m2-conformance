@@ -10,6 +10,7 @@ use jam_std_common::{
 use crate::chain::{ChainError, RefChain};
 
 /// Ticket context for a target epoch.
+#[derive(Clone)]
 pub struct TicketCtx {
     /// Serialized bandersnatch public keys of the designated validators.
     pub pks: Vec<[u8; 32]>,
@@ -41,6 +42,51 @@ pub enum TicketDelivery {
     Ce132,
 }
 
+/// A deliberate defect injected into one planned ticket delivery.
+///
+/// DESIGN §11 N2's Faults column. Each variant is a stimulus the harness
+/// sends on purpose and an answer it then requires the node *not* to give:
+/// no forward, and no place in a block. The node refuses each of them, and
+/// polkajam's `chain/authoring/error.rs` has a distinct error for every one,
+/// which is what gives the catalogue its shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketFault {
+    /// Ring signature corrupted in its body, leaving the ticket id — and so
+    /// the designated proxy — intact. Offered over CE 131 to the NUT, which
+    /// really is its proxy, so the proof is the only thing wrong with it.
+    BadProof,
+    /// A valid ticket whose designated proxy is another validator, offered to
+    /// the NUT over CE 131 regardless.
+    WrongProxy,
+    /// A valid ticket labelled for an epoch that has already closed.
+    StaleEpoch,
+    /// An attempt at or above the per-validator cap. The node checks the
+    /// attempt before it checks the proof, so relabelling an honest ticket is
+    /// enough and no second proving round is needed.
+    BadAttempt,
+    /// A second delivery of a ticket already sent. The one fault whose ticket
+    /// is still owed a place in a block — exactly one.
+    Duplicate,
+    /// A valid ticket delivered after the submission window has closed.
+    Late,
+    /// A ticket for an epoch past the node's horizon, which it must answer by
+    /// resetting the stream (`simple.md:335-337`).
+    UnknownEpoch,
+}
+
+impl TicketFault {
+    /// Whether the node may still carry this ticket in a block.
+    ///
+    /// Only [`TicketFault::Duplicate`] may: it is a second copy of a ticket
+    /// that was legitimately delivered, and the rule it tests is that the
+    /// block carries it *once*. Every other fault must leave no trace, which
+    /// is why they withdraw the honest delivery of the ticket they reuse —
+    /// see `plan_faults`.
+    pub fn still_owed_inclusion(&self) -> bool {
+        matches!(self, TicketFault::Duplicate)
+    }
+}
+
 /// A ticket plus its scheduled delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduledTicket {
@@ -49,12 +95,29 @@ pub struct ScheduledTicket {
     pub slot: u32,
     /// Epoch the ticket is *for*, which is not the epoch it is delivered in.
     pub target_epoch: u32,
+    /// The defect deliberately injected into this delivery, if any.
+    pub fault: Option<TicketFault>,
+    /// This entry's position in the plan, assigned once the plan is whole.
+    ///
+    /// The identity of a delivery, and intrinsic to the entry rather than its
+    /// position in whatever list currently holds it: the plan is split per
+    /// peer and each peer's share is sorted into delivery order, so an index
+    /// into either of those is not an index into the plan. Ticket ids do not
+    /// serve either — three faults reuse an honest ticket's proof.
+    pub plan_index: usize,
 }
 
 impl RefChain {
     /// Ticket context for the current head state: serialized bandersnatch
-    /// public keys of the designated validators and the tickets entropy
-    /// (entropy buffer entry 1, current after the upcoming epoch change).
+    /// public keys of the designated validators and the tickets entropy.
+    ///
+    /// The entropy is buffer entry *2*, which is what a node checks a
+    /// submitted ticket against. Entry 1 looks plausible -- it is what entry 2
+    /// becomes after the next epoch change -- and it is what this read, so
+    /// every ticket the emulator ever offered was rejected with "invalid
+    /// ticket signature". It went unnoticed because the two agree whenever an
+    /// epoch boundary happens to fall between proving and delivery, which a
+    /// genesis anchored far enough in the past made likely.
     pub fn ticket_ctx(&self) -> Result<TicketCtx, ChainError> {
         let storage = self.harness().storage(None);
         let validators = storage
@@ -63,13 +126,13 @@ impl RefChain {
         let pks = validators.iter().map(|v| v.bandersnatch.0).collect();
         let entropy = storage
             .entropy()
-            .map_err(|e| ChainError::Tickets(format!("entropy: {e}")))?[1]
+            .map_err(|e| ChainError::Tickets(format!("entropy: {e}")))?[2]
             .0;
         Ok(TicketCtx { pks, entropy })
     }
 
     /// Generate tickets for every keystore-backed author (the emulated set,
-    /// excluding the NUT), one per attempt up to `tickets_attempts_number()`.
+    /// excluding the NUT), one per attempt up to `tickets_per_validator(max_val_count())`.
     pub fn generate_tickets(&self, ctx: &TicketCtx) -> Result<Vec<EmulatedTicket>, ChainError> {
         let pks: Vec<bandersnatch::Public> =
             ctx.pks.iter().map(|p| bandersnatch::Public(*p)).collect();
@@ -80,7 +143,7 @@ impl RefChain {
                 continue;
             }
             let prover = ring_vrf::RingContext::prover(&pks, author);
-            for attempt in 0..jam_types::tickets_attempts_number() {
+            for attempt in 0..jam_types::tickets_per_validator(jam_types::max_val_count()) {
                 let message = bandersnatch::Message::TicketSeal(Entropy(ctx.entropy), attempt);
                 let signature = keystore
                     .bandersnatch_ring_sign(pk, &message, &[], &prover)
@@ -121,37 +184,283 @@ pub fn first_delivery_slot(now_slot: u32) -> u32 {
     }
 }
 
+/// The slots in which a ticket for `target_epoch` may still be submitted,
+/// given that the earliest the emulator can deliver is `first_slot`.
+///
+/// Tickets for epoch `e` are submitted during epoch `e - 1` and only before
+/// its tail (`epoch_tail_start`). `None` when that window has already closed —
+/// the honest answer when ticket generation ran long enough to miss it, and
+/// better than scheduling deliveries the node is obliged to refuse.
+pub fn submission_window(first_slot: u32, target_epoch: u32) -> Option<(u32, u32)> {
+    let period = jam_types::epoch_period();
+    let epoch_start = target_epoch.checked_sub(1)?.checked_mul(period)?;
+    let start = first_slot.max(epoch_start);
+    // `epoch_tail_start` is the first slot of the tail, so the last slot that
+    // still accepts tickets is the one before it.
+    let end = epoch_start + jam_types::epoch_tail_start() - 1;
+    (start <= end).then_some((start, end))
+}
+
+/// The latest epoch phase at which a ticket's arrival still obliges the
+/// validator it was proxied to to forward it.
+///
+/// A proxy forwards within a window inside the lottery, not at the instant it
+/// receives: it delays to avoid revealing when the generator sent, and stops
+/// well before the tail. Where exactly that window sits belongs to the node,
+/// so the harness takes the lottery's first half — early enough that any
+/// window must still be open. `None` when the lottery is too short for any
+/// phase to qualify.
+///
+/// This is the planning side of the rule `m2_scenario::ctx` judges by; the two
+/// are tied together by `m2-runner`'s `forwardable_phases_match_the_judged_rule`.
+pub fn last_forwardable_phase() -> Option<u32> {
+    (jam_types::epoch_tail_start() / 2).checked_sub(1)
+}
+
+/// Whether the window still open for `target_epoch` can exercise the proxy
+/// forwarding duty at all.
+///
+/// A CE 131 delivery goes out at the window's first slot, which is as early as
+/// the harness can place it. If that slot is already past the forwardable
+/// phases then nothing in this epoch can be, and a run laid out against it
+/// grades the proxy duty as "not exercised" however well the node behaves.
+/// The caller's answer to a `false` here is to wait for the next epoch, which
+/// costs slots and buys the whole of the next lottery.
+pub fn window_can_exercise_forwarding(first_slot: u32, target_epoch: u32) -> bool {
+    let Some(last) = last_forwardable_phase() else {
+        return false;
+    };
+    let Some((start, _)) = submission_window(first_slot, target_epoch) else {
+        return false;
+    };
+    start % jam_types::epoch_period() <= last
+}
+
 /// Schedule delivery of each ticket within the epoch submission window.
 ///
-/// A ticket whose proxy is the NUT goes via CE 131 at `epoch_start + 1`; any
-/// other ticket is delivered via CE 132 at a deterministic slot in
-/// `[epoch_start + 1, epoch_start + 5]` (round-robin by author index).
+/// A ticket whose proxy is the NUT goes via CE 131 at the window's first slot;
+/// any other ticket is delivered via CE 132 at a deterministic slot spread
+/// across the window (round-robin by author index).
+///
+/// The schedule is clamped to [`submission_window`], so no delivery lands in
+/// the epoch tail or after the target epoch has already begun. The old
+/// schedule ran `first_slot..first_slot + 5` unconditionally, which in a run
+/// that started late in an epoch put most deliveries past the tail and the
+/// rest inside the target epoch itself, where every one of them is correctly
+/// refused.
 pub fn plan_tickets(
     tickets: &[EmulatedTicket],
     nut_index: usize,
     first_slot: u32,
     target_epoch: u32,
 ) -> Vec<ScheduledTicket> {
-    tickets
+    let Some((start, end)) = submission_window(first_slot, target_epoch) else {
+        return Vec::new();
+    };
+    let span = end - start + 1;
+    let (faults, withdrawn) = plan_faults(tickets, nut_index, start, end, target_epoch);
+    let mut scheduled: Vec<ScheduledTicket> = tickets
         .iter()
-        .map(|t| {
+        .enumerate()
+        // A ticket a fault reuses is delivered only as that fault. Sending it
+        // honestly as well would put the same id in both the set a block must
+        // carry and the set it must not, and one of the two would fail
+        // whatever the node did.
+        .filter(|(i, _)| !withdrawn.contains(i))
+        .map(|(_, t)| {
             if t.proxy == nut_index {
                 ScheduledTicket {
                     ticket: t.clone(),
                     delivery: TicketDelivery::Ce131,
-                    slot: first_slot,
+                    slot: start,
                     target_epoch,
+                    fault: None,
+                    plan_index: 0,
                 }
             } else {
                 ScheduledTicket {
                     ticket: t.clone(),
                     delivery: TicketDelivery::Ce132,
-                    slot: first_slot + (t.author % 5) as u32,
+                    slot: start + (t.author as u32 % span),
                     target_epoch,
+                    fault: None,
+                    plan_index: 0,
                 }
             }
         })
-        .collect()
+        .collect();
+    scheduled.extend(faults);
+    for (i, entry) in scheduled.iter_mut().enumerate() {
+        entry.plan_index = i;
+    }
+    scheduled
+}
+
+/// Corrupt a ring signature without touching the ticket id.
+///
+/// The id is the proof's VRF output, which lives in the leading bytes, so a
+/// byte flipped deep in the signature body leaves the id — and therefore the
+/// designated proxy — exactly as it was. That matters: a [`TicketFault::BadProof`]
+/// whose id moved would be proxied to some other validator, and the run could
+/// not tell a node refusing a bad proof from one refusing a ticket it was not
+/// the proxy for. `bad_proof_keeps_the_id_and_loses_the_proof` holds it.
+fn corrupt_proof(proof: &[u8; 784]) -> [u8; 784] {
+    let mut corrupted = *proof;
+    let last = corrupted.len() - 1;
+    corrupted[last] ^= 0xff;
+    corrupted
+}
+
+/// The deliberately-wrong deliveries for this window, and the indices into
+/// `tickets` whose honest delivery they replace.
+///
+/// Selection is deterministic in `tickets`, so a plan is reproducible. Faults
+/// other than [`TicketFault::BadProof`] draw from tickets the NUT is *not*
+/// proxy for, which keeps the proxied set — the forwarding control the fault
+/// verdicts are gated on — intact. `BadProof` has to draw from that set,
+/// because the whole point is a ticket the NUT is proxy for, so it is skipped
+/// when it would take the last one.
+pub fn plan_faults(
+    tickets: &[EmulatedTicket],
+    nut_index: usize,
+    start: u32,
+    end: u32,
+    target_epoch: u32,
+) -> (Vec<ScheduledTicket>, Vec<usize>) {
+    let proxied_to_nut: Vec<usize> = (0..tickets.len())
+        .filter(|&i| tickets[i].proxy == nut_index)
+        .collect();
+    let mut others = (0..tickets.len()).filter(|&i| tickets[i].proxy != nut_index);
+
+    let mut faults = Vec::new();
+    let mut withdrawn = Vec::new();
+    let early = (start + 1).min(end);
+    let mut inject = |index: usize, fault: TicketFault, delivery, slot, epoch, withdraw: bool| {
+        let mut ticket = tickets[index].clone();
+        match fault {
+            TicketFault::BadProof => ticket.proof = corrupt_proof(&ticket.proof),
+            // At the cap, not above it: the first value the node must refuse.
+            // It checks the attempt before the proof, so the proof staying
+            // valid for the original attempt costs nothing.
+            TicketFault::BadAttempt => {
+                ticket.attempt = jam_types::tickets_per_validator(jam_types::max_val_count())
+            }
+            _ => {}
+        }
+        if withdraw {
+            withdrawn.push(index);
+        }
+        faults.push(ScheduledTicket {
+            ticket,
+            delivery,
+            slot,
+            target_epoch: epoch,
+            fault: Some(fault),
+            plan_index: 0,
+        });
+    };
+
+    // A bad proof needs a ticket the NUT really is the proxy for, and the
+    // forwarding control needs one too. With only one to go round, the
+    // control wins: a fault that destroys the evidence its own verdict is
+    // gated on buys nothing, and the lane reports it as unexercised.
+    if proxied_to_nut.len() >= 2 {
+        inject(
+            proxied_to_nut[0],
+            TicketFault::BadProof,
+            TicketDelivery::Ce131,
+            early,
+            target_epoch,
+            true,
+        );
+    }
+    // CE 131 to a node that is not this ticket's proxy — that *is* the fault.
+    if let Some(i) = others.next() {
+        inject(
+            i,
+            TicketFault::WrongProxy,
+            TicketDelivery::Ce131,
+            early,
+            target_epoch,
+            true,
+        );
+    }
+    // The rest go out as CE 132, where the proxy plays no part: sending them
+    // over CE 131 from a ticket the NUT is not proxy for would make every one
+    // of them a wrong-proxy case as well, and no verdict could say which
+    // defect the node had answered.
+    if let Some(i) = others.next() {
+        inject(
+            i,
+            TicketFault::StaleEpoch,
+            TicketDelivery::Ce132,
+            early,
+            // The epoch now closing, whose tickets were due an epoch ago.
+            target_epoch.saturating_sub(1),
+            true,
+        );
+    }
+    if let Some(i) = others.next() {
+        inject(
+            i,
+            TicketFault::BadAttempt,
+            TicketDelivery::Ce132,
+            early,
+            target_epoch,
+            true,
+        );
+    }
+    if let Some(i) = others.next() {
+        // Past the window on purpose. The sender's readiness gate must let
+        // this one through: being late is the stimulus.
+        inject(
+            i,
+            TicketFault::Late,
+            TicketDelivery::Ce132,
+            jam_types::epoch_tail_start()
+                + (end / jam_types::epoch_period()) * jam_types::epoch_period(),
+            target_epoch,
+            true,
+        );
+    }
+    if let Some(i) = others.next() {
+        // Last inside the window: a node that answers by dropping the
+        // connection rather than resetting the stream must not cost the run
+        // its legitimate deliveries.
+        inject(
+            i,
+            TicketFault::UnknownEpoch,
+            TicketDelivery::Ce132,
+            end,
+            // `target_epoch` is already the next epoch, so `+ 1` is the first
+            // one no validator can hold the entropy for yet.
+            target_epoch + 1,
+            true,
+        );
+    }
+    // The exception: a second copy of a ticket that stays honestly delivered,
+    // so the block still owes it a place — once.
+    if let Some(i) = others.next() {
+        inject(
+            i,
+            TicketFault::Duplicate,
+            TicketDelivery::Ce132,
+            (start + 2).min(end),
+            target_epoch,
+            false,
+        );
+    }
+    (faults, withdrawn)
+}
+
+/// The ticket id carried by a ring signature: its VRF output.
+///
+/// A ticket announced over CE 131/132 is just an attempt index and a proof;
+/// the id a block's extrinsic is keyed by is derived from the proof, so the
+/// harness can recognise the node's own tickets in its own blocks without
+/// having been told them.
+pub fn ticket_id(proof: &[u8; 784]) -> [u8; 32] {
+    ring_vrf::Signature(*proof).vrf_output().0
 }
 
 /// Verify a ticket's ring signature against the context's validator ring.
@@ -178,13 +487,13 @@ mod tests {
 
     #[test]
     fn tickets_generate_and_verify() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(1..6)?;
+        let chain = RefChain::tiny(0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         assert!(!tickets.is_empty(), "expected emulated tickets");
         assert_eq!(
             tickets.len(),
-            5 * jam_types::tickets_attempts_number() as usize
+            5 * jam_types::tickets_per_validator(jam_types::max_val_count()) as usize
         );
         for t in &tickets {
             assert!(
@@ -199,7 +508,7 @@ mod tests {
 
     #[test]
     fn ticket_wrong_attempt_fails_verify() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(1..6)?;
+        let chain = RefChain::tiny(0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         let t = &tickets[0];
@@ -221,42 +530,346 @@ mod tests {
 
     #[test]
     fn plan_slots_within_window() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(1..6)?;
+        let chain = RefChain::tiny(0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         let nut_index = 0;
-        let first = 1001;
-        let plan = plan_tickets(&tickets, nut_index, first, 42);
+        let period = jam_types::epoch_period();
+        let target_epoch = 42;
+        // Early in epoch 41, so the whole submission window is still ahead.
+        let first = 41 * period + 1;
+        let (start, end) = submission_window(first, target_epoch).expect("window is open");
+        let plan = plan_tickets(&tickets, nut_index, first, target_epoch);
         assert!(!plan.is_empty());
-        for s in &plan {
+        // The honest half of the plan. A fault is the harness breaking a rule
+        // on purpose and is held to its own expectations, below.
+        for s in plan.iter().filter(|s| s.fault.is_none()) {
             assert!(
-                (first..first + 5).contains(&s.slot),
-                "slot {} outside submission window",
+                (start..=end).contains(&s.slot),
+                "slot {} outside submission window {start}..={end}",
                 s.slot
             );
-            assert_eq!(s.target_epoch, 42);
+            assert_eq!(s.target_epoch, target_epoch);
             if s.ticket.proxy == nut_index {
                 assert_eq!(s.delivery, TicketDelivery::Ce131);
-                assert_eq!(s.slot, first);
+                assert_eq!(s.slot, start);
             } else {
                 assert_eq!(s.delivery, TicketDelivery::Ce132);
             }
         }
-        let plan2 = plan_tickets(&tickets, nut_index, first, 42);
+        let plan2 = plan_tickets(&tickets, nut_index, first, target_epoch);
         assert_eq!(plan, plan2);
         Ok(())
     }
 
+    /// Every planned slot must be one in which the node may still accept a
+    /// ticket: inside the epoch before the target, and before that epoch's
+    /// tail. A schedule that violates either is a harness fault reported as a
+    /// node one.
     #[test]
-    fn entropy_from_storage_index_1() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(1..6)?;
+    fn plan_never_schedules_past_the_tail_or_into_the_target_epoch() -> Result<(), ChainError> {
+        let chain = RefChain::tiny(0)?;
+        let ctx = chain.ticket_ctx()?;
+        let tickets = chain.generate_tickets(&ctx)?;
+        let period = jam_types::epoch_period();
+        let tail = jam_types::epoch_tail_start();
+        let target_epoch = 42;
+
+        for offset in 0..period {
+            let plan = plan_tickets(&tickets, 0, 41 * period + offset, target_epoch);
+            for s in plan.iter().filter(|s| s.fault.is_none()) {
+                assert_eq!(s.slot / period, 41, "slot {} left epoch 41", s.slot);
+                assert!(s.slot % period < tail, "slot {} is in the tail", s.slot);
+                assert!(
+                    s.slot >= 41 * period + offset,
+                    "slot {} is in the past",
+                    s.slot
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A window that opens inside the lottery's first half can exercise the
+    /// proxy duty; one that opens later cannot, however much of the
+    /// submission window is still ahead of it. The distinction is the whole
+    /// point: a run starting at phase 8 still delivers tickets the node must
+    /// accept, and still cannot ask it to forward one.
+    #[test]
+    fn forwarding_window_closes_before_the_submission_window() -> Result<(), ChainError> {
+        // Applies the tiny parameters process-wide, which the phase
+        // arithmetic below reads.
+        let _chain = RefChain::tiny(0)?;
+        let period = jam_types::epoch_period();
+        let last = last_forwardable_phase().expect("tiny leaves room to forward");
+        let target_epoch = 42;
+
+        for offset in 0..period {
+            let first = 41 * period + offset;
+            let can = window_can_exercise_forwarding(first, target_epoch);
+            match submission_window(first, target_epoch) {
+                // `first_delivery_slot` is not applied here, so the window
+                // opens at `first` itself.
+                Some((start, _)) => assert_eq!(
+                    can,
+                    start % period <= last,
+                    "offset {offset}: window opens at phase {}",
+                    start % period
+                ),
+                None => assert!(!can, "offset {offset}: a closed window forwards nothing"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Every plan carries exactly one ticket for an epoch past the node's
+    /// horizon, so each run exercises the reset rule (`simple.md:335-337`).
+    /// A bad-proof fault must fail verification while keeping the ticket id,
+    /// and therefore the designated proxy, exactly as it was. If the id moved
+    /// the ticket would be proxied elsewhere and the run could not tell a
+    /// node refusing a bad proof from one refusing a ticket it was not proxy
+    /// for.
+    #[test]
+    fn bad_proof_keeps_the_id_and_loses_the_proof() -> Result<(), ChainError> {
+        let chain = RefChain::tiny(0)?;
+        let ctx = chain.ticket_ctx()?;
+        let tickets = chain.generate_tickets(&ctx)?;
+        let honest = &tickets[0];
+
+        let corrupted = corrupt_proof(&honest.proof);
+
+        assert!(
+            verify_ticket(&ctx, honest.attempt, &honest.proof),
+            "the ticket it is built from verifies"
+        );
+        assert!(
+            !verify_ticket(&ctx, honest.attempt, &corrupted),
+            "the corrupted proof does not"
+        );
+        assert_eq!(
+            ticket_id(&corrupted),
+            honest.id,
+            "and the id, which decides the proxy, is untouched"
+        );
+        Ok(())
+    }
+
+    /// The invariant the whole fault catalogue rests on: no ticket id is both
+    /// owed a place in a block and forbidden from one. Three faults reuse a
+    /// valid proof, so their ids equal an honest ticket's; each withdraws that
+    /// honest delivery. `Duplicate` is the exception and is owed inclusion.
+    #[test]
+    fn no_id_is_both_expected_and_forbidden() -> Result<(), ChainError> {
+        let chain = RefChain::tiny(0)?;
+        let ctx = chain.ticket_ctx()?;
+        let tickets = chain.generate_tickets(&ctx)?;
+        let period = jam_types::epoch_period();
+        let target_epoch = 42;
+        let plan = plan_tickets(&tickets, 5, 41 * period + 1, target_epoch);
+
+        let expected: Vec<[u8; 32]> = plan
+            .iter()
+            .filter(|s| s.fault.is_none_or(|f| f.still_owed_inclusion()))
+            .filter(|s| s.target_epoch == target_epoch)
+            .map(|s| s.ticket.id)
+            .collect();
+        let forbidden: Vec<[u8; 32]> = plan
+            .iter()
+            .filter(|s| s.fault.is_some_and(|f| !f.still_owed_inclusion()))
+            .map(|s| s.ticket.id)
+            .collect();
+
+        assert!(!forbidden.is_empty(), "the plan injects faults at all");
+        for id in &forbidden {
+            assert!(
+                !expected.contains(id),
+                "ticket {:02x?} is both owed a block and forbidden from one",
+                &id[..4],
+            );
+        }
+        Ok(())
+    }
+
+    /// Each fault is injected once, and the faults that reuse a valid proof
+    /// take that ticket's honest delivery with them.
+    #[test]
+    fn every_fault_is_injected_once_and_withdraws_what_it_reuses() -> Result<(), ChainError> {
+        let chain = RefChain::tiny(0)?;
+        let ctx = chain.ticket_ctx()?;
+        let tickets = chain.generate_tickets(&ctx)?;
+        let period = jam_types::epoch_period();
+        let target_epoch = 42;
+        let nut_index = 5;
+        let (faults, withdrawn) = plan_faults(
+            &tickets,
+            nut_index,
+            41 * period + 1,
+            41 * period + 9,
+            target_epoch,
+        );
+
+        let mut kinds: Vec<TicketFault> = faults.iter().filter_map(|s| s.fault).collect();
+        let before = kinds.len();
+        kinds.sort_by_key(|f| format!("{f:?}"));
+        kinds.dedup();
+        assert_eq!(kinds.len(), before, "no fault is injected twice");
+
+        // Every fault but `Duplicate` withdraws the honest delivery of the
+        // ticket it reuses; `Duplicate` is a second copy of one that stays.
+        let withdrawing = faults
+            .iter()
+            .filter(|s| s.fault.is_some_and(|f| !f.still_owed_inclusion()))
+            .count();
+        assert_eq!(
+            withdrawn.len(),
+            withdrawing,
+            "one withdrawal per fault that must leave no trace"
+        );
+        let mut unique = withdrawn.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), withdrawn.len(), "no ticket withdrawn twice");
+        Ok(())
+    }
+
+    /// A bad proof needs a ticket the NUT is proxy for, and so does the
+    /// forwarding control the fault verdicts are gated on. With one to go
+    /// round, the control wins.
+    #[test]
+    fn bad_proof_is_skipped_rather_than_consume_the_only_control() -> Result<(), ChainError> {
+        let chain = RefChain::tiny(0)?;
+        let ctx = chain.ticket_ctx()?;
+        let all = chain.generate_tickets(&ctx)?;
+        let nut_index = 5;
+        let period = jam_types::epoch_period();
+        let (start, end) = (41 * period + 1, 41 * period + 9);
+
+        let proxied: Vec<EmulatedTicket> = all
+            .iter()
+            .filter(|t| t.proxy == nut_index)
+            .cloned()
+            .collect();
+        assert!(!proxied.is_empty(), "the fixture has a proxied ticket");
+        let others: Vec<EmulatedTicket> = all
+            .iter()
+            .filter(|t| t.proxy != nut_index)
+            .take(6)
+            .cloned()
+            .collect();
+
+        let one = [&proxied[..1], &others[..]].concat();
+        let (faults, _) = plan_faults(&one, nut_index, start, end, 42);
+        assert!(
+            !faults
+                .iter()
+                .any(|s| s.fault == Some(TicketFault::BadProof)),
+            "with one proxied ticket the control keeps it"
+        );
+
+        if proxied.len() >= 2 {
+            let two = [&proxied[..2], &others[..]].concat();
+            let (faults, _) = plan_faults(&two, nut_index, start, end, 42);
+            assert!(
+                faults
+                    .iter()
+                    .any(|s| s.fault == Some(TicketFault::BadProof)),
+                "with two, one can be spared"
+            );
+        }
+        Ok(())
+    }
+
+    /// The late fault is the one delivery deliberately outside the window:
+    /// being too late is the stimulus, so the schedule must not clamp it.
+    #[test]
+    fn the_late_fault_is_scheduled_past_the_window() -> Result<(), ChainError> {
+        let chain = RefChain::tiny(0)?;
+        let ctx = chain.ticket_ctx()?;
+        let tickets = chain.generate_tickets(&ctx)?;
+        let period = jam_types::epoch_period();
+        let target_epoch = 42;
+        let first = 41 * period + 1;
+        let (_, end) = submission_window(first, target_epoch).expect("window is open");
+
+        let plan = plan_tickets(&tickets, 5, first, target_epoch);
+        let late = plan
+            .iter()
+            .find(|s| s.fault == Some(TicketFault::Late))
+            .expect("a late fault is planned");
+
+        assert!(late.slot > end, "slot {} is inside the window", late.slot);
+        assert!(
+            late.slot % period >= jam_types::epoch_tail_start(),
+            "slot {} is not in the tail",
+            late.slot
+        );
+        assert_eq!(late.slot / period, 41, "and has not left the epoch");
+        Ok(())
+    }
+
+    /// The unknown-epoch fault is delivered last inside the window and
+    /// reuses a real proof, costing no extra ring-VRF work.
+    #[test]
+    fn plan_carries_one_unknown_epoch_fault() -> Result<(), ChainError> {
+        let chain = RefChain::tiny(0)?;
+        let ctx = chain.ticket_ctx()?;
+        let tickets = chain.generate_tickets(&ctx)?;
+        let period = jam_types::epoch_period();
+        let target_epoch = 42;
+        let first = 41 * period + 1;
+        let (_, end) = submission_window(first, target_epoch).expect("window is open");
+
+        let plan = plan_tickets(&tickets, 0, first, target_epoch);
+        let probes: Vec<&ScheduledTicket> = plan
+            .iter()
+            .filter(|s| s.fault == Some(TicketFault::UnknownEpoch))
+            .collect();
+        assert_eq!(probes.len(), 1, "exactly one unknown-epoch fault");
+        assert!(
+            probes[0].target_epoch > target_epoch,
+            "it names an epoch past the one being submitted into"
+        );
+        assert_eq!(probes[0].slot, end, "delivered last inside the window");
+        assert_eq!(probes[0].delivery, TicketDelivery::Ce132);
+        Ok(())
+    }
+
+    /// Generation that overruns the submission window yields no plan at all,
+    /// rather than deliveries the node must refuse.
+    #[test]
+    fn plan_is_empty_once_the_window_has_closed() -> Result<(), ChainError> {
+        let chain = RefChain::tiny(0)?;
+        let ctx = chain.ticket_ctx()?;
+        let tickets = chain.generate_tickets(&ctx)?;
+        let period = jam_types::epoch_period();
+        let tail = jam_types::epoch_tail_start();
+
+        // The first slot of the tail: nothing may still be submitted.
+        let first = 41 * period + tail;
+        assert_eq!(submission_window(first, 42), None);
+        assert!(plan_tickets(&tickets, 0, first, 42).is_empty());
+        // And the slot before it still has room for exactly one.
+        assert_eq!(
+            submission_window(first - 1, 42),
+            Some((first - 1, first - 1))
+        );
+        Ok(())
+    }
+
+    /// A submitted ticket is checked against entropy buffer entry 2, so that
+    /// is what it must be sealed with. This test previously asserted entry 1
+    /// -- pinning the defect in place rather than catching it -- and the node
+    /// rejected every ticket the emulator offered.
+    #[test]
+    fn tickets_are_sealed_with_the_entropy_a_node_checks_them_against() -> Result<(), ChainError> {
+        let chain = RefChain::tiny(0)?;
         let ctx = chain.ticket_ctx()?;
         assert_eq!(ctx.entropy.len(), 32);
         let storage = chain.harness().storage(None);
         let entropy = storage
             .entropy()
             .map_err(|e| ChainError::Tickets(e.to_string()))?;
-        assert_eq!(ctx.entropy, entropy[1].0);
+        assert_eq!(ctx.entropy, entropy[2].0);
         Ok(())
     }
 

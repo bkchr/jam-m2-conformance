@@ -1,6 +1,8 @@
 # JAM M2 Conformance Harness — Design
 
-Status: draft for review, 2026-09-03. Implementation now exists for P0 + L0/L1/L2 (see README.md); this document remains the design contract.
+Status: draft for review, 2026-09-03. Implementation now exists for P0 + N0/N1/N2 (see README.md); this document remains the design contract.
+
+**Lane naming.** The M2 lanes are **N0–N7** (`N` for network). They were called L0–L7 in the first draft of this document and in the code, which collides with M1's L0–L3 — a different axis that already appears in the published conformance matrix. The reports this harness emits go to the same teams that read that matrix, so the names had to differ. The one L0–L3 left in this document, under §1, is M1's and stays as it is.
 
 ## 1. Goals and non-goals
 
@@ -124,7 +126,7 @@ expression power of code. Rust is also the language a conformance reviewer alrea
 // src/scenarios/l3.rs — one function per scenario
 use crate::{check, log, stimulus::{self, *}, expect::Seq as *};
 
-/// L3: a work-package is submitted to the NUT; it must refine, share (CE 134 ×2)
+/// N3: a work-package is submitted to the NUT; it must refine, share (CE 134 ×2)
 /// with its co-guarantors and report (CE 135) to all validators.
 pub fn wp_refine_and_report(net: &mut Net, sched: &mut Scheduler) -> CheckId {
     check("wp_refine_and_report", sched, |obs| {
@@ -257,7 +259,7 @@ executes their checks and renders a coverage table (§11 row ↔ scenario module
 - Default tolerances (soft in v1): NUT block announced within `[slot_start, slot_start + 4 s]`;
   assurance received within `[slot_start − 4 s, slot_start]`; CE 135 within 2 slots of the CE 133
   submission; tickets delivered before slot 10 of the epoch. Ordering and validity are hard.
-- Lane sizing: L0 one epoch; most lanes two to three epochs so that epoch transitions and the
+- Lane sizing: N0 one epoch; most lanes two to three epochs so that epoch transitions and the
   rotation period (4 slots) are exercised.
 
 ## 7. Node-under-test contract
@@ -295,14 +297,16 @@ Bandersnatch secrets, BLS optional (zero placeholder as in polkajam `keyset.rs:7
 | variable | meaning |
 |---|---|
 | `JAM_M2=1` | enable M2 conformance mode |
-| `JAM_M2_SPEC` | path to the spec file above |
+| `JAM_M2_SPEC` | path to the spec file above, in the M2 standard format (`spec-m2.json`) |
 | `JAM_M2_ED25519_SECRET`, `JAM_M2_BANDERSNATCH_SECRET` | hex, 32 bytes each |
 | `JAM_M2_LISTEN` | `[::]:<port>` |
 | `JAM_M2_PUBLIC_ADDR` | `<ipv6>:<port>` as carried in genesis metadata |
 | `JAM_M2_DATA_PATH`, `JAM_M2_LOG_LEVEL` | as in M1 |
 
-**Launch.** Command template with placeholders `{spec} {ed25519_secret} {bandersnatch_secret}
-{listen} {public_addr} {data} {log_level}`. Presets: `docker` (host network, because QUIC is UDP and
+**Launch.** Command template with placeholders `{spec} {m2_spec} {ed25519_secret}
+{bandersnatch_secret} {listen} {public_addr} {data} {log_level}`. `{spec}` is polkajam's native
+format and `{m2_spec}` the M2 standard one; a preset passes whichever its node reads, and only
+the `polkajam` preset reads the former. Presets: `docker` (host network, because QUIC is UDP and
 the NUT must be able to *initiate* connections under the preferred-initiator rule) and `polkajam`
 (`polkajam --chain {spec} run --key-seed-file … --listen-ip … --port … --mode validator`, once the
 spec adapter exists).
@@ -375,7 +379,7 @@ substitute for the catalogue.
 
 - ALPN: polkajam emits `jamnp-s/0/…` (`node/src/net/mod.rs:99-105`); the spec says version `1`
   (`:51-53`). Polkajam's prefix `u32::from_be_bytes(first 4 bytes)` formatted `{:08x}` equals "first
-  8 nibbles". Polkajam as NUT fails L0 until it bumps the version.
+  8 nibbles". Polkajam as NUT fails N0 until it bumps the version.
 - Polkajam defines CE 149–152 (GRANDPA vote/commit/state/catch-up), absent from the spec. The harness
   refuses unknown kinds; a NUT opening an unknown kind is a soft finding.
 - Finality is unspecified in jam-np (polkajam default `FinalityMode::Dummy`, `node/src/node/config.rs:404`).
@@ -385,12 +389,23 @@ substitute for the catalogue.
   the harness offers only `jamnp-s/1/…`.
 - CE 134's explicit `Shard Count` is the newest spec change (jam-np commit `06a2fe9`); verify
   polkajam's `WorkPackageSharing` sends it before using it as reference.
+- Ticket attempts per validator: §2 records tiny `N = 3` from the `w3f/jamtestvectors` README, and
+  that figure predates GP 0.8.0. Polkajam carried an explicit `tickets_attempts_number` (tiny = 3)
+  until `7b7993c8 GP 0.8.0 (#1024)` replaced it with a quantity derived from two parameters that
+  remain, `tickets_per_validator(val_count) = ⌈2·E / V⌉ = ⌈24/6⌉ = `**`4`**, applied as the cap at
+  all three points it matters — generation, the CE 131 attempt check, and the Safrole STF. This
+  harness targets GP 0.8.0 (§2) and pins a revision after that change, so **4 is the live figure**:
+  it generates and judges against 4, and `spec-m2.json` declares 4. §2's `N = 3` is the stale one
+  and is kept only as the provenance of the number. Confirm with the conformance group that the
+  tiny vector set has followed GP 0.8.0 here; if it has not, a node built to the vectors will make
+  three attempts where the harness expects four, and `m2-runner`'s
+  `m2_spec_parameters_match_the_engine` is where that surfaces.
 
 ## 11. Lanes and check catalogue
 
 Line numbers refer to `jam-np/simple.md`. Severity is hard unless marked *(soft)*.
 
-### L0 — connectivity and sync (1 epoch)
+### N0 — connectivity and sync (1 epoch)
 
 | Check | Emulated side | Assertions on NUT | Faults → expected |
 |---|---|---|---|
@@ -405,7 +420,7 @@ Line numbers refer to `jam-np/simple.md`. Severity is hard unless marked *(soft)
 | CE 128 fetch | reply to NUT requests | after an announcement of an unknown block the NUT fetches missing parents; never re-fetches known blocks *(soft)* | wrong-parent block → not announced; reset → retry another peer *(soft)* |
 | CE 129 `:267-303` | ranges with various Max Size | 31-byte sorted keys in range; boundary nodes parent-before-child, no duplicates `:275-281`; size cap `:283-285`; `len++` values | unknown hash → reset |
 
-### L1 — block authoring, fuzzer-validated (2 epochs)
+### N1 — block authoring, fuzzer-validated (2 epochs)
 
 | Check | Assertions | Faults |
 |---|---|---|
@@ -416,17 +431,74 @@ Line numbers refer to `jam-np/simple.md`. Severity is hard unless marked *(soft)
 | Extrinsic completeness | includes every valid ticket/guarantee/assurance/preimage/judgment delivered ≥2 s before the slot; excludes every injected-invalid item; assurance anchor = parent | item delivered 200 ms before the slot → inclusion optional *(soft)* |
 | Skipped slots | emulated author skips → NUT's next block has the gap and the correct parent | — |
 
-### L2 — Safrole tickets, CE 131/132 `:305-349` (2 epochs)
+### N2 — Safrole tickets, CE 131/132 `:305-349` (2 epochs)
 
 | Check | Assertions | Faults |
 |---|---|---|
-| Generation, step 1 (NUT → proxy, CE 131) | ≤3 tickets per epoch; proxy from the next-epoch list; from slot ≥ epoch_start+1; `Epoch(next) ++ Attempt(<3) ++ [u8;784]` `:340-346`; proof verifies against ring root and η'₂ | — |
-| Self-proxy (CE 132) | tickets whose proxy is the NUT go directly to all current validators `:322-325` | — |
-| Proxy duty (accept 131, send 132) | verify, then forward to all five emulated; earliest slot ≥ epoch_start+1, spread until slot 5 `:329-332`; stop after finalized inclusion *(soft)* | bad proof / wrong proxy / wrong epoch → no forward, no inclusion; slot ≥ 10 → not included |
-| Inclusion | NUT block has all valid received tickets, sorted, deduplicated; empty extrinsic when slot ≥ 10 | duplicate → once |
+| Generation, step 1 (NUT → proxy, CE 131) | ≤ `A` tickets per epoch; proxy drawn from the next-epoch validator set, by the selection rule below *(soft)*; from slot ≥ epoch_start+1; `Epoch(next) ++ Attempt(<A) ++ [u8;784]` `:340-346`; proof verifies against ring root and η'₂ | — |
+| Self-proxy (CE 132) | tickets the NUT generated **and** is itself the proxy for go directly to all current validators `:322-325`. A ticket it forwards as another validator's proxy is the row below, not this one | — |
+| Proxy duty (accept 131, send 132) | verify, then forward to all five emulated; the forward is not before the arrival and lands inside the lottery (phase < `Y`); window per the formula below *(soft)*; stop after finalized inclusion *(soft)* | bad proof / wrong proxy / wrong epoch → no forward, no inclusion; slot ≥ `Y` → not included |
+| Inclusion | NUT blocks have all valid received tickets, sorted, deduplicated; empty extrinsic when slot ≥ 10 | duplicate → once |
 | Unknown epoch | ticket for epoch+2 → reset `:335-337` | — |
 
-### L3 — guaranteeing, CE 133/146/134/135/148 (2–3 epochs)
+`A` is the per-validator attempt cap, `tickets_per_validator(V) = ⌈2·E / V⌉` — **4** under
+tiny, not the `N = 3` of §2, which predates GP 0.8.0 (§10). `Y` is `epoch_tail_start`, 10
+under tiny.
+
+**Proxy selection.** `proxy_index(ticket_id, V) = u32::from_be(ticket_id[28..32]) mod V`,
+over the *next-epoch* validator set. Whether this is normative or implementation-defined is
+§12 question 9; the harness grades it soft until that is settled. Note that set membership
+on its own is not gradable with this topology — the harness holds endpoints only for
+validators, so a CE 131 sent to a non-validator cannot be observed.
+
+**Forward window.** The proxy delays before forwarding, to avoid exposing when the
+generator sent:
+
+| phase | formula | full (E=600) | tiny (E=12) |
+|---|---|---|---|
+| forward start | `conn + max(E/20, 1)` | 50 | 2 |
+| forward end | `min(Y, max(Y/2, start + m))` | 250 | 7 |
+| lottery end | `Y` | 500 | 10 |
+
+with `conn = max(E/30, 1)` and `m = 5` (polkajam's `MIN_FORWARD_WINDOW`). Earlier revisions
+of this table said "spread until slot 5", which is the nominal `Y/2` and correct at full
+spec; under tiny the minimum-window clamp legitimately carries the end to 7, so a hard
+bound at 5 would fail a conforming node. Only `phase < Y` is asserted hard.
+
+**The stopping rule.** "Stop after finalized inclusion" is judged against the node's *own*
+account of finality, not the harness's: §10 defines depth ≥ 2 for the rules the harness
+applies, but this one is a decision the node makes, and it publishes what it considers
+final in the `Final` of every UP 0 message. A forwarded ticket is finalized-included from
+the first moment the node advertised a `Final` at or past the slot of its own block
+carrying it. Two silences would otherwise read as obedience, so two controls gate the row:
+the run must have watched on past that moment — a node still advertising a slot later
+could have forwarded again — and the node must repeat a forward *somewhere* in the run.
+polkajam sends exactly one CE 132 frame per ticket per peer, so against it the rule holds
+however it is written and the row reports itself unexercised, which is the expected
+verdict and not a defect in either the node or the rule. A node that re-gossips is the one
+it bites.
+
+**Which blocks.** The subject is every block the NUT authored in the epoch its tickets were
+submittable in, not that epoch's newest. The tail rule, sortedness and "carried nothing the
+harness never sent" are properties of a block on its own and are reported once per block;
+"no faulted ticket" is a property of the epoch, since a node could otherwise bury one in
+any block but the last. Coverage is judged once, against what the node held by its last
+chance to include — the arrival lead of the N1 Extrinsic-completeness row — because a block
+sealed before a ticket arrived is owed nothing, and a ticket carried early is on chain and
+owed by no later block. Strict per-block completeness is the N1 row's; this lane does not
+repeat it.
+
+**Faults.** The prohibitions above are negatives, and are reported only alongside the
+control that makes them mean something: a node that forwards nothing and authors nothing
+satisfies every "must not" without deciding anything. "No forward" is further assertable
+only for the faults delivered over CE 131 — a node forwards what it is *proxy* for and
+does not rebroadcast a CE 132 arrival, so against a broadcast fault the rule holds in
+every run and tests nothing. The wrong-epoch and late faults reach the node over CE 132
+(sending them over CE 131 from a ticket the NUT does not proxy would make each of them a
+wrong-proxy case too, and no verdict could say which defect the node answered), so for
+those the assertion is "not included" alone.
+
+### N3 — guaranteeing, CE 133/146/134/135/148 (2–3 epochs)
 
 | Check | Assertions | Faults |
 |---|---|---|
@@ -438,7 +510,7 @@ Line numbers refer to `jam-np/simple.md`. Severity is hard unless marked *(soft)
 | CE 135 receive → inclusion | NUT includes reference-signed reports in its next block | one signature; unassigned signer; stale slot; duplicate core → excluded |
 | CE 148 `:650-673` | serves `[Segment] ++ [Import-Proof]` for own bundles; prefers 148 over 139/140 *(soft)*; ≤3072 per stream | corrupt segment → fallback to 139/140 `:660` |
 
-### L4 — availability, CE 137/138/139/140/141 (2 epochs)
+### N4 — availability, CE 137/138/139/140/141 (2 epochs)
 
 | Check | Assertions | Faults |
 |---|---|---|
@@ -450,7 +522,7 @@ Line numbers refer to `jam-np/simple.md`. Severity is hard unless marked *(soft)
 | CE 139/140 serve `:597-648` | 139 `[SegShard]`; 140 adds justification discriminator 0/1/2 `:637`; ≤2·3072 | over limit → reset |
 | CE 139/140 fetch | NUT reconstructs imports from 2 shards; 139 first, 140 on inconsistency `:625-630` | one corrupt shard → retries via 140 and completes |
 
-### L5 — auditing and disputes, CE 136/144/145/147 (2–3 epochs)
+### N5 — auditing and disputes, CE 136/144/145/147 (2–3 epochs)
 
 | Check | Assertions | Faults |
 |---|---|---|
@@ -461,7 +533,7 @@ Line numbers refer to `jam-np/simple.md`. Severity is hard unless marked *(soft)
 | CE 136 `:487-504` | serves held reports; on an unknown negatively-judged report requests it from the judging peer `:494-495` | — |
 | Later tranches | two or more emulated auditors no-show → NUT sends a tranche-n announcement 8 s later with `[sₙ(w) ++ len++[No-Show]]` `:769-775` | — |
 
-### L6 — preimages, CE 142/143 (1–2 epochs)
+### N6 — preimages, CE 142/143 (1–2 epochs)
 
 | Check | Assertions | Faults |
 |---|---|---|
@@ -470,7 +542,7 @@ Line numbers refer to `jam-np/simple.md`. Severity is hard unless marked *(soft)
 | Serve | returns the bytes, FIN | unknown → reset |
 | Inclusion | in the next NUT block, sorted; lookups updated | no longer requested → excluded |
 
-### L7 — adversarial and robustness (cross-cutting)
+### N7 — adversarial and robustness (cross-cutting)
 
 | Fault | Expected |
 |---|---|
@@ -493,17 +565,22 @@ Out of scope: GRANDPA/BEEFY (no JAMNP-S spec). Finality is emulated by the harne
 3. Is finality/GRANDPA in scope for M2? → no; harness-defined finality, documented.
 4. Which jam-np timings are normative? → soft in v1; ordering and validity hard.
 5. Required protocols → CE 129 required; CE 147/148 optional (fallback to 138/139 verified);
-   CE 136 required only in L5.
+   CE 136 required only in N5.
 6. jam-np has no tags → pin the commit hash in every report; ask for tagging.
-7. NUT index → 0 in all lanes; L7 rotates it.
+7. NUT index → 0 in all lanes; N7 rotates it.
 8. Clock → shared host clock, NTP-synced, 250 ms drift budget.
+9. Is the ticket proxy *selection* rule normative, or only the requirement that the proxy
+   come from the next-epoch set? → membership normative, selection implementation-defined;
+   the harness reports a mismatch against `proxy_index` as soft (§11 N2). Polkajam enforces
+   its own rule with `Error::NotCorrectProxy`, so a client that selects differently is
+   refused by it today.
 
 ## 13. Roadmap
 
 | phase | content |
 |---|---|
-| P0 | polkajam prerequisite PRs (§8); `jamnp-s` crate (endpoint, cert, ALPN, framing, all codecs); runner skeleton; L0 |
-| P1 | `m2-reference` wrapper; L1 authoring validation; L2 tickets |
-| P2 | L3 guaranteeing; L4 availability (erasure coding export) |
-| P3 | L5 auditing/disputes; L6 preimages |
-| P4 | L7 adversarial, index rotation, IPv6 variant; fuzz web UI integration; public trace format |
+| P0 | polkajam prerequisite PRs (§8); `jamnp-s` crate (endpoint, cert, ALPN, framing, all codecs); runner skeleton; N0 |
+| P1 | `m2-reference` wrapper; N1 authoring validation; N2 tickets |
+| P2 | N3 guaranteeing; N4 availability (erasure coding export) |
+| P3 | N5 auditing/disputes; N6 preimages |
+| P4 | N7 adversarial, index rotation, IPv6 variant; fuzz web UI integration; public trace format |

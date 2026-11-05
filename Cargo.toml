@@ -15,14 +15,19 @@ license = "Apache-2.0"
 repository = "https://github.com/paritytech/jam-m2-conformance"
 
 # Polkajam reference-engine crates are git dependencies pinned to a commit
-# (DESIGN.md §8). Nothing from polkajam is vendored into this repository; the
-# two local patches in `patches/` apply only to the NUT *binary*, built by
-# `scripts/prepare-nut.sh` into the gitignored `third_party/`.
+# (DESIGN.md §8). Nothing from polkajam is vendored into this repository.
+#
+# This pin is the single source of the polkajam revision: `scripts/prepare-nut.sh`
+# reads it from here to build the NUT *binary* into the gitignored `third_party/`,
+# so the node under test and the engine that grades it are the same build.
+# Re-pinning is deliberate -- upstream HEAD has broken this workspace three times
+# in four weeks -- so move it at most once per milestone, in a commit of its own
+# that records what changed in the genesis writer and the hazmat exports.
 [workspace.dependencies]
-jam-types = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "44cc3ec20ea4bbfd75df6b56e3b7798eab1b15b2" }
-jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "44cc3ec20ea4bbfd75df6b56e3b7798eab1b15b2" }
-jam-node = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "44cc3ec20ea4bbfd75df6b56e3b7798eab1b15b2", features = ["hazmat"] }
-polkajam-fuzz = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "44cc3ec20ea4bbfd75df6b56e3b7798eab1b15b2" }
+jam-types = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a" }
+jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a" }
+jam-node = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a", features = ["hazmat"] }
+polkajam-fuzz = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a" }
 
 quinn = { version = "0.11", features = ["rustls", "runtime-tokio", "log"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -42,3 +47,21 @@ rand = "0.8"
 
 [profile.release]
 opt-level = 2
+
+# `jam-node`'s build script embeds the `jam-bootstrap-service` blob only when the
+# profile says `debug = false`; otherwise it defers the build to the first call at
+# runtime, which resolves the workspace from the *caller's* working directory. For
+# a test that is its own crate root, so the lookup lands in this workspace, where
+# no such package exists. Building jam-node without debug info keeps the blob
+# baked in and every `RefChain` test runnable.
+[profile.dev.package.jam-node]
+debug = false
+
+# Ring-VRF proving is the harness's one hot path: twenty proofs take 46 s
+# unoptimized, which is 7.7 of an epoch's 12 slots under the tiny parameters.
+# A run that starts more than a slot or two into an epoch then finishes proving
+# after the ticket submission window has closed, and both ticket lanes measure
+# nothing. Optimizing the dependencies -- our own crates keep full debug info --
+# brings it back under a slot.
+[profile.dev.package."*"]
+opt-level = 3

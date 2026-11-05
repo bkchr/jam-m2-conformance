@@ -12,10 +12,17 @@ use jam_types::{WorkPackageHash, WorkReportHash};
 /// distribution step they are used for (`simple.md:314-316`).
 pub const TICKET_PROOF_LEN: usize = 784;
 
-/// A Safrole ticket: an attempt byte (0 or 1) followed by the RingVRF proof.
+/// A Safrole ticket: an attempt byte followed by the RingVRF proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ticket {
-    /// Ticket attempt; only 0 or 1 are valid (rejected otherwise on decode).
+    /// Ticket attempt.
+    ///
+    /// How many attempts a validator may make follows from the protocol
+    /// parameters and is not a wire constant: at the pinned revision it is
+    /// `tickets_per_validator(val_count)`, derived as `(2 × epoch_period) ÷
+    /// val_count` rounded up, which is 4 under tiny. The range is judged by
+    /// the N2 lane's `n2_gen_attempt_in_range`; the decoder deliberately does
+    /// not enforce it, for the reason on [`Ticket`]'s `Decode`.
     pub attempt: u8,
     /// Bandersnatch RingVRF proof.
     pub proof: [u8; TICKET_PROOF_LEN],
@@ -28,12 +35,25 @@ impl Encode for Ticket {
     }
 }
 
+/// Decodes the wire shape and nothing more. The attempt is *not* range-checked
+/// here.
+///
+/// It used to be, against a hard-coded `attempt <= 1`. Under tiny a validator
+/// makes four attempts, so every ticket numbered 2 or 3 failed to decode and
+/// was dropped by the caller — silently, because a frame that will not decode
+/// is skipped rather than reported. The node had sent it correctly, the
+/// harness never saw it, and the lane then recorded that the node had not sent
+/// it: `n2_proxy_duty_forwarded` failed in every run that proxied such a
+/// ticket (`sessions/fwd-2`: one ticket, attempt 2, forwarded to all five
+/// validators one slot after it arrived, graded as reaching none of them), and
+/// the N1 and N2 ticket sets were short by the same frames.
+///
+/// A range the protocol parameters set does not belong in a decoder: the N2
+/// lane judges it as `n2_gen_attempt_in_range`, where an out-of-range attempt
+/// is a reportable failure instead of an invisible one.
 impl Decode for Ticket {
     fn decode<I: Input>(input: &mut I) -> Result<Self, codec::Error> {
         let attempt = input.read_byte()?;
-        if attempt > 1 {
-            return Err(codec::Error::from("ticket attempt must be 0 or 1"));
-        }
         let mut proof = [0u8; TICKET_PROOF_LEN];
         input.read(&mut proof)?;
         Ok(Self { attempt, proof })
@@ -186,22 +206,25 @@ mod tests {
         core::array::from_fn(|i| (i as u8).wrapping_add(offset))
     }
 
-    /// Minimal all-zero `WorkReport`. Encodes to `[0u8; 272]` (pinned below).
+    /// Minimal all-zero `WorkReport`. Encodes to `[0u8; 310]` (pinned below).
     fn sample_work_report() -> WorkReport {
         WorkReport {
             package_spec: WorkPackageSpec {
                 hash: [0u8; 32].into(),
                 len: 0,
                 erasure_root: [0u8; 32].into(),
+                erasure_shards: 0,
                 exports_root: [0u8; 32].into(),
                 exports_count: 0,
             },
             context: RefineContext {
                 anchor: [0u8; 32].into(),
+                anchor_slot: 0,
                 state_root: [0u8; 32].into(),
                 beefy_root: [0u8; 32].into(),
                 lookup_anchor: [0u8; 32].into(),
                 lookup_anchor_slot: 0,
+                lookup_anchor_state_root: [0u8; 32].into(),
                 prerequisites: Default::default(),
             },
             core_index: 0,
@@ -238,20 +261,35 @@ mod tests {
         assert_eq!(&bytes[1..], &proof(1)[..]);
     }
 
+    /// Any attempt byte decodes. The per-validator attempt count is a
+    /// protocol parameter — four under tiny — so a decoder that admits only
+    /// 0 and 1 drops conforming tickets, and drops them where nothing can
+    /// report it. Whether an attempt is in range is the N2 lane's question.
     #[test]
-    fn ticket_rejects_bad_attempt() {
-        for bad in [2u8, 3, 0x7f, 0xff] {
-            let mut input: &[u8] = &[bad, 0xaa, 0xbb];
-            assert!(
-                Ticket::decode(&mut input).is_err(),
-                "attempt {bad} must be rejected"
-            );
+    fn ticket_decodes_every_attempt_byte() {
+        for attempt in [0u8, 1, 2, 3, 0x7f, 0xff] {
+            let bytes = Ticket {
+                attempt,
+                proof: proof(attempt),
+            }
+            .encode();
+            let mut input: &[u8] = &bytes[..];
+            let decoded = Ticket::decode(&mut input).expect("every attempt byte decodes");
+            assert_eq!(decoded.attempt, attempt);
         }
+    }
+
+    /// A truncated proof is still a decode failure: that is a wire-shape
+    /// error, not a parameter one.
+    #[test]
+    fn ticket_rejects_a_short_proof() {
+        let mut input: &[u8] = &[0u8, 0xaa, 0xbb];
+        assert!(Ticket::decode(&mut input).is_err());
     }
 
     #[test]
     fn ticket_roundtrip() {
-        for attempt in [0u8, 1] {
+        for attempt in [0u8, 1, 2, 3] {
             let t = Ticket {
                 attempt,
                 proof: proof(attempt),
@@ -463,7 +501,7 @@ mod tests {
         let report = sample_work_report();
         let report_bytes = report.encode();
         // Pins the GP Work-Report encoding of the minimal report.
-        assert_eq!(report_bytes, vec![0u8; 272]);
+        assert_eq!(report_bytes, vec![0u8; 310]);
 
         let gwr = GuaranteedWorkReport {
             report,
@@ -476,7 +514,7 @@ mod tests {
         };
         let bytes = gwr.encode();
         let mut expected = Vec::new();
-        expected.extend_from_slice(&[0u8; 272]); // Work-Report
+        expected.extend_from_slice(&[0u8; 310]); // Work-Report
         expected.extend_from_slice(&[0x04, 0x03, 0x02, 0x01]); // Slot u32 LE
         expected.push(0x03); // compact(3) signatures
         for (idx, off) in [(0x0102u16, 0x00u8), (0x0304, 0x40), (0x0506, 0x80)] {
@@ -515,7 +553,7 @@ mod tests {
         let reply = WorkReportReply {
             report: sample_work_report(),
         };
-        assert_eq!(reply.encode(), vec![0u8; 272]);
+        assert_eq!(reply.encode(), vec![0u8; 310]);
     }
 
     #[test]
@@ -543,7 +581,7 @@ mod tests {
         let mut input: &[u8] = &[0x13; 16];
         assert!(WorkReportRequest::decode(&mut input).is_err());
         // Reply report truncated.
-        let mut bytes = vec![0u8; 100];
+        let bytes = [0u8; 100];
         let mut input: &[u8] = &bytes[..];
         assert!(WorkReportReply::decode(&mut input).is_err());
     }

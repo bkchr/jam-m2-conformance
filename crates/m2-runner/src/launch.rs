@@ -7,8 +7,15 @@ use tokio::process::Child;
 
 /// Configuration for a NUT launch: everything the command templates reference.
 pub struct LaunchConfig {
-    /// Path to the generated spec file.
+    /// Path to the generated spec file in polkajam's native format.
+    ///
+    /// Only the polkajam preset reads this; a third-party image has no reason
+    /// to parse it.
     pub spec_path: PathBuf,
+    /// Path to the generated spec file in the M2 standard format
+    /// (`spec-m2.json`), which is what the environment contract hands a
+    /// third-party node.
+    pub m2_spec_path: PathBuf,
     /// Hex of the NUT's 32-byte Ed25519 secret.
     pub ed25519_secret_hex: String,
     /// Hex of the NUT's 32-byte Bandersnatch secret.
@@ -23,7 +30,7 @@ pub struct LaunchConfig {
     pub log_level: String,
 }
 
-/// Replaces the DESIGN.md §7 placeholders `{spec} {ed25519_secret}
+/// Replaces the DESIGN.md §7 placeholders `{spec} {m2_spec} {ed25519_secret}
 /// {bandersnatch_secret} {listen} {public_addr} {data} {log_level}` with `cfg`
 /// values. Unknown placeholders are rejected.
 ///
@@ -50,6 +57,7 @@ pub fn substitute(template: &str, cfg: &LaunchConfig) -> Result<String, LaunchEr
 fn value_of<'a>(name: &str, cfg: &'a LaunchConfig) -> Result<&'a str, LaunchError> {
     match name {
         "spec" => path_str(&cfg.spec_path),
+        "m2_spec" => path_str(&cfg.m2_spec_path),
         "ed25519_secret" => Ok(&cfg.ed25519_secret_hex),
         "bandersnatch_secret" => Ok(&cfg.bandersnatch_secret_hex),
         "listen" => Ok(&cfg.listen),
@@ -92,7 +100,12 @@ pub fn preset_polkajam(cfg: &LaunchConfig) -> String {
 /// initiate connections under the preferred-initiator rule). Config values are
 /// substituted; `{image}` is left for the caller to fill in.
 pub fn preset_docker(cfg: &LaunchConfig) -> String {
-    let spec = cfg.spec_path.display();
+    // `spec-m2.json`, not polkajam's native `spec.json`. The environment
+    // contract (§5.3) is the one thing a third-party node is told to parse,
+    // and handing it the oracle's internal format asked it to read a file it
+    // has no reason to understand. Both are written to the session directory
+    // either way, so the interim workaround was to go and find the right one.
+    let spec = cfg.m2_spec_path.display();
     let ed25519_secret = &cfg.ed25519_secret_hex;
     let bandersnatch_secret = &cfg.bandersnatch_secret_hex;
     let listen = &cfg.listen;
@@ -167,6 +180,11 @@ pub async fn spawn(cmd: &str, session_dir: &Path) -> std::io::Result<NutProcess>
         .args(args)
         .stdout(stdout_file)
         .stderr(stderr_file)
+        // The run kills the NUT explicitly at teardown, but every `?` between
+        // the launch and that point would otherwise leave it running and
+        // holding its QUIC port -- which outlives the run and fails the next
+        // one with `AddrInUse`. Dropping the handle now reaps it too.
+        .kill_on_drop(true)
         .spawn()?;
 
     Ok(NutProcess {
@@ -209,6 +227,7 @@ mod tests {
     fn test_config() -> LaunchConfig {
         LaunchConfig {
             spec_path: PathBuf::from("/tmp/m2-test/spec.json"),
+            m2_spec_path: PathBuf::from("/tmp/m2-test/spec-m2.json"),
             ed25519_secret_hex: "ab".repeat(32),
             bandersnatch_secret_hex: "cd".repeat(32),
             listen: "[::]:3000".to_string(),
@@ -284,6 +303,55 @@ mod tests {
         );
     }
 
+    /// A 40-character lowercase hex run, i.e. a commit hash written out.
+    fn carries_a_commit_hash(line: &str) -> bool {
+        line.as_bytes().windows(40).any(|w| {
+            w.iter()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
+    }
+
+    /// The oracle grades the node under test, so both must be built from the
+    /// same polkajam revision unless a run deliberately compares revisions.
+    /// The workspace manifest holds the pin and `scripts/prepare-nut.sh` reads
+    /// it from there; the copy the script used to carry drifted three
+    /// revisions behind before anyone noticed, because nothing compared them.
+    #[test]
+    fn the_nut_binary_is_built_from_the_pinned_revision() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+
+        let revs: Vec<&str> = manifest
+            .lines()
+            .filter(|l| l.contains("polkajam.git"))
+            .filter_map(|l| l.split("rev = \"").nth(1))
+            .filter_map(|r| r.split('"').next())
+            .collect();
+        assert!(
+            !revs.is_empty(),
+            "the workspace must pin polkajam by revision, not by branch"
+        );
+        assert!(
+            revs.windows(2).all(|w| w[0] == w[1]),
+            "every polkajam dependency must name one revision; got {revs:?}"
+        );
+
+        let script = std::fs::read_to_string(root.join("scripts/prepare-nut.sh")).unwrap();
+        assert!(
+            script.contains("Cargo.toml"),
+            "prepare-nut.sh must read the revision out of the manifest"
+        );
+        let copies: Vec<&str> = script
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .filter(|l| carries_a_commit_hash(l))
+            .collect();
+        assert!(
+            copies.is_empty(),
+            "prepare-nut.sh must not hold its own copy of the revision: {copies:?}"
+        );
+    }
+
     #[test]
     fn split_host_port_bracketed_ipv6() {
         assert_eq!(split_host_port("[::]:40000"), ("::", "40000"));
@@ -301,7 +369,11 @@ mod tests {
         assert!(cmd.contains("docker run"));
         assert!(cmd.contains("--network host"));
         assert!(cmd.contains("JAM_M2=1"));
-        assert!(cmd.contains("JAM_M2_SPEC"));
+        assert!(cmd.contains("JAM_M2_SPEC=/tmp/m2-test/spec-m2.json"));
+        assert!(
+            !cmd.contains("/tmp/m2-test/spec.json"),
+            "the docker contract hands over the M2 spec, never polkajam's own"
+        );
         assert!(cmd.contains("JAM_M2_ED25519_SECRET"));
     }
 
@@ -323,11 +395,35 @@ mod tests {
     #[tokio::test]
     async fn kill_running_process() {
         let dir = temp_dir("kill-running");
-        let mut nut = spawn("sleep 30", &dir).await.unwrap();
+        let nut = spawn("sleep 30", &dir).await.unwrap();
         let pid = nut.child.id().unwrap();
         super::kill(nut).await.unwrap();
         // Killed and reaped: the child's /proc entry is gone.
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A run that dies between the launch and teardown -- any `?` on the way
+    /// -- drops the handle without ever calling `kill`. Before `kill_on_drop`,
+    /// that left the NUT running and holding its QUIC port, and the next run
+    /// on those ports failed with `AddrInUse`.
+    #[tokio::test]
+    async fn dropped_process_is_reaped() {
+        let dir = temp_dir("drop-reaps");
+        let nut = spawn("sleep 30", &dir).await.unwrap();
+        let pid = nut.child.id().unwrap();
+        drop(nut);
+        // Tokio reaps on drop in the background, so give it a moment.
+        for _ in 0..100 {
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "dropping the handle must kill the NUT, not leak it"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -1,4 +1,4 @@
-//! Scenario evaluation for a run: the L0 checks against an observation log
+//! Scenario evaluation for a run: the N0 checks against an observation log
 //! and the deterministic dry-run baseline log.
 
 use std::sync::{Arc, Mutex};
@@ -9,20 +9,24 @@ use jamnp_s::trace::Trace;
 use m2_emu::emu::Emulator;
 use m2_reference::chain::RefChain;
 use m2_scenario::ctx::{
-    DeliveredTicket, EmuTicket, ImportFact, L1Ctx, L2Ctx, NutBlock, NutTicketFacts, TicketDelivery,
-    NUT_INDEX, SLOT_PERIOD_MS, TICKET_ARRIVAL_LEAD_MS,
+    DeliveredTicket, EmuTicket, ImportFact, N1Ctx, N2Ctx, NutBlock, NutBlockTickets, NutFinal,
+    NutTicketFacts, TicketDelivery, SLOT_PERIOD_MS, TICKET_ARRIVAL_LEAD_MS,
 };
 use m2_scenario::dsl::{Check, Obs, ObsKind, ObsLog, Outcome, Scheduler, Severity};
-use m2_scenario::scenarios::obs::{EMU_SENT_131, EMU_SENT_132, RECV_CE131, RECV_CE132};
-use m2_scenario::scenarios::{l0, l1, l2};
+use m2_scenario::scenarios::n0::{Ce128Probe, Ce129Probe};
+use m2_scenario::scenarios::obs::{
+    EMU_SENT_131, EMU_SENT_132, RECV_CE131, RECV_CE132, TICKET_REFUSED,
+};
+use m2_scenario::scenarios::{n0, n1, n2};
 
+use crate::cli::LaneSet;
 use crate::report::{CheckOutcome, Finding};
 
 /// Per-lane facts a run's scenario evaluation reads.
 pub(crate) struct RunCtx {
-    pub l0_reference_block_count: usize,
-    pub l1: Option<L1Ctx>,
-    pub l2: Option<L2Ctx>,
+    pub n0: n0::N0Ctx,
+    pub n1: Option<N1Ctx>,
+    pub n2: Option<N2Ctx>,
 }
 
 /// The outcome of a run's scenario evaluation.
@@ -38,25 +42,34 @@ pub(crate) enum ObsSource {
     Emulator {
         obs: Arc<Mutex<ObsLog>>,
         trace: Arc<Mutex<Trace>>,
+        ce128_probes: Arc<Mutex<Vec<Ce128Probe>>>,
+        ce129_probes: Arc<Mutex<Vec<Ce129Probe>>>,
         _emu: Emulator,
     },
     /// Deterministic fabricated log + empty trace (dry-run).
     Fabricated { log: ObsLog, trace: Trace },
 }
 
-/// Run the L0/L1/L2 checks against `obs` and reduce to report outcomes +
-/// findings. L1/L2 lanes fire only when their context is present.
-pub(crate) fn evaluate(obs: &ObsLog, run_ctx: &RunCtx) -> Evaluation {
+/// Run the selected lanes' checks against `obs` and reduce to report outcomes
+/// and findings. A lane fires only when it was asked for *and* its context is
+/// present.
+pub(crate) fn evaluate(obs: &ObsLog, run_ctx: &RunCtx, selected: LaneSet) -> Evaluation {
     let mut outcomes = Vec::new();
     let mut findings = Vec::new();
     let mut all_hard_passed = true;
-    let mut lanes: Vec<(&str, Vec<Check>)> =
-        vec![("L0", l0::all(run_ctx.l0_reference_block_count))];
-    if let Some(ctx) = &run_ctx.l1 {
-        lanes.push(("L1", l1::all(ctx)));
+    // Two conditions, and they mean different things. `selected` is what the
+    // operator asked to grade; the context being present is whether the run
+    // produced anything to grade it on. A lane nobody asked for is absent
+    // from the report rather than passed.
+    let mut lanes: Vec<(&str, Vec<Check>)> = Vec::new();
+    if selected.n0 {
+        lanes.push(("N0", n0::all(&run_ctx.n0)));
     }
-    if let Some(ctx) = &run_ctx.l2 {
-        lanes.push(("L2", l2::all(ctx)));
+    if let (true, Some(ctx)) = (selected.n1, &run_ctx.n1) {
+        lanes.push(("N1", n1::all(ctx)));
+    }
+    if let (true, Some(ctx)) = (selected.n2, &run_ctx.n2) {
+        lanes.push(("N2", n2::all(ctx)));
     }
     for (lane, checks) in lanes {
         let (out, finds, hard) = run_lane(lane, &checks, obs);
@@ -79,10 +92,10 @@ fn run_lane(lane: &str, checks: &[Check], obs: &ObsLog) -> (Vec<CheckOutcome>, V
     for check in checks {
         for result in scheduler.fire(check, obs) {
             let passed = result.outcome == Outcome::Pass;
-            let soft = match result.outcome {
-                Outcome::Pass => check.severity == Severity::Soft,
-                Outcome::Fail(severity) => severity == Severity::Soft,
-            };
+            // The row's own severity, not the parent check's. A passing row
+            // used to inherit the parent's, so a soft row under a hard check
+            // printed `hard` on exactly the runs where it passed.
+            let soft = result.severity == Severity::Soft;
             if !passed && !soft {
                 all_hard_passed = false;
             }
@@ -92,7 +105,10 @@ fn run_lane(lane: &str, checks: &[Check], obs: &ObsLog) -> (Vec<CheckOutcome>, V
                     spec_citation: format!("{lane} {}", check.id),
                     slot: None,
                     evidence: "traces/jamnp.bin".into(),
-                    message: format!("{}: {}", check.id, result.name),
+                    message: match &result.detail {
+                        Some(detail) => format!("{}: {}: {detail}", check.id, result.name),
+                        None => format!("{}: {}", check.id, result.name),
+                    },
                 });
             }
             outcomes.push(CheckOutcome {
@@ -101,10 +117,10 @@ fn run_lane(lane: &str, checks: &[Check], obs: &ObsLog) -> (Vec<CheckOutcome>, V
                 severity: if soft { "soft" } else { "hard" }.into(),
                 passed,
                 soft,
-                details: if passed {
-                    "ok".into()
-                } else {
-                    format!("{result:?}")
+                details: match (passed, &result.detail) {
+                    (true, _) => "ok".into(),
+                    (false, Some(detail)) => detail.clone(),
+                    (false, None) => format!("{:?}", result.outcome),
                 },
             });
         }
@@ -113,10 +129,10 @@ fn run_lane(lane: &str, checks: &[Check], obs: &ObsLog) -> (Vec<CheckOutcome>, V
 }
 
 /// The deterministic conforming observation log the dry-run baseline reports
-/// on: peer 1 exhibits every L0 contract event (codes 20..=40 plus the named
+/// on: peer 1 exhibits every N0 contract event (codes 20..=40 plus the named
 /// kinds) in an order that satisfies all nine checks.
 pub(crate) fn fabricated_obs_log(reference_block_count: usize) -> ObsLog {
-    use l0::{
+    use n0::{
         ALPN_ACCEPTED, ALPN_BUILDER_OK, ALPN_OFFERED, BUILDERS_ACCEPTED, CE128_FIN_BOTH,
         CE128_MAX_RESPECTED, CE129_BOUNDARY_ORDER, CE129_LEN_PREFIXED, CE129_SIZE_CAP,
         CE129_SORTED, CE133_ON_BUILDER, CERT_ED25519, CERT_KEY_MATCH, CERT_SAN_OK, ENDPOINT_DIALED,
@@ -135,169 +151,451 @@ pub(crate) fn fabricated_obs_log(reference_block_count: usize) -> ObsLog {
         );
         at += 10;
     };
-    push(l0::PEER_1, ObsKind::Accept);
-    push(l0::PEER_1, ObsKind::Other(CERT_ED25519));
-    push(l0::PEER_1, ObsKind::Other(CERT_KEY_MATCH));
-    push(l0::PEER_1, ObsKind::Other(CERT_SAN_OK));
-    push(l0::PEER_1, ObsKind::OpenUp0);
-    push(l0::PEER_1, ObsKind::Other(ALPN_ACCEPTED));
-    push(l0::PEER_1, ObsKind::Other(ALPN_OFFERED));
-    push(l0::PEER_1, ObsKind::Other(ALPN_BUILDER_OK));
-    push(l0::PEER_1, ObsKind::Other(NUT_INITIATED));
-    push(l0::PEER_1, ObsKind::Other(ENDPOINT_DIALED));
-    push(l0::PEER_1, ObsKind::Other(BUILDERS_ACCEPTED));
-    push(l0::PEER_1, ObsKind::Other(CE133_ON_BUILDER));
-    push(l0::PEER_1, ObsKind::Other(UP0_KIND0));
-    push(l0::PEER_1, ObsKind::Other(UP0_FINAL_GENESIS));
-    push(l0::PEER_1, ObsKind::Up0Announce);
-    push(l0::PEER_1, ObsKind::Other(REANNOUNCED));
+    push(n0::PEER_1, ObsKind::Accept);
+    push(n0::PEER_1, ObsKind::Other(CERT_ED25519));
+    push(n0::PEER_1, ObsKind::Other(CERT_KEY_MATCH));
+    push(n0::PEER_1, ObsKind::Other(CERT_SAN_OK));
+    push(n0::PEER_1, ObsKind::OpenUp0);
+    push(n0::PEER_1, ObsKind::Other(ALPN_ACCEPTED));
+    push(n0::PEER_1, ObsKind::Other(ALPN_OFFERED));
+    push(n0::PEER_1, ObsKind::Other(ALPN_BUILDER_OK));
+    push(n0::PEER_1, ObsKind::Other(NUT_INITIATED));
+    push(n0::PEER_1, ObsKind::Other(ENDPOINT_DIALED));
+    push(n0::PEER_1, ObsKind::Other(BUILDERS_ACCEPTED));
+    push(n0::PEER_1, ObsKind::Other(CE133_ON_BUILDER));
+    push(n0::PEER_1, ObsKind::Other(UP0_KIND0));
+    push(n0::PEER_1, ObsKind::Other(UP0_FINAL_GENESIS));
+    push(n0::PEER_1, ObsKind::Up0Announce);
+    push(n0::PEER_1, ObsKind::Other(REANNOUNCED));
     for _ in 0..reference_block_count {
-        push(l0::PEER_1, ObsKind::ServesCe128);
+        push(n0::PEER_1, ObsKind::ServesCe128);
     }
-    push(l0::PEER_1, ObsKind::Other(CE128_FIN_BOTH));
-    push(l0::PEER_1, ObsKind::Other(CE128_MAX_RESPECTED));
-    push(l0::PEER_1, ObsKind::Other(CE129_SORTED));
-    push(l0::PEER_1, ObsKind::Other(CE129_BOUNDARY_ORDER));
-    push(l0::PEER_1, ObsKind::Other(CE129_SIZE_CAP));
-    push(l0::PEER_1, ObsKind::Other(CE129_LEN_PREFIXED));
-    // L1: the NUT announced an authored block.
-    push(l0::PEER_1, ObsKind::AuthorsBlock);
-    // L2: the NUT received its CE 131/132 ticket distributions and the
+    push(n0::PEER_1, ObsKind::Other(CE128_FIN_BOTH));
+    push(n0::PEER_1, ObsKind::Other(CE128_MAX_RESPECTED));
+    push(n0::PEER_1, ObsKind::Other(CE129_SORTED));
+    push(n0::PEER_1, ObsKind::Other(CE129_BOUNDARY_ORDER));
+    push(n0::PEER_1, ObsKind::Other(CE129_SIZE_CAP));
+    push(n0::PEER_1, ObsKind::Other(CE129_LEN_PREFIXED));
+    // N1: the NUT announced an authored block.
+    push(n0::PEER_1, ObsKind::AuthorsBlock);
+    // N2: the NUT received its CE 131/132 ticket distributions and the
     // emulator's sends; the CE 132 broadcast reaches all five emulated peers.
-    push(l0::PEER_1, ObsKind::Other(RECV_CE131));
+    push(n0::PEER_1, ObsKind::Other(RECV_CE131));
     for peer in 1..=5u16 {
         push(peer, ObsKind::Other(RECV_CE132));
     }
-    push(l0::PEER_1, ObsKind::Other(EMU_SENT_131));
-    push(l0::PEER_1, ObsKind::Other(EMU_SENT_132));
+    push(n0::PEER_1, ObsKind::Other(EMU_SENT_131));
+    push(n0::PEER_1, ObsKind::Other(EMU_SENT_132));
+    // N2: the NUT reset the stream carrying the unknown-epoch probe.
+    // Which ticket it refused is carried by that ticket's plan entry, below;
+    // this records only that a refusal happened, for the report.
+    push(n0::PEER_1, ObsKind::Other(TICKET_REFUSED));
     log
 }
 
-/// The deterministic conforming [`RunCtx`] for the dry-run baseline: the L1
+/// The deterministic conforming [`RunCtx`] for the dry-run baseline: the N1
 /// lane is built around one real reference-authored NUT block (genuine header
 /// and extrinsic types), with its import fact and delivered tickets matching
-/// that block; the L2 lane carries a conforming emulator plan and verified NUT
+/// that block; the N2 lane carries a conforming emulator plan and verified NUT
 /// ticket facts.
 pub(crate) fn fabricated_run_ctx(
     reference_block_count: usize,
 ) -> Result<RunCtx, m2_reference::chain::ChainError> {
-    let mut chain = RefChain::tiny(1..6)?;
+    let chain = RefChain::tiny(0)?;
     let start = chain.next_slot();
-    let mut authored = None;
-    for slot in start..start + 12 {
+    // Two blocks, the second built on the first: one NUT block on its own can
+    // never witness its own posterior state root, which only the header of a
+    // block built on top of it commits to.
+    let mut authored: Vec<jam_std_common::Block> = Vec::new();
+    for slot in start..start + 24 {
         if let Some(block) = chain.author_block(slot)? {
-            authored = Some(block);
-            break;
+            authored.push(block);
+            if authored.len() == 2 {
+                break;
+            }
         }
     }
-    let block = authored.ok_or_else(|| {
-        m2_reference::chain::ChainError::Chain("no emulated slot to author in 12 slots".into())
+    let [first, second] = <[_; 2]>::try_from(authored).map_err(|_| {
+        m2_reference::chain::ChainError::Chain("no two emulated slots in 24 slots".into())
     })?;
 
-    let header_root = block.header.hash().0;
-    let parent = block.header.parent.0;
-    let slot = block.header.slot;
-    let included_ids: Vec<[u8; 32]> = block.extrinsic.tickets.iter().map(|t| t.id().0).collect();
-    let slot_start = JAM_COMMON_ERA * 1000 + slot as u64 * SLOT_PERIOD_MS;
-    let l1 = L1Ctx {
-        reference_best: parent,
-        reference_block_hashes: vec![parent],
-        nut_blocks: vec![NutBlock {
-            block,
-            announced_wall_ms: slot_start,
-        }],
-        imports: vec![ImportFact {
-            header_root,
-            ok: true,
-            root: Some(header_root),
-            error: None,
-        }],
+    // Everything up to and including `first` is reference history; `second` is
+    // the block under test, so its parent is the reference best at its slot.
+    let history: Vec<(u32, [u8; 32])> = chain
+        .chain_blocks()
+        .iter()
+        .take_while(|block| block.header.slot <= first.header.slot)
+        .map(|block| (block.header.slot, block.header.hash().0))
+        .collect();
+    let first_root = first.header.hash().0;
+    let second_root = second.header.hash().0;
+    let slot = first.header.slot;
+    let second_slot = second.header.slot;
+    // The N0 sync probes: what a conforming node would answer. The reference
+    // the CE 128 reply is compared against stops at `first`, since that is all
+    // the harness treats as history here; the node is allowed to be ahead.
+    let genesis = chain.genesis_hash();
+    let reference_chain: Vec<[u8; 32]> = history.iter().skip(1).map(|(_, hash)| *hash).collect();
+    let probed_blocks: Vec<n0::ProbedBlock> = chain
+        .chain_blocks()
+        .iter()
+        .skip(1)
+        .map(|block| n0::ProbedBlock {
+            slot: block.header.slot,
+            hash: block.header.hash().0,
+            parent: block.header.parent.0,
+        })
+        .collect();
+    let included_ids: Vec<[u8; 32]> = first.extrinsic.tickets.iter().map(|t| t.id().0).collect();
+    let slot_start = |slot: u32| JAM_COMMON_ERA * 1000 + slot as u64 * SLOT_PERIOD_MS;
+    let import = |block: &jam_std_common::Block, root: Option<[u8; 32]>| ImportFact {
+        header_root: block.header.hash().0,
+        parent: block.header.parent.0,
+        declared_parent_root: block.header.parent_state_root.0,
+        reference_parent_root: Some(block.header.parent_state_root.0),
+        ok: true,
+        root,
+        error: None,
+    };
+    let n1 = N1Ctx {
+        // The fabricated node's blocks carry only tickets the emulator
+        // delivered, so there are none of its own to account for. The
+        // own-ticket allowance is exercised by the N1 lane's own tests.
+        own_ticket_ids: Vec::new(),
+        reference_best: first_root,
+        reference_block_hashes: history.iter().map(|(_, hash)| *hash).collect(),
+        reference_chain: history,
+        imports: vec![
+            // `second` declares `first`'s posterior root, so the witnessed
+            // path is the one this baseline exercises. `second` itself has no
+            // block built on it, which is a soft "not witnessed" — inherent to
+            // the last block of any chain, and reported as such.
+            import(&first, Some(second.header.parent_state_root.0)),
+            import(&second, Some(second_root)),
+        ],
+        nut_blocks: vec![
+            // Each block is announced at the start of *its own* slot. The two
+            // are not necessarily adjacent -- the reference only authors the
+            // slots it wins, so the NUT may own the one in between -- and
+            // timing the second as `first + one slot period` put its
+            // announcement before its slot had begun whenever that happened,
+            // failing `n1_timing_within_slot` for one wall-clock slot in
+            // several. A fabricated baseline must not depend on the clock.
+            NutBlock {
+                block: first,
+                announced_wall_ms: slot_start(slot),
+            },
+            NutBlock {
+                block: second,
+                announced_wall_ms: slot_start(second_slot),
+            },
+        ],
         delivered_tickets: included_ids
             .into_iter()
-            .map(|id| DeliveredTicket {
+            .enumerate()
+            .map(|(plan_index, id)| DeliveredTicket {
+                plan_index,
                 id,
-                delivered_at_ms: slot_start - TICKET_ARRIVAL_LEAD_MS,
+                delivered_at_ms: slot_start(slot) - TICKET_ARRIVAL_LEAD_MS,
+                target_epoch: slot / jam_types::epoch_period() + 1,
+                probe: false,
+                // A conforming node accepts every ticket owed to it.
+                refused: false,
             })
             .collect(),
         slot_period_ms: SLOT_PERIOD_MS,
+        epoch_period: jam_types::epoch_period(),
+        epoch_tail_start: jam_types::epoch_tail_start(),
+        max_tickets_per_block: jam_types::max_tickets_per_block(),
     };
 
-    let emu = |id: u8, proxy: u16, delivery: TicketDelivery| EmuTicket {
+    // The fabricated NUT sits at validator index 0, so the emulated peers —
+    // the index space the observation log and the ticket facts share — are
+    // the other five validators.
+    const FAB_NUT_INDEX: u16 = 0;
+    const FAB_TARGET_EPOCH: u32 = 3;
+    let emu_peers: Vec<u16> = (1..=5).collect();
+    // Emulator-sent tickets carry proofs in the low range; the node's own
+    // carry the high range, so a forward is never mistaken for a ticket the
+    // node generated, and vice versa.
+    let emu = |id: u8, proxy: u16, delivery: TicketDelivery, target_epoch: u32| EmuTicket {
         id: [id; 32],
         author: 1,
         attempt: 0,
-        proof: [0u8; 784],
+        proof: [id; 784],
         proxy,
         valid: true,
         delivery,
         slot: 1,
+        target_epoch,
+        // Set per entry below: the baseline's node refuses the unknown-epoch
+        // probe, as it must, and nothing else.
+        refused: false,
+        fault: None,
+        // The baseline is a conforming run, so every planned ticket reached
+        // the node on the slot it was planned for: the dry run has nothing to
+        // withhold or delay them for.
+        delivered_at_ms: Some(JAM_COMMON_ERA * 1000 + SLOT_PERIOD_MS),
     };
-    let nut = |attempt: u8, peer: u16| NutTicketFacts {
-        epoch: 3,
-        ticket: Ce131Ticket {
+    // A ticket the node generates during epoch 2 is for epoch 3, so the facts
+    // are stamped inside epoch 2 rather than at an arbitrary instant: the
+    // lane derives the epoch it expects from the moment the frame went out.
+    // Phase 1, not 0 -- generation starts at `epoch_start + 1` (DESIGN §11
+    // N2), and a baseline that sits on the boundary would assert the node may
+    // do what the catalogue says it may not.
+    let sent_in_epoch_2 =
+        JAM_COMMON_ERA * 1000 + u64::from(2 * jam_types::epoch_period() + 1) * SLOT_PERIOD_MS;
+    let sent =
+        |attempt: u8, proof: [u8; 784], id: [u8; 32], peer: u16, delivery: TicketDelivery| {
+            NutTicketFacts {
+                epoch: FAB_TARGET_EPOCH,
+                ticket: Ce131Ticket { attempt, proof },
+                id,
+                peer,
+                delivery,
+                verified: Some(true),
+                received_at_ms: sent_in_epoch_2,
+            }
+        };
+    // A ticket's proxy follows from its id, so a baseline that sends one to
+    // an arbitrary peer claims a conforming node may ignore the rule. For a
+    // uniform id byte `k` the rule reduces to `k mod validators`, because
+    // `0x01010101 ≡ 1 (mod 6)`; the bytes below are chosen to designate the
+    // peer each ticket is actually sent to, and stay in the high range that
+    // separates the node's own tickets from the emulator's.
+    let own = |attempt: u8, id_byte: u8, peer: u16, delivery: TicketDelivery| {
+        sent(
             attempt,
-            proof: [0u8; 784],
-        },
-        peer,
-        verified: true,
-        received_at_ms: 100,
+            [0x80 + attempt; 784],
+            [id_byte; 32],
+            peer,
+            delivery,
+        )
     };
-    let l2 = L2Ctx {
-        target_epoch: 3,
+    // The block the fabricated node authors in the epoch its tickets are
+    // submitted in, a slot after the last of its forwards.
+    let fab_block_slot = 2 * jam_types::epoch_period() + 3;
+    let proxied_to_the_nut = emu(1, FAB_NUT_INDEX, TicketDelivery::Ce131, FAB_TARGET_EPOCH);
+    // Two tickets of its own proxied to one validator each, one it proxies
+    // for itself and so broadcasts, and the forward of the ticket another
+    // validator proxied to it.
+    let mut nut_tickets = vec![
+        // 0x85 mod 6 == 1 and 0x86 mod 6 == 2: each goes to the validator the
+        // proxy rule names for it.
+        own(0, 0x85, 1, TicketDelivery::Ce131),
+        own(1, 0x86, 2, TicketDelivery::Ce131),
+    ];
+    for &peer in &emu_peers {
+        // 0x84 mod 6 == 0, the fabricated NUT's own index: this is the one
+        // ticket it proxies for itself, and so the one CE 132 broadcast that
+        // `n2_self_proxy` judges.
+        nut_tickets.push(own(2, 0x84, peer, TicketDelivery::Ce132));
+        // The forward of the ticket another validator proxied to it, which is
+        // `n2_proxy_duty`'s to judge and not the self-proxy row's.
+        nut_tickets.push(sent(
+            proxied_to_the_nut.attempt,
+            proxied_to_the_nut.proof,
+            proxied_to_the_nut.id,
+            peer,
+            TicketDelivery::Ce132,
+        ));
+    }
+    // A second forward of that ticket to one peer, a slot later. The baseline
+    // has to carry one for the same reason it has to carry a fault: a node
+    // that never repeats a forward satisfies "it stopped forwarding once the
+    // ticket was final" without having stopped anything, so without this the
+    // baseline reports `n2_forward_stops_at_finality` unexercised. It is a
+    // conforming repeat -- before the node declared the block carrying the
+    // ticket final, which is where the rule bites.
+    nut_tickets.push(NutTicketFacts {
+        received_at_ms: sent_in_epoch_2 + SLOT_PERIOD_MS,
+        ..sent(
+            proxied_to_the_nut.attempt,
+            proxied_to_the_nut.proof,
+            proxied_to_the_nut.id,
+            emu_peers[0],
+            TicketDelivery::Ce132,
+        )
+    });
+    let n2 = N2Ctx {
+        target_epoch: FAB_TARGET_EPOCH,
         epoch_start_slot: 0,
         emu_plan: vec![
-            emu(1, NUT_INDEX, TicketDelivery::Ce131),
-            emu(2, 1, TicketDelivery::Ce132),
+            proxied_to_the_nut,
+            emu(2, 1, TicketDelivery::Ce132, FAB_TARGET_EPOCH),
+            // The unknown-epoch probe (`simple.md:335-337`): an epoch the
+            // node cannot know yet, which it must reset the stream on -- and
+            // in the baseline, does.
+            EmuTicket {
+                refused: true,
+                fault: Some(m2_scenario::ctx::TicketFault::UnknownEpoch),
+                ..emu(3, 1, TicketDelivery::Ce132, FAB_TARGET_EPOCH + 2)
+            },
+            // A ticket proxied to the node over CE 131 that is not its to
+            // proxy. A conforming node refuses it, and the baseline has to
+            // carry one: `n2_fault_not_forwarded` is a negative rule, and
+            // without a CE 131 fault beside the honest forward above there is
+            // nothing for it to judge and the run reports it unexercised.
+            EmuTicket {
+                refused: true,
+                fault: Some(m2_scenario::ctx::TicketFault::WrongProxy),
+                ..emu(4, 1, TicketDelivery::Ce131, FAB_TARGET_EPOCH)
+            },
         ],
-        nut_tickets: vec![nut(0, 1), nut(1, 2)],
-        nut_block_ticket_ids: vec![[1u8; 32], [2u8; 32]],
-        nut_block_slot: 12,
+        nut_tickets,
+        // Two delivered tickets plus one of the node's own: a validator's own
+        // ticket belongs in its own block, and the baseline says so.
+        //
+        // The slot is inside the epoch those tickets are submitted in -- the
+        // one before `FAB_TARGET_EPOCH` -- and after the slot the node
+        // forwarded them in, so the baseline tells one coherent story:
+        // received, forwarded, included, declared final.
+        nut_blocks: vec![NutBlockTickets {
+            slot: fab_block_slot,
+            ticket_ids: vec![[1u8; 32], [2u8; 32], [9u8; 32]],
+        }],
+        // The node calls its own block final two slots after authoring it,
+        // and is still advertising a slot after that. Both halves matter:
+        // without the first there is no moment for the stopping rule to be
+        // judged against, and without the second a pass would only say the
+        // run ended.
+        nut_finals: vec![
+            NutFinal {
+                at_ms: slot_start(fab_block_slot + 2),
+                slot: fab_block_slot,
+            },
+            NutFinal {
+                at_ms: slot_start(fab_block_slot + 3),
+                slot: fab_block_slot + 1,
+            },
+        ],
+        own_ticket_ids: vec![[9u8; 32]],
+        nut_index: FAB_NUT_INDEX,
+        emulated_peers: emu_peers,
+        slot_period_ms: SLOT_PERIOD_MS,
+        epoch_period: jam_types::epoch_period(),
+        epoch_tail_start: jam_types::epoch_tail_start(),
+        tickets_per_validator: jam_types::tickets_per_validator(jam_types::max_val_count()),
+        max_tickets_per_block: jam_types::max_tickets_per_block(),
     };
 
     Ok(RunCtx {
-        l0_reference_block_count: reference_block_count,
-        l1: Some(l1),
-        l2: Some(l2),
+        // The fabricated log is written for a NUT at index 0, which initiates
+        // to every emulated peer and so never needs a fallback dial.
+        n0: n0::N0Ctx {
+            reference_block_count,
+            reference_chain: reference_chain.clone(),
+            // A conforming node: the ascending walk returns the reference
+            // chain itself, within the cap, FIN'd; the state slice is sorted,
+            // in range and inside the size cap.
+            ce128_probes: vec![n0::Ce128Probe {
+                peer: n0::PEER_1,
+                max_blocks: 64,
+                from: genesis,
+                returned: probed_blocks,
+                finished: true,
+                error: None,
+            }],
+            ce129_probes: vec![n0::Ce129Probe {
+                peer: n0::PEER_1,
+                start: [0u8; 31],
+                end: [0xffu8; 31],
+                max_size: 16 * 1024,
+                keys: vec![[0u8; 31], [1u8; 31]],
+                boundary_nodes: vec![[7u8; 64]],
+                response_bytes: 128,
+                entry_bytes: vec![64, 64],
+                decoded: true,
+                error: None,
+            }],
+            first_emu_peer: n0::PEER_1,
+            handshake_completed: true,
+            wrong_alpn_rejected: true,
+            builder: Some(n0::BuilderProbeFacts {
+                attempted: 21,
+                accepted: 21,
+                ce133_accepted: true,
+                ce133_detail: None,
+            }),
+            nut_preferred_peers: vec![n0::PEER_1],
+            emu_preferred_peers: Vec::new(),
+        },
+        n1: Some(n1),
+        n2: Some(n2),
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use m2_scenario::scenarios::obs::RECV_CE132;
 
     use super::*;
+
+    /// Every implemented lane, which is what a run grades unless told
+    /// otherwise.
+    const ALL_LANES: LaneSet = LaneSet {
+        n0: true,
+        n1: true,
+        n2: true,
+    };
 
     #[test]
     fn evaluate_reports_lanes() {
         let run_ctx = fabricated_run_ctx(3).expect("fabricated run ctx builds");
         let log = fabricated_obs_log(3);
-        let eval = evaluate(&log, &run_ctx);
+        let eval = evaluate(&log, &run_ctx, ALL_LANES);
 
-        assert!(eval.all_hard_passed, "fabricated log must pass all lanes");
-        for lane in ["L0", "L1", "L2"] {
+        let hard_failures: Vec<&str> = eval
+            .outcomes
+            .iter()
+            .filter(|o| !o.passed)
+            .map(|o| o.id.as_str())
+            .collect();
+        assert!(
+            eval.all_hard_passed,
+            "fabricated log must pass all lanes; failed: {hard_failures:?}"
+        );
+        for lane in ["N0", "N1", "N2"] {
             let outcomes: Vec<&CheckOutcome> =
                 eval.outcomes.iter().filter(|o| o.lane == lane).collect();
             assert!(!outcomes.is_empty(), "lane {lane} must produce outcomes");
+            let failed: Vec<&str> = outcomes
+                .iter()
+                .filter(|o| !o.passed)
+                .map(|o| o.id.as_str())
+                .collect();
             assert!(
-                outcomes.iter().all(|o| o.passed),
-                "lane {lane} must all pass"
+                failed.is_empty(),
+                "lane {lane} must all pass; failed: {failed:?}"
             );
         }
 
-        // L1 facts come from the ctx, not the log (every L1 check ignores
-        // `obs`), so a log change cannot fail L1; strip instead the CE 132
-        // distribution every L2 proxy/self-proxy check requires.
-        let mut no_ce132 = ObsLog::new();
-        for (t, o) in fabricated_obs_log(3).events() {
-            if o.kind != ObsKind::Other(RECV_CE132) {
-                no_ce132.push(*t, *o);
-            }
-        }
-        let eval = evaluate(&no_ce132, &run_ctx);
-        assert!(!eval.all_hard_passed, "missing CE 132 must fail the run");
+        // The N1 and N2 verdicts come from the ctx facts, not from markers in
+        // the log, so the negative case has to change what the node did: drop
+        // every CE 132 frame it sent and the broadcast and forwarding duties
+        // both go unmet.
+        let mut silent = run_ctx;
+        let n2 = silent
+            .n2
+            .as_mut()
+            .expect("the fabricated run has an N2 lane");
+        n2.nut_tickets
+            .retain(|f| f.delivery != m2_scenario::ctx::TicketDelivery::Ce132);
+        let eval = evaluate(&log, &silent, ALL_LANES);
         assert!(
-            eval.outcomes.iter().any(|o| o.lane == "L2" && !o.passed),
-            "L2 must have a failing outcome"
+            !eval.all_hard_passed,
+            "a node that broadcast no CE 132 at all must fail the run"
+        );
+        let failed: Vec<&str> = eval
+            .outcomes
+            .iter()
+            .filter(|o| o.lane == "N2" && !o.passed)
+            .map(|o| o.id.as_str())
+            .collect();
+        assert!(
+            failed
+                .iter()
+                .any(|id| id.contains("n2_proxy_duty_forwarded")),
+            "the unforwarded ticket must be named: {failed:?}"
         );
     }
 }

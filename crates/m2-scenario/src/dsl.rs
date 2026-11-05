@@ -150,6 +150,32 @@ impl ObsLog {
             .map(|(_, o)| o)
     }
 
+    /// First record of `kind` from `peer`, in observation order.
+    ///
+    /// [`ObsLog::first`] ignores the peer, which is wrong for any per-connection
+    /// decision: one peer's observation would answer for all of them.
+    pub fn first_from<K: Into<ObsKind>>(&self, peer: u16, kind: K) -> Option<&Obs> {
+        let kind = kind.into();
+        self.records
+            .iter()
+            .find(|(_, o)| o.peer == peer && o.kind == kind)
+            .map(|(_, o)| o)
+    }
+
+    /// Every peer with a record of `kind`, ascending and deduplicated.
+    pub fn peers_with<K: Into<ObsKind>>(&self, kind: K) -> Vec<u16> {
+        let kind = kind.into();
+        let mut peers: Vec<u16> = self
+            .records
+            .iter()
+            .filter(|(_, o)| o.kind == kind)
+            .map(|(_, o)| o.peer)
+            .collect();
+        peers.sort_unstable();
+        peers.dedup();
+        peers
+    }
+
     /// Last record of `kind`, in observation order.
     pub fn last<K: Into<ObsKind>>(&self, kind: K) -> Option<&Obs> {
         let kind = kind.into();
@@ -339,10 +365,27 @@ pub struct Check {
 }
 
 /// One assertion within a check.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `detail` carries the values behind a failure — the two state roots that
+/// disagreed, the ticket ids that were owed — so a finding says what went
+/// wrong rather than only which assertion did (DESIGN.md §11 N1 asks for an
+/// "M1-style diff report"). It is built only on failure and only where the
+/// check has something useful to say, so most results carry `None`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckResult {
     pub name: &'static str,
     pub outcome: Outcome,
+    /// What a failure of *this* row would have cost.
+    ///
+    /// `Outcome::Fail` carries it too, and for a failure the two agree. The
+    /// field exists for the passing case, which otherwise says nothing about
+    /// its own severity and left the reporter to fall back on the parent
+    /// `Check`'s. A soft row under a hard check then printed as `hard` on the
+    /// runs where it passed, which reads as a guarantee the harness does not
+    /// make -- `n2_gen_proxy_matches_rule` is soft precisely because the rule
+    /// it grades may not be normative (DESIGN §12 question 9).
+    pub severity: Severity,
+    pub detail: Option<String>,
 }
 
 /// Build a [`Check`] from an id, its fail severity, and the check closure.
@@ -359,9 +402,79 @@ pub fn check(
 }
 
 /// Embedded `log::check` assertions: plain pass/fail on the observation log,
+/// Evidence that the node was doing the positive thing a negative check
+/// depends on.
+///
+/// A rule of the form "the node must **not** do X" is satisfied by a node
+/// that does nothing at all: a run where no ticket was forwarded passes every
+/// must-not-forward check, and one where no block was authored passes every
+/// must-not-include check. Reporting those as passes claims coverage the run
+/// did not have, which is the half of the N0 audit that found checks which
+/// were passing and could not fail.
+///
+/// So a negative check is reported only alongside the control that makes it
+/// mean something. Where the control is absent the run says the rule was not
+/// exercised, which is what it knows, and [`log::negative`] emits
+/// [`Control::absent_row`] in place of the check.
+///
+/// Roughly half the DESIGN §11 catalogue across N2–N7 is fault injection, and
+/// every one of those lanes needs this gate, which is why it lives here and
+/// not in a lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Control {
+    absent_row: &'static str,
+    evidence: &'static str,
+    present: bool,
+}
+
+impl Control {
+    /// `absent_row` is the row reported when the control is missing, and
+    /// `evidence` completes the sentence "the run never showed …", so it
+    /// reads as a noun phrase: "a ticket the NUT forwarded to every peer".
+    pub const fn new(absent_row: &'static str, evidence: &'static str, present: bool) -> Self {
+        Self {
+            absent_row,
+            evidence,
+            present,
+        }
+    }
+
+    /// Whether the positive evidence was there.
+    pub const fn present(&self) -> bool {
+        self.present
+    }
+
+    /// The row reported in place of a gated check when it was not.
+    pub const fn absent_row(&self) -> &'static str {
+        self.absent_row
+    }
+
+    /// What the run would have had to show.
+    pub const fn evidence(&self) -> &'static str {
+        self.evidence
+    }
+
+    /// The soft "not exercised" row reported in place of the gated check.
+    ///
+    /// [`log::negative`] emits this itself, and a lane with one row to gate
+    /// never needs it. A lane that judges one row *per* injected fault does:
+    /// when the control is missing there may also be nothing to loop over, so
+    /// `negative` is never reached and the absence would go unreported. Such a
+    /// lane branches on [`Control::present`] and emits this once.
+    pub fn absent(&self, name: &'static str) -> CheckResult {
+        let evidence = self.evidence;
+        log::check_detail(self.absent_row, false, Severity::Soft, || {
+            format!(
+                "`{name}` asks what the node did not do, and the run never showed \
+                 {evidence}, so a pass would claim coverage it did not have"
+            )
+        })
+    }
+}
+
 /// run alongside a sequence (DESIGN.md §5 "Extra checks").
 pub mod log {
-    use super::{CheckResult, Outcome, Severity};
+    use super::{CheckResult, Control, Outcome, Severity};
 
     /// A standalone assertion result: `Pass` when `pass`, else `Fail(severity)`.
     pub fn check(name: &'static str, pass: bool, severity: Severity) -> CheckResult {
@@ -370,7 +483,54 @@ pub mod log {
         } else {
             Outcome::Fail(severity)
         };
-        CheckResult { name, outcome }
+        CheckResult {
+            name,
+            outcome,
+            severity,
+            detail: None,
+        }
+    }
+
+    /// A negative assertion — "the node must **not** do X" — reported only
+    /// where `control` shows the node was doing the corresponding positive
+    /// thing in the same run.
+    ///
+    /// `held` is whether the prohibition held. With the control present this
+    /// is an ordinary [`check_detail`]; without it, the result is a soft
+    /// failure named [`Control::absent_row`], because a silent node must not
+    /// collect passes for the rules it never came near. See [`Control`].
+    pub fn negative(
+        name: &'static str,
+        control: &Control,
+        held: bool,
+        severity: Severity,
+        detail: impl FnOnce() -> String,
+    ) -> CheckResult {
+        if !control.present() {
+            return control.absent(name);
+        }
+        check_detail(name, held, severity, detail)
+    }
+
+    /// [`check`], plus a detail string describing *why* it failed.
+    ///
+    /// `detail` runs only on failure, so a check may format hashes or ticket
+    /// ids there without paying for it on the passing path.
+    pub fn check_detail(
+        name: &'static str,
+        pass: bool,
+        severity: Severity,
+        detail: impl FnOnce() -> String,
+    ) -> CheckResult {
+        if pass {
+            return check(name, pass, severity);
+        }
+        CheckResult {
+            name,
+            outcome: Outcome::Fail(severity),
+            severity,
+            detail: Some(detail()),
+        }
     }
 }
 
@@ -513,23 +673,118 @@ mod tests {
             log::check("x", false, Severity::Hard),
             CheckResult {
                 name: "x",
-                outcome: Outcome::Fail(Severity::Hard)
+                outcome: Outcome::Fail(Severity::Hard),
+                severity: Severity::Hard,
+                detail: None,
             }
         );
         assert_eq!(
             log::check("x", true, Severity::Hard),
             CheckResult {
                 name: "x",
-                outcome: Outcome::Pass
+                outcome: Outcome::Pass,
+                severity: Severity::Hard,
+                detail: None,
             }
         );
         assert_eq!(
             log::check("x", false, Severity::Soft),
             CheckResult {
                 name: "x",
-                outcome: Outcome::Fail(Severity::Soft)
+                outcome: Outcome::Fail(Severity::Soft),
+                severity: Severity::Soft,
+                detail: None,
             }
         );
+    }
+
+    /// The point of the whole mechanism: a node that did nothing collects no
+    /// passes for the rules it never came near.
+    #[test]
+    fn a_negative_check_without_its_control_is_not_a_pass() {
+        let absent = Control::new("x_control_absent", "a ticket it forwarded", false);
+
+        // `held` is true -- the prohibition was not violated -- and it still
+        // must not pass, because nothing happened that could have violated it.
+        let r = log::negative("x_not_forwarded", &absent, true, Severity::Hard, || {
+            unreachable!("the gated detail is not built when the control is absent")
+        });
+
+        assert_eq!(r.name, "x_control_absent");
+        assert_eq!(r.outcome, Outcome::Fail(Severity::Soft));
+        assert_eq!(
+            r.severity,
+            Severity::Soft,
+            "an unexercised rule is not a hard failure"
+        );
+        let detail = r.detail.expect("the absent control explains itself");
+        assert!(
+            detail.contains("x_not_forwarded"),
+            "it names the gated check: {detail}"
+        );
+        assert!(
+            detail.contains("a ticket it forwarded"),
+            "and the missing evidence: {detail}"
+        );
+    }
+
+    /// With the control present it is an ordinary check, at its own severity,
+    /// and it can still fail.
+    #[test]
+    fn a_negative_check_with_its_control_is_judged_normally() {
+        let present = Control::new("x_control_absent", "a ticket it forwarded", true);
+
+        let held = log::negative("x_not_forwarded", &present, true, Severity::Hard, || {
+            unreachable!("no detail is built for a check that held")
+        });
+        assert_eq!(held.name, "x_not_forwarded");
+        assert_eq!(held.outcome, Outcome::Pass);
+        assert_eq!(held.severity, Severity::Hard);
+
+        let broken = log::negative("x_not_forwarded", &present, false, Severity::Hard, || {
+            "it forwarded a ticket it was meant to refuse".into()
+        });
+        assert_eq!(broken.name, "x_not_forwarded");
+        assert_eq!(broken.outcome, Outcome::Fail(Severity::Hard));
+        assert_eq!(
+            broken.detail.as_deref(),
+            Some("it forwarded a ticket it was meant to refuse")
+        );
+    }
+
+    /// A passing row still says what its failure would have cost.
+    ///
+    /// The reporter reads this rather than the parent `Check`'s severity, so
+    /// a soft row under a hard check must not print as hard just because it
+    /// passed -- that reads as a guarantee the harness does not make.
+    #[test]
+    fn a_passing_result_keeps_its_own_severity() {
+        assert_eq!(
+            log::check("x", true, Severity::Soft).severity,
+            Severity::Soft
+        );
+        assert_eq!(
+            log::check("x", true, Severity::Hard).severity,
+            Severity::Hard
+        );
+        assert_eq!(
+            log::check_detail("x", true, Severity::Soft, || unreachable!()).severity,
+            Severity::Soft
+        );
+    }
+
+    /// A detail is built only on failure, and reaches the result verbatim.
+    #[test]
+    fn log_check_detail_only_on_failure() {
+        let passed = log::check_detail("x", true, Severity::Hard, || {
+            panic!("detail must not be built for a passing check")
+        });
+        assert_eq!(passed.outcome, Outcome::Pass);
+        assert_eq!(passed.detail, None);
+
+        let failed = log::check_detail("x", false, Severity::Hard, || "roots differ".to_string());
+        assert_eq!(failed.outcome, Outcome::Fail(Severity::Hard));
+        assert_eq!(failed.detail.as_deref(), Some("roots differ"));
     }
 
     #[test]

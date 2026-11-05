@@ -14,11 +14,12 @@ pub struct Cli {
     pub seed: u64,
     /// NUT validator index. Defaults to 5, not 0: the preferred-initiator rule
     /// is degenerate for trivial keys at index 0 (the NUT is never preferred,
-    /// so NUT-initiated L0 checks can never fire). L7 rotates this.
+    /// so NUT-initiated N0 checks can never fire). N7 rotates this.
     #[arg(long, default_value_t = 5)]
     pub validator_index: usize,
-    /// Base port: the NUT listens on this port, the five emulated validators
-    /// on `base+1 ..= base+5`.
+    /// Base port: validator `i` listens on `base+i`, so the NUT is on
+    /// `base+validator_index` and the five emulated validators take the other
+    /// five ports in `base ..= base+5`.
     #[arg(long, default_value_t = 40000)]
     pub base_port: u16,
     /// NUT launch preset.
@@ -33,15 +34,65 @@ pub struct Cli {
     /// Seconds of JAMNP observation before evaluation (§4 step 4).
     #[arg(long, default_value_t = 60)]
     pub observe_secs: u64,
-    /// Comma-separated lane set to run (parsed for this pass; selection wiring
-    /// is iterative).
-    #[arg(long, default_value = "l0,l1,l2")]
-    pub lanes: String,
+    /// Comma-separated lane set to grade, e.g. `n0` or `n1,n2`.
+    #[arg(long, default_value = "n0,n1,n2", value_parser = LaneSet::parse)]
+    pub lanes: LaneSet,
     /// Skip NUT launch and connectivity; fabricate a conforming observation
     /// log so the scenario checks pass and the report renders. The
     /// deterministic S4 baseline (no network, no processes).
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// The lanes a run grades.
+///
+/// A client that implements only part of the surface is graded on the part it
+/// implements: without this the report drowns it in failures for lanes it
+/// never claimed, which is the difference between *not attempted* and
+/// *failed*. The lanes a run does not grade it also does not exercise — N1
+/// and N2 both need the ticket plan, and proving it costs the most expensive
+/// seconds in the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneSet {
+    pub n0: bool,
+    pub n1: bool,
+    pub n2: bool,
+}
+
+impl LaneSet {
+    /// Parse a comma-separated lane list. Unknown names are an error rather
+    /// than an ignored token: a typo that silently grades nothing is worse
+    /// than a refused command line.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let mut set = Self {
+            n0: false,
+            n1: false,
+            n2: false,
+        };
+        for name in raw.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            match name.to_ascii_lowercase().as_str() {
+                "n0" => set.n0 = true,
+                "n1" => set.n1 = true,
+                "n2" => set.n2 = true,
+                other => {
+                    return Err(format!(
+                        "unknown lane {other:?}; implemented lanes are n0, n1, n2"
+                    ))
+                }
+            }
+        }
+        if !(set.n0 || set.n1 || set.n2) {
+            return Err("no lanes selected".to_string());
+        }
+        Ok(set)
+    }
+
+    /// Whether the run needs a ticket plan at all. Both ticket lanes read it:
+    /// N2 grades what the node did with the tickets, N1 grades whether its
+    /// blocks carried them.
+    pub fn needs_tickets(&self) -> bool {
+        self.n1 || self.n2
+    }
 }
 
 /// NUT launch preset (§7).
@@ -72,8 +123,17 @@ fn exit_code(all_hard_passed: bool, startup_failed: bool) -> i32 {
 pub async fn run(cli: Cli) -> i32 {
     match run::run_once(cli).await {
         Ok(eval) => exit_code(eval.all_hard_passed, false),
-        Err(run::RunError::Startup(_)) => 1,
-        Err(run::RunError::Internal(_)) => 2,
+        // A run that dies before it can write a report has nowhere else to
+        // say why: the session directory holds the node's log and nothing of
+        // the harness's own. Exiting silently leaves the operator guessing.
+        Err(e @ run::RunError::Startup(_)) => {
+            eprintln!("m2-runner: {e}");
+            1
+        }
+        Err(e @ run::RunError::Internal(_)) => {
+            eprintln!("m2-runner: {e}");
+            2
+        }
     }
 }
 
@@ -84,9 +144,9 @@ mod tests {
 
     use clap::Parser;
     use m2_scenario::dsl::{Obs, ObsKind, ObsLog};
-    use m2_scenario::scenarios::l0;
+    use m2_scenario::scenarios::n0;
 
-    use super::{exit_code, run, Cli, Preset};
+    use super::{exit_code, run, Cli, LaneSet, Preset};
 
     /// Unique temp dir under `std::env::temp_dir()`, removed on drop.
     struct TempDir(PathBuf);
@@ -131,7 +191,10 @@ mod tests {
         assert_eq!(cli.validator_index, 5);
         assert_eq!(cli.startup_timeout, 30);
         assert_eq!(cli.observe_secs, 60);
-        assert_eq!(cli.lanes, "l0,l1,l2");
+        assert_eq!(
+            cli.lanes,
+            LaneSet::parse("n0,n1,n2").expect("default lanes parse")
+        );
         assert!(!cli.dry_run);
         assert_eq!(cli.preset, Preset::Polkajam);
 
@@ -146,16 +209,48 @@ mod tests {
             "--observe-secs",
             "45",
             "--lanes",
-            "l1,l2",
+            "n1,n2",
             "--session-dir",
             "/tmp/x",
         ]);
         assert_eq!(cli.observe_secs, 45);
-        assert_eq!(cli.lanes, "l1,l2");
+        assert!(!cli.lanes.n0);
+        assert!(cli.lanes.n1 && cli.lanes.n2);
 
         let defaults = Cli::parse_from(["m2-runner", "--session-dir", "/tmp/x"]);
         assert_eq!(defaults.observe_secs, 60);
-        assert_eq!(defaults.lanes, "l0,l1,l2");
+        assert!(defaults.lanes.n0 && defaults.lanes.n1 && defaults.lanes.n2);
+    }
+
+    /// A lane name the harness does not implement is refused outright. A run
+    /// that quietly grades nothing reads as a clean report.
+    #[test]
+    fn cli_rejects_an_unknown_or_empty_lane_set() {
+        assert!(LaneSet::parse("n0,n9").is_err());
+        assert!(LaneSet::parse("").is_err());
+        assert!(LaneSet::parse(" , ").is_err());
+        assert_eq!(
+            LaneSet::parse(" N0 , n2 ").expect("case and spacing are tolerated"),
+            LaneSet {
+                n0: true,
+                n1: false,
+                n2: true
+            }
+        );
+        assert!(
+            Cli::try_parse_from(["m2-runner", "--lanes", "n7", "--session-dir", "/tmp/x"]).is_err()
+        );
+    }
+
+    /// Only the ticket lanes need a plan, and proving one is the most
+    /// expensive thing the run does.
+    #[test]
+    fn only_the_ticket_lanes_need_a_plan() {
+        assert!(!LaneSet::parse("n0").expect("n0 parses").needs_tickets());
+        assert!(LaneSet::parse("n0,n1")
+            .expect("n0,n1 parses")
+            .needs_tickets());
+        assert!(LaneSet::parse("n2").expect("n2 parses").needs_tickets());
     }
 
     #[tokio::test]
@@ -169,7 +264,7 @@ mod tests {
             session_dir: dir.path().clone(),
             startup_timeout: 30,
             observe_secs: 60,
-            lanes: "l0,l1,l2".to_string(),
+            lanes: LaneSet::parse("n0,n1,n2").expect("lanes parse"),
             dry_run: true,
         };
         let code = run(cli).await;
@@ -204,7 +299,7 @@ mod tests {
             "ce128_serve",
             "ce129_serve",
         ] {
-            assert!(md.contains(check), "report must cover L0 check {check}");
+            assert!(md.contains(check), "report must cover N0 check {check}");
         }
     }
 
@@ -219,7 +314,7 @@ mod tests {
             session_dir: dir.clone(),
             startup_timeout: 30,
             observe_secs: 60,
-            lanes: "l0,l1,l2".to_string(),
+            lanes: LaneSet::parse("n0,n1,n2").expect("lanes parse"),
             dry_run: true,
         };
         let cli = mk(dir.path());
@@ -267,7 +362,7 @@ mod tests {
             session_dir: dir.path().clone(),
             startup_timeout: 1,
             observe_secs: 60,
-            lanes: "l0,l1,l2".to_string(),
+            lanes: LaneSet::parse("n0,n1,n2").expect("lanes parse"),
             dry_run: false,
         };
         let code = run(cli).await;
@@ -282,14 +377,14 @@ mod tests {
     async fn exit_code_reflects_hard_failure() {
         let dir = TempDir::new("hard-fail");
         // A fabricated observation log missing the `CERT_SAN_OK` observation
-        // (L0 contract code 22): `tls_cert_single_san_e_base32` hard-fails.
+        // (N0 contract code 22): `tls_cert_single_san_e_base32` hard-fails.
         let mut log = ObsLog::new();
         let mut t = 0u64;
         let mut push = |kind: ObsKind| {
             log.push(
                 t,
                 Obs {
-                    peer: l0::PEER_1,
+                    peer: n0::PEER_1,
                     kind,
                     at_ms: t,
                 },
@@ -297,8 +392,8 @@ mod tests {
             t += 10;
         };
         push(ObsKind::Accept);
-        push(ObsKind::Other(l0::CERT_ED25519));
-        push(ObsKind::Other(l0::CERT_KEY_MATCH));
+        push(ObsKind::Other(n0::CERT_ED25519));
+        push(ObsKind::Other(n0::CERT_KEY_MATCH));
         push(ObsKind::OpenUp0);
         // CERT_SAN_OK deliberately omitted.
         drop(push); // end the closure's borrows so `log` can be read
@@ -306,6 +401,7 @@ mod tests {
         let eval = crate::scenario::evaluate(
             &log,
             &crate::scenario::fabricated_run_ctx(3).expect("fabricated run ctx builds"),
+            LaneSet::parse("n0,n1,n2").expect("lanes parse"),
         );
         assert!(
             !eval.all_hard_passed,
