@@ -17,12 +17,12 @@ use jamnp_s::{
     framing::{frame, CE131, CE132},
     trace::{wall_ts, Direction as TraceDir, Trace},
 };
-use m2_reference::tickets::{ScheduledTicket, TicketDelivery};
+use m2_reference::tickets::{ScheduledTicket, TicketDelivery, TicketFault};
 use m2_scenario::ctx::{DeliveredTicket, TICKET_ARRIVAL_LEAD_MS};
 use m2_scenario::dsl::{ObsKind, ObsLog};
 use m2_scenario::scenarios::obs::{
-    BAD_PROOF_IGNORED, EMU_SENT_131, EMU_SENT_132, RECV_CE131, RECV_CE132, TICKET_WITHHELD,
-    UNKNOWN_EPOCH_RESET,
+    EMU_SENT_131, EMU_SENT_132, NUT_SENT_UNDECODABLE, RECV_CE131, RECV_CE132, TICKET_REFUSED,
+    TICKET_WITHHELD,
 };
 
 use crate::emu::NO_ADVERTISED_FINAL;
@@ -56,17 +56,6 @@ pub enum TicketInbound {
     Invalid,
 }
 
-/// Which observation a NUT stream reset maps to: a ticket targeted at a
-/// different epoch than the plan's is the unknown-epoch probe (`:335-337`);
-/// any other rejected ticket is a bad proof (`:329-332`).
-fn reset_obs(epoch_index: u32, plan_epoch: u32) -> ObsKind {
-    if epoch_index == plan_epoch {
-        ObsKind::Other(BAD_PROOF_IGNORED)
-    } else {
-        ObsKind::Other(UNKNOWN_EPOCH_RESET)
-    }
-}
-
 /// Classify an inbound CE 131/132 payload as a ticket distribution.
 pub fn classify_received(kind: u8, payload: &[u8]) -> TicketInbound {
     let mut input: &[u8] = payload;
@@ -86,12 +75,17 @@ pub fn classify_received(kind: u8, payload: &[u8]) -> TicketInbound {
 }
 
 /// Record an inbound NUT ticket stream: `RECV_CE131`/`RECV_CE132` for a
-/// decodable distribution, `BAD_PROOF_IGNORED` (soft) for an invalid one.
+/// decodable distribution, `NUT_SENT_UNDECODABLE` for one that will not
+/// decode.
+///
+/// This is the node's encoding, not its judgement of anything the harness
+/// sent. The two shared a code until 2026-11-02, which let an undecodable
+/// frame anywhere in a run satisfy a lane check about a refused ticket.
 pub async fn handle_inbound_ticket(kind: u8, payload: &[u8], peer: u16, obs: &Mutex<ObsLog>) {
     let recorded = match classify_received(kind, payload) {
         TicketInbound::Ce131(_) => RECV_CE131,
         TicketInbound::Ce132(_) => RECV_CE132,
-        TicketInbound::Invalid => BAD_PROOF_IGNORED,
+        TicketInbound::Invalid => NUT_SENT_UNDECODABLE,
     };
     crate::emu::record(obs, peer, ObsKind::Other(recorded));
 }
@@ -112,17 +106,13 @@ pub async fn spawn_ticket_sender(
     nut_final_slot: Arc<AtomicU32>,
     peer: u16,
 ) {
-    let Some(first) = plan.first() else {
-        return;
-    };
-    let plan_epoch = first.target_epoch;
     for scheduled in plan {
         let (kind, sent) = match scheduled.delivery {
             TicketDelivery::Ce131 => (CE131, EMU_SENT_131),
             TicketDelivery::Ce132 => (CE132, EMU_SENT_132),
         };
         sleep_until_delivery(scheduled.slot).await;
-        if !hold_until_the_node_can_accept(&nut_final_slot, scheduled.target_epoch, plan_epoch)
+        if !hold_until_the_node_can_accept(&nut_final_slot, scheduled.target_epoch, scheduled.fault)
             .await
         {
             crate::emu::record(&obs, peer, ObsKind::Other(TICKET_WITHHELD));
@@ -156,23 +146,39 @@ pub async fn spawn_ticket_sender(
         // wall clock: the N1 lane compares this against slot starts, which are
         // absolute, so a run-relative timestamp would make every ticket look
         // as though it had arrived before the run began.
-        crate::emu::lock(&deliveries).push(DeliveredTicket {
-            id: scheduled.ticket.id,
-            delivered_at_ms: wall_ts(),
-            target_epoch: scheduled.target_epoch,
-            // The probe is the one entry naming an epoch other than the
-            // plan's, and the only ticket the node is meant to refuse.
-            probe: scheduled.target_epoch != plan_epoch,
-        });
+        let delivery = {
+            let mut recorded = crate::emu::lock(&deliveries);
+            recorded.push(DeliveredTicket {
+                plan_index: scheduled.plan_index,
+                id: scheduled.ticket.id,
+                delivered_at_ms: wall_ts(),
+                target_epoch: scheduled.target_epoch,
+                // Read off the injected fault rather than guessed from the
+                // epoch. The guess held only while the unknown-epoch probe
+                // was the single ticket a node was meant to reject.
+                probe: scheduled.fault.is_some_and(|f| !f.still_owed_inclusion()),
+                // Not known until the node answers, below.
+                refused: false,
+            });
+            recorded.len() - 1
+        };
         let _ = send.finish();
         // Await the NUT's decision: a clean FIN accepts the ticket; a stream
-        // reset rejects it (unknown epoch `:335-337` or bad proof `:329-332`).
-        // Only a reset counts. A connection that died for its own reasons
-        // also fails this read, and recording that as a rejection would let
-        // a run credit the node with a refusal it never made.
+        // reset rejects it (`:329-337`). Only a reset counts. A connection
+        // that died for its own reasons also fails this read, and recording
+        // that as a rejection would let a run credit the node with a refusal
+        // it never made.
+        //
+        // The refusal goes on the delivery it answers rather than into the
+        // observation log alone. A reset carries no reason, so the log can
+        // only say that one happened; which ticket the node refused is a fact
+        // only this loop holds, and a lane that has to ask "did *this* ticket
+        // get refused" cannot be answered by an unscoped `obs.first`. The
+        // code recorded alongside is for the report and the trace.
         let mut buf = [0u8; 1024];
         if let Err(quinn::ReadError::Reset(_)) = recv.read(&mut buf).await {
-            crate::emu::record(&obs, peer, reset_obs(epoch_index, plan_epoch));
+            crate::emu::lock(&deliveries)[delivery].refused = true;
+            crate::emu::record(&obs, peer, ObsKind::Other(TICKET_REFUSED));
         }
     }
 }
@@ -211,12 +217,23 @@ pub fn node_can_accept_tickets(nut_final_slot: u32, now_slot: u32) -> bool {
 /// The unknown-epoch probe (`simple.md:335-337`) names a far epoch on purpose,
 /// so it is exempt from the staleness test; it is the one ticket whose refusal
 /// is the point.
-fn still_worth_sending(now_slot: u32, target_epoch: u32, plan_epoch: u32) -> bool {
-    let period = jam_types::epoch_period();
-    if now_slot % period >= jam_types::epoch_tail_start().saturating_sub(1) {
-        return false;
+fn still_worth_sending(now_slot: u32, target_epoch: u32, fault: Option<TicketFault>) -> bool {
+    // A fault goes out whatever the clock says. Half the catalogue is itself
+    // a statement about timing or epoch -- `Late` is *defined* by arriving
+    // after the window shuts, `StaleEpoch` and `UnknownEpoch` by naming an
+    // epoch the window does not belong to -- so a gate that withheld anything
+    // out of season would suppress exactly the deliveries it was given to
+    // make. The readiness test still applies: the node must be in a state to
+    // process the stimulus, or its answer says nothing about the rule.
+    if fault.is_some() {
+        return true;
     }
-    target_epoch != plan_epoch || now_slot / period + 1 == target_epoch
+    let period = jam_types::epoch_period();
+    // Before the lottery's last submittable phase, and still in the epoch
+    // this ticket may be submitted during. Either alone is not enough: the
+    // phase test says nothing about which epoch the phase belongs to.
+    now_slot % period < jam_types::epoch_tail_start().saturating_sub(1)
+        && now_slot / period + 1 == target_epoch
 }
 
 /// Hold a ticket until the node can accept it, or until it is no longer worth
@@ -224,14 +241,14 @@ fn still_worth_sending(now_slot: u32, target_epoch: u32, plan_epoch: u32) -> boo
 async fn hold_until_the_node_can_accept(
     nut_final_slot: &AtomicU32,
     target_epoch: u32,
-    plan_epoch: u32,
+    fault: Option<TicketFault>,
 ) -> bool {
     loop {
         let now_slot = m2_reference::chain::wall_clock_slot();
         // Asked before readiness, not after: a node that became ready only
         // once the window had shut would otherwise be sent a ticket it is
         // required to refuse.
-        if !still_worth_sending(now_slot, target_epoch, plan_epoch) {
+        if !still_worth_sending(now_slot, target_epoch, fault) {
             return false;
         }
         if node_can_accept_tickets(nut_final_slot.load(Ordering::SeqCst), now_slot) {
@@ -381,43 +398,84 @@ mod tests {
         /// exists to avoid.
         #[test]
         fn a_ticket_is_held_only_while_it_could_still_be_submitted() {
-            let plan_epoch = 101;
+            let target = 101;
             assert!(
-                still_worth_sending(slot_in(100, 1), plan_epoch, plan_epoch),
+                still_worth_sending(slot_in(100, 1), target, None),
                 "early in the submission epoch"
             );
             assert!(
                 !still_worth_sending(
                     slot_in(100, jam_types::epoch_tail_start() - 1),
-                    plan_epoch,
-                    plan_epoch
+                    target,
+                    None
                 ),
                 "the lottery's last submittable phase has passed"
             );
             assert!(
-                !still_worth_sending(slot_in(101, 1), plan_epoch, plan_epoch),
+                !still_worth_sending(slot_in(101, 1), target, None),
                 "the target epoch has begun, so the ticket is stale"
             );
         }
 
+        /// A fault is sent whatever the clock says. Being out of season is
+        /// the stimulus for half the catalogue, so the gate that protects
+        /// honest tickets must not suppress them.
+        #[test]
+        fn a_fault_is_never_held_back_for_being_out_of_season() {
+            let target = 101;
+            for fault in [
+                TicketFault::Late,
+                TicketFault::StaleEpoch,
+                TicketFault::UnknownEpoch,
+                TicketFault::BadProof,
+                TicketFault::WrongProxy,
+                TicketFault::BadAttempt,
+                TicketFault::Duplicate,
+            ] {
+                assert!(
+                    still_worth_sending(
+                        slot_in(100, jam_types::epoch_tail_start()),
+                        target,
+                        Some(fault)
+                    ),
+                    "{fault:?} must still go out after the window shuts"
+                );
+                assert!(
+                    still_worth_sending(slot_in(101, 1), target, Some(fault)),
+                    "{fault:?} must still go out once the target epoch has begun"
+                );
+            }
+        }
+
         /// The unknown-epoch probe names an epoch no validator can hold
         /// entropy for, on purpose. Judging it stale would withhold the one
-        /// ticket whose refusal is the thing being tested.
+        /// A fault naming an epoch outside the window is not "stale": the
+        /// epoch it names is the stimulus.
+        ///
+        /// It is exempt from the lottery window too. A fault delivered in the
+        /// tail may be refused for lateness rather than for its own defect,
+        /// but the verdicts assert only that the node refused it, so the two
+        /// reasons are not told apart and nothing is confounded. The honest
+        /// deliveries keep both guards.
         #[test]
-        fn the_unknown_epoch_probe_is_not_stale() {
-            let plan_epoch = 101;
+        fn a_fault_naming_another_epoch_is_not_stale() {
+            let target = 101;
             assert!(still_worth_sending(
                 slot_in(100, 1),
-                plan_epoch + 1,
-                plan_epoch
+                target + 1,
+                Some(TicketFault::UnknownEpoch)
             ));
             assert!(
-                !still_worth_sending(
+                still_worth_sending(
                     slot_in(100, jam_types::epoch_tail_start()),
-                    plan_epoch + 1,
-                    plan_epoch
+                    target + 1,
+                    Some(TicketFault::UnknownEpoch)
                 ),
-                "but it is still bound by the lottery window"
+                "and is not bound by the window an honest ticket is"
+            );
+            assert!(
+                !still_worth_sending(slot_in(100, 1), target + 1, None),
+                "an honest ticket for another epoch is still stale"
             );
         }
     }
@@ -453,9 +511,17 @@ mod tests {
             assert!(
                 obs.lock()
                     .unwrap()
-                    .first(ObsKind::Other(obs::BAD_PROOF_IGNORED))
+                    .first(ObsKind::Other(obs::NUT_SENT_UNDECODABLE))
                     .is_some(),
-                "an undecodable stream must record BAD_PROOF_IGNORED"
+                "an undecodable stream is the node's encoding defect, and must \
+                 record NUT_SENT_UNDECODABLE rather than a refusal"
+            );
+            assert!(
+                obs.lock()
+                    .unwrap()
+                    .first(ObsKind::Other(obs::TICKET_REFUSED))
+                    .is_none(),
+                "and must not look like the node refusing a ticket we sent"
             );
         }
     }

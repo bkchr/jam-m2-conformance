@@ -458,10 +458,12 @@ mod tests {
     /// A delivered ticket for the epoch after `slot`'s, in hand in time for it.
     fn delivered_for(ctx: &N1Ctx, id: [u8; 32], slot: u32, lead_ms: u64) -> DeliveredTicket {
         DeliveredTicket {
+            plan_index: 0,
             id,
             delivered_at_ms: ctx.slot_start_ms(slot) - lead_ms,
             target_epoch: slot / ctx.epoch_period + 1,
             probe: false,
+            refused: false,
         }
     }
 
@@ -986,10 +988,12 @@ mod tests {
         let mut ctx = base_ctx();
         let tail_slot = EPOCH_TAIL_START; // epoch 0, first slot of the tail
         ctx.delivered_tickets = vec![DeliveredTicket {
+            plan_index: 0,
             id: t.id,
             delivered_at_ms: ctx.slot_start_ms(tail_slot) - 10_000,
             target_epoch: 1,
             probe: false,
+            refused: false,
         }];
 
         // In the tail nothing is owed, so an empty block is correct...

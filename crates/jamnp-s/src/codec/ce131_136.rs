@@ -17,10 +17,12 @@ pub const TICKET_PROOF_LEN: usize = 784;
 pub struct Ticket {
     /// Ticket attempt.
     ///
-    /// How many attempts a validator may make is a protocol parameter
-    /// (`tickets_per_validator`), not a wire constant, and the range is judged
-    /// by the N2 lane's `n2_gen_attempt_in_range`. The decoder deliberately
-    /// does not enforce it: see [`Ticket`]'s `Decode`.
+    /// How many attempts a validator may make follows from the protocol
+    /// parameters and is not a wire constant: at the pinned revision it is
+    /// `tickets_per_validator(val_count)`, derived as `(2 × epoch_period) ÷
+    /// val_count` rounded up, which is 4 under tiny. The range is judged by
+    /// the N2 lane's `n2_gen_attempt_in_range`; the decoder deliberately does
+    /// not enforce it, for the reason on [`Ticket`]'s `Decode`.
     pub attempt: u8,
     /// Bandersnatch RingVRF proof.
     pub proof: [u8; TICKET_PROOF_LEN],

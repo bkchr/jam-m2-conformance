@@ -9,15 +9,42 @@ nothing else does:
 | `M2 Conformance - Delivery Plan.md` | the delivery plan — milestone ladder, effort, rollout |
 | `M2-status.md` (this file) | progress against that ladder, and the evidence for it |
 
-Last verified 2026-10-30 against polkajam @ `940ef56c7`, branch `m2/connectivity-fixes`
-@ `60f5c46` plus the uncommitted fixes of §3.1 and §3.2.
+Last verified 2026-11-02 against polkajam @ `e3d216c24`, branch `devel` @ `8270303` plus
+the uncommitted re-pin and spec-parameter fix below. The results of §3 were taken on
+2026-10-30 against the previous pin `940ef56c7` and are unchanged by the re-pin.
+
+### Re-pin, 2026-11-02: `940ef56c` → `e3d216c2`
+
+Ten commits, `940ef56c` (2026-10-16, #1305) to upstream `main` `e3d216c2` (2026-11-02, #1352).
+Cargo.toml's policy asks a re-pin to record what moved in the genesis writer and the hazmat
+exports:
+
+| | what moved |
+|---|---|
+| **Genesis writer** | `gen_spec` dropped `ProtocolParameters::large()` from its core-count lookup, because that preset was removed. The harness builds tiny (`core_count` 2) through `hazmat::dev_spec` and `StorageBuilder::RawFactory`, which are unchanged, and `jam-std-common` is untouched — so the genesis header and state keys, and therefore the genesis hash and the ALPN derived from it, are the same. |
+| **Hazmat exports** | `exec::SafroleProgressor` added. `Harness::try_submit_guarantee` removed; the harness never used it. All eight symbols the harness imports (`AuthoringHarness`, `AuthoringHarnessConfig`, `ImportBlockParams`, `KeystoreSigner`, `SecretKeysets`, `StorageBuilder`, `default_dev_spec`, `dev_spec`) are unchanged. |
+| **Ticket rules** | unchanged. `ticket_communication.rs`, `proxy.rs`, `error.rs` and `exec/safrole.rs` are byte-identical across the ten commits, so the attempt cap stays 4 (`m2_spec_parameters_match_the_engine` asserts it), as do the proxy-selection rule and the forwarding window. |
+| **Ticket diagnostics** | `execute_block.rs` now returns `Safrole(e)` where it returned `BadSignature` for a bad ticket extrinsic, so a rejected import names `BadTicketAttempt` or `BadTicketEpoch` instead of a flat bad-signature. `m2-reference`'s `ImportOutcome::error` is an `Option<String>` that is reported and never matched on, so this is a free improvement to N1's findings. `ticket_table.rs` drops a full table's worst ticket at `Debug` rather than `Warn` — by design, and worth knowing if anything ever reads the node log for ticket evidence. |
+| **State transition** | `execute_block.rs` moved `authorizations::progress` from before accumulation to after it, "from the queues that accumulation has set". This changes posterior state roots for blocks where accumulation sets an authorization queue. Harmless here only because the oracle and the NUT are the same build and move together — it is precisely the divergence the pin policy exists to prevent. |
+| **Everything else** | the bulk is `polkajam-fuzz` (#1288, an STF-fuzzer overhaul). It is a workspace dependency but no harness crate imports it, and it does not compile as part of a workspace build. |
+
+`/parity/polkajam` was *not* the source of this pin: that clone sits at `75e9061a`
+(2026-03-13, #931), a direct ancestor of the old pin and seven months behind it. Reading it
+as current is what produced the inverted parameter history now corrected in DESIGN §10.
+
+Verified end to end, `sessions/repin-1`: the NUT binary rebuilt from `e3d216c2` reports
+`polkajam 0.1.29 / GP 0.8.0`; 100 checks ran, 95 hard pass, 3 soft pass, and the same two
+hard findings as before the re-pin — `ce129_boundary_parent_before_child` and
+`n2_unknown_epoch_reset_observed`, both node defects of §3. N2 is otherwise green, including
+`n2_proxy_duty_forwarded` and seven passes of `n2_gen_attempt_in_range`, and the node log
+has no `finality lagging` at all.
 
 ## Milestone ladder
 
 | Milestone | Lanes | Coverage | Status |
 |---|---|---|---|
 | **M2-A** — Foundations live | N0, N1 | 6 / 41 | ✅ **complete** — §1 |
-| **M2-B** — Self-tested | N2 | 8 / 41 | ⚠️ **partial** — the N2 lane exists; the bar does not. See below |
+| **M2-B** — Self-tested | N2 | 8 / 41 | ⚠️ **partial** — the N2 lane is complete; the bar's second half is not. See below |
 | **M2-C** — Guaranteeing | N3 | 21 / 41 | ⏳ not started |
 | **M2-D** — Availability | N4 | 30 / 41 | ⏳ not started |
 | **M2-E** — Audit & preimages | N5, N6 | 41 / 41 | ⏳ not started |
@@ -26,11 +53,21 @@ Last verified 2026-10-30 against polkajam @ `940ef56c7`, branch `m2/connectivity
 
 **On M2-B.** Its bar is *"Safrole tickets covered, **and** the harness's own checks are proven
 by deliberately faulty simulated clients"* — the delivery plan calls it the structural
-milestone: *before it, the harness reports; after it, the harness can be trusted to judge.* The
-N2 lane is implemented and graded live, so the first half holds. The second does not: there are
-no simulated clients, no transport abstraction and no virtual clock to build them on (§4). Two
-of the four hard failures in the last run were harness defects that simulated faulty clients
-exist to catch (§3), which is the cost of that gap measured rather than argued.
+milestone: *before it, the harness reports; after it, the harness can be trusted to judge.*
+
+*Safrole tickets covered* now holds in full. As of 2026-11-03 every row of DESIGN §11 N2 is
+implemented, the Faults column included: seven checks, graded live, with a catalogue of seven
+deliberately-broken ticket shapes injected into each run as the ticket budget allows, and every
+negative verdict gated on a control so that it cannot pass on a run in which the node did
+nothing. `N2-design.md` is the row-by-row account, including the three rows that assert
+deliberately less than the DESIGN wording reads like and the three items left out on purpose.
+
+*Proven by deliberately faulty simulated clients* does not. The faults are injected into the
+ticket stream of an otherwise honest emulator; there are no faulty **clients**, and no transport
+abstraction or virtual clock to build them on (§4). The distinction is not pedantic: two of the
+four hard failures ever observed were harness defects of exactly the kind simulated clients
+exist to catch (§3), and injected tickets would not have caught either, because both were in how
+the harness itself spoke to the node.
 
 This document records what each milestone required, the evidence that it holds, what is not
 covered, and how to point the suite at a third-party node.
@@ -120,8 +157,8 @@ Result: the node accepts every ticket the emulator offers. `invalid ticket signa
 | | |
 |---|---|
 | Crates | 5 (`jamnp-s`, `m2-reference`, `m2-emu`, `m2-scenario`, `m2-runner`) |
-| Rust | ~17.6k lines, 359 test functions |
-| `cargo test --workspace` | **363 passed / 0 failed** |
+| Rust | ~20.9k lines, 387 test functions |
+| `cargo test --workspace` | **404 passed / 0 failed** |
 | `cargo fmt --all --check` | clean |
 | `cargo clippy --workspace --all-targets` | 3 warnings, all pre-existing |
 | Dry-run baseline | exits 0 — the harness's own expectations are satisfiable |
@@ -133,7 +170,8 @@ Verification run (`sessions/m0-verify`, 2026-10-28): **82 checks, 5 findings, 4 
 failures**, exit code 1. Five peers registered and stayed registered for the whole window
 (45 consecutive `Net status: 5 peers (5 vals)` samples).
 
-Run-to-run check counts vary between roughly 82 and 130, because which slots the node wins and
+Run-to-run check counts vary between roughly 82 and 278 — a 90 s window grades a fraction of
+what a 300 s one does — because which slots the node wins and
 when a proxied ticket arrives decide which rules get exercised. A single run is not a stable
 baseline, and the set of findings is not stable either — see the caution below.
 
@@ -141,7 +179,7 @@ baseline, and the set of findings is not stable either — see the caution below
 |---|---|---|
 | N0 connectivity and sync | UP 0, CE 128, CE 129 | 26/27 hard pass |
 | N1 authoring | asserted over UP 0 and CE 128 | parent, seal, prior/posterior state roots graded per block |
-| N2 Safrole tickets | CE 131, CE 132 | proofs, target epochs, attempt ranges, per-epoch caps, proxy routing, inclusion |
+| N2 Safrole tickets | CE 131, CE 132 | complete against DESIGN §11 N2: proofs, target epochs, attempt ranges, per-epoch caps, proxy routing, the forward window, the stopping rule, inclusion, and the Faults column — bad proof, wrong proxy, wrong epoch, late and duplicate |
 
 Four distinct hard failures have been observed. Reading the node's own log alongside them shows
 that **only two are node defects**; the other two are the harness blaming the node for a refusal
@@ -157,8 +195,18 @@ it was right to make.
 **Update, 2026-10-30.** Every hard failure but the two node defects is closed. §3.1 records four
 delivery fixes and §3.2 three more, with the evidence for each. `n2_proxy_duty_forwarded` took
 both rounds: the gate of §3.1 got tickets accepted at all, and the decoder fix of §3.2 got the
-node's forwards seen. The latest runs (`sessions/fwd-3`, `sessions/fwd-4`) report **two hard
-findings, both node defects**.
+node's forwards seen. The latest run (`sessions/unitB-9`, 2026-11-03, a 300 s
+window) reports **278 checks and two hard findings, both node defects** — the same two, now
+against a run that also injects six deliberately-broken tickets, grades every block of the
+submission epoch on what the node did with them, and exercises the proxy duty four times.
+
+That run adds two soft rows. `n2_proxy_duty_bad_proof_ignored`: the bad-proof fault reached
+the node (its own log says `Error processing incoming ticket: invalid ticket signature`), so
+it detected the forgery and refused it — but did not reset the stream it arrived on. That is
+`n2_unknown_epoch_reset_observed`'s defect in a second place, and the harness now sees both.
+`n2_forward_stops_at_finality` reports itself unexercised: the node sends each ticket to each
+peer exactly once, so it never had a forward to stop, which is the expected verdict against
+this node rather than a gap to close (DESIGN §11 N2, "The stopping rule").
 
 #### 3.1 The delivery fixes, 2026-10-29
 
@@ -299,7 +347,7 @@ this upstream.
 
 #### `n2_unknown_epoch_reset_observed` — node defect
 
-> 1 ticket(s) for an epoch past the NUT's horizon were delivered, and none made it reset the stream
+> 1 of 1 ticket(s) for an epoch past the NUT's horizon were delivered and not refused; it must reset the stream each arrived on
 
 `simple.md:335-337` requires a ticket for an epoch the node cannot know yet to make it reset the
 stream. The node detects the ticket correctly —
@@ -311,6 +359,11 @@ WARN authoring  Error processing incoming ticket: bad ticket epoch value 797852
 — rejects it, and then lets the stream finish cleanly. The emulator records a reset only on a
 genuine `ReadError::Reset`, deliberately: a connection that died for its own reasons must not be
 credited as a refusal. So the node is right semantically and wrong at the transport layer.
+
+The verdict is unchanged by the 2026-11-02 attribution work, but its basis is firmer. The check
+used to ask whether *any* reset had been seen in the run; it now asks whether the probe itself was
+refused, which is the question the rule poses. Both answers happen to agree here because the probe
+is the only ticket a run currently offers that the node is meant to reject.
 
 #### `n2_proxy_duty_forwarded` — harness-induced (closed, §3.1)
 
@@ -393,8 +446,11 @@ coverage beyond its own 6 / 41.
   `sleep`/`SystemTime::now`/`Instant::now` sites** above `jamnp-s`. The plan's estimate of
   earlier estimate of "only 10 call sites" understates the work by roughly 3×; re-estimate
   before scheduling it.
-- **No negative testing.** Roughly half the DESIGN §11 catalogue is fault injection; none of it
-  exists. A node that accepts a bad signature can still pass today.
+- **Negative testing exists in N2 only.** N2 injects its whole Faults column — bad proof, wrong
+  proxy, wrong epoch, late, duplicate, plus an over-cap attempt DESIGN does not list — and gates
+  every negative verdict on a control. Nothing equivalent exists for the other lanes, because the
+  other lanes do not exist. And the faults are injected into an honest emulator's ticket stream,
+  which is not the same thing as a faulty client (see M2-B above).
 - **One real node has been graded.** The suite has only ever run against polkajam.
 
 ---
@@ -524,7 +580,11 @@ report top-down.
    correct prior and posterior state roots; carry the tickets it has been delivered.
 8. **Safrole tickets (N2).** Run the lottery, send over CE 131 to its proxy and CE 132 to every
    validator, respect target epoch, attempt range and the per-epoch cap, and reset the stream on
-   a ticket for an unknown epoch.
+   a ticket for an unknown epoch. Forward a ticket you are proxy for to all five, after it
+   arrives and inside the lottery. Expect deliberately broken tickets as well as honest ones: a
+   bad proof, a ticket naming you as proxy when the rule names someone else, a stale epoch, one
+   past slot 10, and a duplicate. None of those may be forwarded or reach a block — except the
+   duplicate, which the block still owes a place, once.
 
 A node that implements only part of this still gets a useful report: checks that could not be
 exercised are reported as soft "not exercised" rows, distinct from failures.
@@ -543,6 +603,7 @@ have been failed for it.
 | ~~**The proxy-forward rule does not model batching or pruning**~~ | **closed 2026-10-30, as not-a-defect** — the node had forwarded every ticket; the harness's decoder was dropping the frames. The batch split fitted the symptom by coincidence. See §3.2 | — |
 | ~~`JAM_M2_SPEC` receives `spec.json` (polkajam's native format), not `spec-m2.json`~~ | **closed 2026-10-30** — `LaunchConfig` carries both paths behind a `{spec}` and a `{m2_spec}` placeholder, and the docker preset passes the M2 one | — |
 | ~~`--lanes` is parsed but never consumed~~ | **closed 2026-10-30** — parsed into a `LaneSet` (an unknown lane name is refused rather than ignored) and consumed by `evaluate`. A lane left out is neither graded nor exercised: `--lanes n0` skips ticket proving entirely | — |
+| ~~`spec-m2.json` declares three ticket attempts per validator; the run uses four~~ | **closed 2026-11-02** — a third-party node configured from the §7 environment contract would have made three attempts an epoch and been graded against four, and the fourth attempt of every emulated author would have looked to it like a ticket over the cap. polkajam never saw it: it reads its own `spec.json`. The nine named parameters are now derived from `jam_types` rather than hand-written literals, so the contract cannot drift from the run | — |
 | No capability handshake | the report cannot distinguish *not attempted* from *not exercised* | declared-lane negotiation, per the delivery plan's rollout section |
 | The `docker` preset has never been exercised live | only its command string is under test; the polkajam preset is the only path with live evidence | run it against a real image before onboarding anyone |
 | The oracle is polkajam | a genuine state-transition disagreement between a third-party node and polkajam surfaces as an N1 state-root failure | expected; M1 state-transition conformance is `davxy/jam-conformance`'s job, and a client should be M1-green before attempting M2 |
@@ -556,7 +617,7 @@ have been failed for it.
 ./scripts/prepare-nut.sh
 
 # Harness checks.
-cargo test --workspace            # 363 passed / 0 failed
+cargo test --workspace            # 404 passed / 0 failed
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets
 
