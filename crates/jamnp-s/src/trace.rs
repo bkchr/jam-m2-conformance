@@ -88,18 +88,20 @@ pub fn decode_record(bytes: &[u8]) -> Option<TraceRecord> {
     })
 }
 
-/// Monotonic-relative timestamp in milliseconds (origin = first call).
+/// Monotonic-relative timestamp in milliseconds (origin = the clock's start).
+///
+/// Read from the installed [`crate::clock`], so a trace recorded on a virtual
+/// clock carries that clock's timeline. The lanes compute slots from these
+/// timestamps, so they and the waits that produced them have to agree about
+/// what time it is.
 pub fn mono_ts() -> u64 {
-    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let origin = *ORIGIN.get_or_init(std::time::Instant::now);
-    origin.elapsed().as_millis() as u64
+    crate::clock::current().mono_ms()
 }
 
-/// Wall-clock timestamp in milliseconds since the Unix epoch.
+/// Wall-clock timestamp in milliseconds since the Unix epoch, from the
+/// installed [`crate::clock`].
 pub fn wall_ts() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+    crate::clock::current().wall_ms()
 }
 
 /// Ordered trace of JAMNP messages.

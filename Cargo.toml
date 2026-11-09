@@ -29,13 +29,14 @@ jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "
 jam-node = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a", features = ["hazmat"] }
 polkajam-fuzz = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a" }
 
+async-trait = "0.1"
 quinn = { version = "0.11", features = ["rustls", "runtime-tokio", "log"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1"
 rcgen = { version = "0.14", features = ["ring"] }
 ed25519-consensus = { version = "2.1.0" }
 x509-parser = "0.17"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 futures = "0.3"
 clap = { version = "4.5.13", features = ["derive", "string"] }
 serde = { version = "1.0", features = ["derive"] }
