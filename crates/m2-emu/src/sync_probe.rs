@@ -10,11 +10,13 @@ use std::sync::Mutex;
 
 use jam_types::{Decode, Encode, HeaderHash};
 use jamnp_s::{
+    clock,
     codec::ce128_129::{
         BlockRequest, BlockResponse, BoundaryNodes, Direction, KeyValues, StateRequest,
     },
     framing::{frame, FrameReader, CE128, CE129},
     trace::{Direction as TraceDir, Trace},
+    transport::Conn,
 };
 use m2_scenario::scenarios::n0::{Ce128Probe, Ce129Probe, ProbedBlock};
 
@@ -37,7 +39,7 @@ pub const PROBE_DELAY_SECS: u64 = 20;
 
 /// Ask the node for every block after `from`, ascending.
 pub async fn probe_ce128(
-    connection: &quinn::Connection,
+    connection: &Conn,
     peer: u16,
     from: [u8; 32],
     trace: &Mutex<Trace>,
@@ -90,7 +92,7 @@ pub async fn probe_ce128(
 /// would grade the node on which states it happens to retain. The genesis
 /// header is the fallback because every node holds its state.
 pub async fn probe_ce129_at(
-    connection: &quinn::Connection,
+    connection: &Conn,
     peer: u16,
     candidates: &[[u8; 32]],
     trace: &Mutex<Trace>,
@@ -110,7 +112,11 @@ pub async fn probe_ce129_at(
     last.unwrap_or_else(|| empty_ce129(peer, "no header to ask about".to_string()))
 }
 
-/// polkajam's `NoData` application error code, as it reaches us through quinn.
+/// polkajam's `NoData` application error code, as the transport reports it.
+///
+/// Matched inside the rendered error rather than on a variant: the probe keeps
+/// what it saw as a string, and `ReadError::Reset` prints its code, so the
+/// number is there either way.
 const NO_DATA_RESET: &str = "91141958510817";
 
 fn empty_ce129(peer: u16, error: String) -> Ce129Probe {
@@ -130,7 +136,7 @@ fn empty_ce129(peer: u16, error: String) -> Ce129Probe {
 
 /// Ask the node for a slice of the state at `header_hash`.
 pub async fn probe_ce129(
-    connection: &quinn::Connection,
+    connection: &Conn,
     peer: u16,
     header_hash: [u8; 32],
     trace: &Mutex<Trace>,
@@ -197,7 +203,7 @@ pub async fn probe_ce129(
 /// Returns the messages and whether the node closed the stream cleanly after
 /// them, which is the "both halves FIN" assertion.
 async fn request_frames(
-    connection: &quinn::Connection,
+    connection: &Conn,
     peer: u16,
     kind: u8,
     payload: &[u8],
@@ -208,13 +214,13 @@ async fn request_frames(
         .open_bi()
         .await
         .map_err(|e| EmuError::Protocol(e.to_string()))?;
-    let stream_id = u64::from(send.id());
+    let stream_id = send.id();
     let wire = frame(kind, payload);
     trace_record(peer, kind, stream_id, &wire, trace, TraceDir::Rx);
     send.write_all(&wire)
         .await
         .map_err(|e| EmuError::Protocol(e.to_string()))?;
-    let _ = send.finish();
+    send.finish();
 
     // We opened the stream, so we wrote the kind byte; the node's replies are
     // bare `[len: u32 LE] ++ [content]` messages on this half.
@@ -255,14 +261,16 @@ async fn request_frames(
 ///
 /// Once, not per peer: the probes are assertions about the node, and five
 /// copies of the same answer would be five identical rows in the report.
-pub fn start_sync_probe(connection: &quinn::Connection, peer: u16, shared: &EmuShared) {
+pub fn start_sync_probe(connection: &Conn, peer: u16, shared: &EmuShared) {
     if !shared.claim_sync_probe() {
         return;
     }
     let connection = connection.clone();
     let shared = shared.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(PROBE_DELAY_SECS)).await;
+        clock::current()
+            .sleep(std::time::Duration::from_secs(PROBE_DELAY_SECS))
+            .await;
         let genesis = shared.ref_chain.genesis_hash();
         let ce128 = probe_ce128(&connection, peer, genesis, &shared.trace).await;
         // Ask at the newest block the node told us about, falling back to

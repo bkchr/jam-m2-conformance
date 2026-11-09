@@ -13,9 +13,11 @@ use std::time::Duration;
 
 use jam_types::{Decode, Encode, JAM_COMMON_ERA};
 use jamnp_s::{
+    clock,
     codec::ce131_136::{Ticket, TicketDistribution},
     framing::{frame, CE131, CE132},
     trace::{wall_ts, Direction as TraceDir, Trace},
+    transport::{Conn, ReadError},
 };
 use m2_reference::tickets::{ScheduledTicket, TicketDelivery, TicketFault};
 use m2_scenario::ctx::{DeliveredTicket, TICKET_ARRIVAL_LEAD_MS};
@@ -98,7 +100,7 @@ pub async fn handle_inbound_ticket(kind: u8, payload: &[u8], peer: u16, obs: &Mu
 /// [`TICKET_WITHHELD`] so the lanes report the rule as unexercised instead of
 /// failing the node for it.
 pub async fn spawn_ticket_sender(
-    connection: quinn::Connection,
+    connection: Conn,
     plan: Vec<ScheduledTicket>,
     trace: Arc<Mutex<Trace>>,
     obs: Arc<Mutex<ObsLog>>,
@@ -130,14 +132,7 @@ pub async fn spawn_ticket_sender(
             },
         };
         let wire = frame(kind, &distribution.encode());
-        crate::emu::trace_record(
-            peer,
-            kind,
-            u64::from(send.id()),
-            &wire,
-            &trace,
-            TraceDir::Rx,
-        );
+        crate::emu::trace_record(peer, kind, send.id(), &wire, &trace, TraceDir::Rx);
         crate::emu::record(&obs, peer, ObsKind::Other(sent));
         if send.write_all(&wire).await.is_err() {
             continue;
@@ -162,7 +157,7 @@ pub async fn spawn_ticket_sender(
             });
             recorded.len() - 1
         };
-        let _ = send.finish();
+        send.finish();
         // Await the NUT's decision: a clean FIN accepts the ticket; a stream
         // reset rejects it (`:329-337`). Only a reset counts. A connection
         // that died for its own reasons also fails this read, and recording
@@ -176,7 +171,7 @@ pub async fn spawn_ticket_sender(
         // get refused" cannot be answered by an unscoped `obs.first`. The
         // code recorded alongside is for the report and the trace.
         let mut buf = [0u8; 1024];
-        if let Err(quinn::ReadError::Reset(_)) = recv.read(&mut buf).await {
+        if let Err(ReadError::Reset(_)) = recv.read(&mut buf).await {
             crate::emu::lock(&deliveries)[delivery].refused = true;
             crate::emu::record(&obs, peer, ObsKind::Other(TICKET_REFUSED));
         }
@@ -254,7 +249,9 @@ async fn hold_until_the_node_can_accept(
         if node_can_accept_tickets(nut_final_slot.load(Ordering::SeqCst), now_slot) {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(READINESS_POLL_MS)).await;
+        clock::current()
+            .sleep(Duration::from_millis(READINESS_POLL_MS))
+            .await;
     }
 }
 
@@ -273,7 +270,9 @@ async fn sleep_until_delivery(slot: u32) {
         if now >= target_ms {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(target_ms - now)).await;
+        clock::current()
+            .sleep(Duration::from_millis(target_ms - now))
+            .await;
     }
 }
 

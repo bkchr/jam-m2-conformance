@@ -9,6 +9,7 @@ use jamnp_s::{
     codec::ce128_129::{BlockRequest, BlockResponse, Direction},
     framing::{frame, FrameReader, CE128},
     trace::{wall_ts, Direction as TraceDir},
+    transport::{Conn, RecvHalf},
 };
 use m2_reference::chain::RefChain;
 use m2_scenario::ctx::NutBlock;
@@ -44,7 +45,7 @@ fn already_fetched(nut_blocks: &Mutex<Vec<NutBlock>>, hash: &[u8; 32]) -> bool {
 /// Fetch the announced block via CE 128 (`DescendingInclusive`, `max_blocks =
 /// 1`) and, on exactly one block, record `AuthorsBlock` and store it.
 pub async fn fetch_block(
-    connection: &quinn::Connection,
+    connection: &Conn,
     announced_hash: [u8; 32],
     peer: u16,
     shared: &EmuShared,
@@ -60,31 +61,17 @@ pub async fn fetch_block(
         max_blocks: 1,
     };
     let wire = frame(CE128, &request.encode());
-    trace_record(
-        peer,
-        CE128,
-        u64::from(send.id()),
-        &wire,
-        trace,
-        TraceDir::Rx,
-    );
+    trace_record(peer, CE128, send.id(), &wire, trace, TraceDir::Rx);
     send.write_all(&wire)
         .await
         .map_err(|e| EmuError::Protocol(e.to_string()))?;
-    let _ = send.finish();
+    send.finish();
     let Some(content) = read_response(&mut recv).await? else {
         return Err(EmuError::Protocol(
             "CE 128 response stream ended early".into(),
         ));
     };
-    trace_record(
-        peer,
-        CE128,
-        u64::from(send.id()),
-        &content,
-        trace,
-        TraceDir::Tx,
-    );
+    trace_record(peer, CE128, send.id(), &content, trace, TraceDir::Tx);
     let response =
         BlockResponse::decode(&mut &content[..]).map_err(|e| EmuError::Decode(format!("{e:?}")))?;
     let [block] = response.blocks.as_slice() else {
@@ -145,7 +132,7 @@ fn record_block(
 /// Read the single response frame on a CE 128 fetch stream. The responder
 /// replies without a kind byte (the request established it), so the reader is
 /// seeded with the request's kind before reading (simple.md:122-124).
-async fn read_response(recv: &mut quinn::RecvStream) -> Result<Option<Vec<u8>>, EmuError> {
+async fn read_response(recv: &mut RecvHalf) -> Result<Option<Vec<u8>>, EmuError> {
     let mut reader = FrameReader::new();
     reader.push(&[CE128]);
     let mut buf = [0u8; 4096];

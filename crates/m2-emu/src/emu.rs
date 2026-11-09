@@ -19,9 +19,10 @@ use jam_types::{Decode, Encode, HeaderHash};
 use jamnp_s::{
     codec::ce128_129::{BlockRequest, BlockResponse, Direction, StateRequest, StateResponse},
     codec::up0::{Announcement, Final, Handshake},
-    endpoint::{Endpoint, EndpointConfig, EndpointError},
+    endpoint::{EndpointConfig, EndpointError},
     framing::{frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, UP},
     trace::{mono_ts, wall_ts, Direction as TraceDir, Trace, TraceRecord},
+    transport::{quic::QuicTransport, Conn, Listener, RecvHalf, SendHalf, Transport},
 };
 use m2_reference::chain::RefChain;
 use m2_reference::tickets::ScheduledTicket;
@@ -61,12 +62,18 @@ pub enum EmuError {
 
 /// The emulated validators: every validator index except the NUT's.
 ///
-/// Each validator is one [`Endpoint`] bound to `127.0.0.1:(base_port + i)` with
+/// Each validator is one listener bound to `127.0.0.1:(base_port + i)` with
 /// the Ed25519 identity `SecretKeyset::trivial(i)`. The endpoints stay alive
 /// in the caller's runtime; [`Emulator::accept_loop`] spawns one reactive
 /// accept task per endpoint.
+///
+/// Which carrier those listeners are on is the caller's choice and travels
+/// with the emulator: [`Emulator::n0`] binds them over QUIC, and whatever
+/// dials out later -- [`dial_nut`] included -- uses the same transport, so a
+/// run cannot end up with one side on each.
 pub struct Emulator {
-    endpoints: Vec<Arc<Endpoint>>,
+    transport: Arc<dyn Transport>,
+    endpoints: Vec<Arc<dyn Listener>>,
     /// Validator index of each endpoint, positionally. Not a range: the NUT can
     /// sit anywhere in the keyset, so the emulated indices straddle it.
     emu_indices: Vec<usize>,
@@ -88,7 +95,7 @@ pub struct Emulator {
     ///
     /// Every live UP 0 stream subscribes, so a block announced here reaches
     /// each one without the emulator holding their send halves: a
-    /// `quinn::SendStream` is not clonable, and sharing one behind a lock would
+    /// a send half is not clonable, and sharing one behind a lock would
     /// mean holding that lock across a write. A subscriber also disappears on
     /// its own when its stream task ends.
     announce: broadcast::Sender<Vec<u8>>,
@@ -101,6 +108,8 @@ pub struct Emulator {
 /// log would have made every one of them longer again.
 #[derive(Clone)]
 pub struct EmuShared {
+    /// The carrier this run is on; see [`Emulator`].
+    pub transport: Arc<dyn Transport>,
     pub ref_chain: Arc<RefChain>,
     pub trace: Arc<Mutex<Trace>>,
     pub obs: Arc<Mutex<ObsLog>>,
@@ -196,6 +205,26 @@ impl Emulator {
         genesis_hash: [u8; 32],
         base_port: u16,
     ) -> Result<Self, EmuError> {
+        Self::n0_on(
+            Arc::new(QuicTransport),
+            emu_indices,
+            genesis_hash,
+            base_port,
+        )
+        .await
+    }
+
+    /// [`Emulator::n0`] on a chosen carrier.
+    ///
+    /// The QUIC one is what grades a real node. An in-process transport is
+    /// what a simulated node is graded on, where a run costs no sockets and no
+    /// handshakes.
+    pub async fn n0_on(
+        transport: Arc<dyn Transport>,
+        emu_indices: Vec<usize>,
+        genesis_hash: [u8; 32],
+        base_port: u16,
+    ) -> Result<Self, EmuError> {
         let config = EndpointConfig {
             genesis_hash,
             builder: false,
@@ -205,15 +234,16 @@ impl Emulator {
             for &i in &emu_indices {
                 let secret = SecretKeyset::trivial(i as u32).ed25519;
                 let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, base_port + i as u16));
-                let endpoint =
-                    Endpoint::serve(config.clone(), SigningKey::from(secret.to_bytes()), addr)
-                        .await?;
-                endpoints.push(Arc::new(endpoint));
+                let endpoint = transport
+                    .listen(config.clone(), SigningKey::from(secret.to_bytes()), addr)
+                    .await?;
+                endpoints.push(Arc::from(endpoint));
             }
             Ok::<_, EmuError>(endpoints)
         }
         .await?;
         Ok(Self {
+            transport,
             endpoints,
             emu_indices,
             genesis_hash,
@@ -261,6 +291,7 @@ impl Emulator {
     /// The state every connection handler shares, over `ref_chain`.
     pub fn shared(&self, ref_chain: Arc<RefChain>) -> EmuShared {
         EmuShared {
+            transport: Arc::clone(&self.transport),
             ref_chain,
             trace: Arc::clone(&self.trace),
             obs: Arc::clone(&self.obs),
@@ -377,13 +408,15 @@ pub async fn dial_nut(
         genesis_hash,
         builder: false,
     };
-    let connection = Endpoint::connect(
-        config,
-        SigningKey::from(secret.to_bytes()),
-        nut_san,
-        nut_addr,
-    )
-    .await?;
+    let connection = shared
+        .transport
+        .connect(
+            config,
+            SigningKey::from(secret.to_bytes()),
+            nut_san,
+            nut_addr,
+        )
+        .await?;
     let peer = index as u16;
     // A completed handshake proves the N0 cert + ALPN contract.
     record(&obs, peer, ObsKind::Other(n0::CERT_ED25519));
@@ -399,13 +432,13 @@ pub async fn dial_nut(
         .await
         .map_err(|e| EmuError::Protocol(e.to_string()))?;
     record(&obs, peer, ObsKind::OpenUp0);
-    let up0_stream_id = u64::from(send.id());
+    let up0_stream_id = send.id();
     let handshake = Handshake {
         final_block: advertised_final(&ref_chain.chain_blocks(), genesis_hash),
         leaves: vec![],
     };
     let wire = frame(UP, &handshake.encode());
-    trace_record(peer, UP, u64::from(send.id()), &wire, &trace, TraceDir::Rx);
+    trace_record(peer, UP, send.id(), &wire, &trace, TraceDir::Rx);
     let _ = send.write_all(&wire).await;
 
     // Announce the reference blocks (skip genesis) so the NUT has something to
@@ -413,7 +446,7 @@ pub async fn dial_nut(
     for block in ref_chain.chain_blocks().iter().skip(1) {
         record(&obs, peer, ObsKind::Up0Announce);
         let wire = announcement_wire(block, &ref_chain);
-        trace_record(peer, UP, u64::from(send.id()), &wire, &trace, TraceDir::Rx);
+        trace_record(peer, UP, send.id(), &wire, &trace, TraceDir::Rx);
         let _ = send.write_all(&wire).await;
     }
     // UP 0 is a persistent stream: keep the send half open for future
@@ -492,7 +525,7 @@ pub fn serve_ce129(_request: &StateRequest) -> StateResponse {
 /// Accept-loop for one emulated validator: record accepts and run the N0
 /// reactive handler on each connection.
 async fn endpoint_task(
-    endpoint: Arc<Endpoint>,
+    endpoint: Arc<dyn Listener>,
     peer_index: u16,
     genesis_hash: [u8; 32],
     shared: EmuShared,
@@ -500,10 +533,7 @@ async fn endpoint_task(
     let obs = Arc::clone(&shared.obs);
     while let Some(incoming) = endpoint.accept().await {
         record(&obs, peer_index, ObsKind::Accept);
-        let Ok(connecting) = incoming.accept() else {
-            continue;
-        };
-        let Ok(connection) = connecting.await else {
+        let Ok(connection) = incoming.established().await else {
             continue;
         };
         // A completed NUT-initiated handshake proves the N0 cert + ALPN
@@ -537,7 +567,7 @@ async fn endpoint_task(
 /// independent. Connections come up while the node is still importing the
 /// seeded chain; the plan is written once it can accept tickets. Reading the
 /// map at connect time found it empty and delivered nothing.
-fn start_ticket_delivery(connection: &quinn::Connection, peer: u16, shared: &EmuShared) {
+fn start_ticket_delivery(connection: &Conn, peer: u16, shared: &EmuShared) {
     let connection = connection.clone();
     let mut plans_set = shared.ticket_plans_set.clone();
     let shared = shared.clone();
@@ -579,7 +609,7 @@ const STREAM_REFUSED: u32 = 1;
 /// message is handled. Each accepted stream gets its own task instead, living
 /// exactly as long as the peer keeps the stream open.
 async fn handle_connection(
-    connection: quinn::Connection,
+    connection: Conn,
     peer_index: u16,
     genesis_hash: [u8; 32],
     shared: EmuShared,
@@ -610,16 +640,16 @@ async fn handle_connection(
 /// one request, one response, FIN. UP 0 is persistent: keep reading messages
 /// until the peer closes it, and never drop the halves first.
 async fn handle_stream(
-    connection: quinn::Connection,
-    mut send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    connection: Conn,
+    mut send: SendHalf,
+    recv: RecvHalf,
     peer_index: u16,
     genesis_hash: [u8; 32],
     shared: &EmuShared,
     mut announce: broadcast::Receiver<Vec<u8>>,
 ) {
     let (ref_chain, trace, obs) = (&*shared.ref_chain, &*shared.trace, &*shared.obs);
-    let stream_id = u64::from(send.id());
+    let stream_id = send.id();
     let mut reader = StreamReader::new(recv);
     let (kind, content) = match reader.next().await {
         Ok(Some(frame)) => frame,
@@ -707,10 +737,9 @@ async fn handle_stream(
 
 /// Reset both halves of a stream the emulator will not serve, leaving the
 /// connection up.
-fn refuse(send: &mut quinn::SendStream, reader: &mut StreamReader) {
-    let code = quinn::VarInt::from_u32(STREAM_REFUSED);
-    let _ = send.reset(code);
-    reader.stop(code);
+fn refuse(send: &mut SendHalf, reader: &mut StreamReader) {
+    send.reset(STREAM_REFUSED);
+    reader.stop(STREAM_REFUSED);
 }
 
 /// Forward every announcement the slot driver broadcasts onto one UP 0 send
@@ -721,7 +750,7 @@ fn refuse(send: &mut quinn::SendStream, reader: &mut StreamReader) {
 /// better than stalling the driver, and the node can still fetch any block it
 /// hears about later over CE 128.
 async fn pump_announcements(
-    mut send: quinn::SendStream,
+    mut send: SendHalf,
     mut rx: broadcast::Receiver<Vec<u8>>,
     peer_index: u16,
     stream_id: u64,
@@ -750,8 +779,8 @@ async fn pump_announcements(
 /// half carries no opening kind byte, since we wrote it when we opened the
 /// stream, and nothing is answered — our handshake went out with the open.
 async fn read_dialed_up0(
-    connection: quinn::Connection,
-    recv: quinn::RecvStream,
+    connection: Conn,
+    recv: RecvHalf,
     peer_index: u16,
     genesis_hash: [u8; 32],
     stream_id: u64,
@@ -799,8 +828,8 @@ async fn read_dialed_up0(
 /// out when the stream was opened, so the NUT's is an answer to it, and
 /// answering back would put a second handshake on the stream.
 async fn handle_up0(
-    connection: &quinn::Connection,
-    send: Option<&mut quinn::SendStream>,
+    connection: &Conn,
+    send: Option<&mut SendHalf>,
     peer_index: u16,
     genesis_hash: [u8; 32],
     stream_id: u64,
@@ -875,7 +904,7 @@ pub fn advertised_final(chain: &[Block], genesis_hash: [u8; 32]) -> Final {
 
 /// Respond to the NUT's UP 0 handshake with our own, recording `OpenUp0`.
 async fn respond_up0(
-    send: &mut quinn::SendStream,
+    send: &mut SendHalf,
     peer_index: u16,
     genesis_hash: [u8; 32],
     stream_id: u64,
@@ -896,7 +925,7 @@ async fn respond_up0(
 
 /// Serve a NUT CE 128 block request from the reference chain.
 async fn serve_block_request(
-    send: &mut quinn::SendStream,
+    send: &mut SendHalf,
     peer_index: u16,
     content: &[u8],
     stream_id: u64,
@@ -925,12 +954,12 @@ async fn serve_block_request(
     let wire = frame_message(&response.encode());
     trace_record(peer_index, CE128, stream_id, &wire, trace, TraceDir::Rx);
     let _ = send.write_all(&wire).await;
-    let _ = send.finish();
+    send.finish();
 }
 
 /// Serve a NUT CE 129 state request: empty response for P0.
 async fn serve_state_request(
-    send: &mut quinn::SendStream,
+    send: &mut SendHalf,
     peer_index: u16,
     content: &[u8],
     stream_id: u64,
@@ -969,7 +998,7 @@ async fn serve_state_request(
             return;
         }
     }
-    let _ = send.finish();
+    send.finish();
 }
 
 /// Incremental frame reader over one QUIC receive stream.
@@ -980,7 +1009,7 @@ async fn serve_state_request(
 /// everything that arrived alongside the first one. On a persistent stream that
 /// loses messages; on an ephemeral one it is invisible.
 pub(crate) struct StreamReader {
-    recv: quinn::RecvStream,
+    recv: RecvHalf,
     reader: FrameReader,
     buf: [u8; 4096],
 }
@@ -988,7 +1017,7 @@ pub(crate) struct StreamReader {
 impl StreamReader {
     /// Wrap a freshly accepted receive stream, whose first frame carries the
     /// stream-kind byte.
-    pub(crate) fn new(recv: quinn::RecvStream) -> Self {
+    pub(crate) fn new(recv: RecvHalf) -> Self {
         Self {
             recv,
             reader: FrameReader::new(),
@@ -998,7 +1027,7 @@ impl StreamReader {
 
     /// Wrap the receive half of a stream *we* opened, which carries no kind
     /// byte: we wrote it, so the peer's replies are bare messages under `kind`.
-    pub(crate) fn with_kind(recv: quinn::RecvStream, kind: u8) -> Self {
+    pub(crate) fn with_kind(recv: RecvHalf, kind: u8) -> Self {
         Self {
             recv,
             reader: FrameReader::with_kind(kind),
@@ -1034,8 +1063,8 @@ impl StreamReader {
     }
 
     /// Ask the peer to stop sending on this stream.
-    pub(crate) fn stop(&mut self, code: quinn::VarInt) {
-        let _ = self.recv.stop(code);
+    pub(crate) fn stop(&mut self, code: u32) {
+        self.recv.stop(code);
     }
 }
 
@@ -1106,6 +1135,74 @@ mod tests {
         assert!(
             ports.iter().all(|&p| p >= 40001),
             "ports must be >= base + 1"
+        );
+        Ok(())
+    }
+
+    /// The emulator on the in-process carrier: a stand-in node dials it,
+    /// opens UP 0, and is answered.
+    ///
+    /// `n0_on` is the injection point M2-B's self-test runs through, so it is
+    /// worth one test that the whole emulator -- accept loop, stream handler,
+    /// UP 0 responder -- works over a transport with no sockets under it, and
+    /// not just that the mock carries bytes.
+    #[tokio::test]
+    async fn runs_over_an_in_process_transport() -> Result<(), EmuError> {
+        use jamnp_s::transport::mock::MockNetwork;
+        use jamnp_s::transport::Transport;
+        use std::time::Duration;
+
+        const GENESIS: [u8; 32] = [0xaa; 32];
+        let net = MockNetwork::new();
+        let emu = Emulator::n0_on(Arc::new(net.clone()), vec![1], GENESIS, 40000).await?;
+        let addr = emu.local_addrs()[0];
+        let ref_chain = Arc::new(RefChain::tiny(0).map_err(chain_err)?);
+        let _accepting = emu.accept_loop(ref_chain);
+
+        let config = EndpointConfig {
+            genesis_hash: GENESIS,
+            builder: false,
+        };
+        let conn = net
+            .connect(
+                config,
+                SigningKey::from([9u8; 32]),
+                "peer".to_string(),
+                addr,
+            )
+            .await
+            .expect("the stand-in node reaches the emulated validator");
+        let (mut send, mut recv) = conn.open_bi().await.expect("UP 0 opens");
+        let handshake = Handshake {
+            final_block: Final {
+                header_hash: HeaderHash::from(GENESIS),
+                slot: 0,
+            },
+            leaves: vec![],
+        };
+        send.write_all(&frame(UP, &handshake.encode()))
+            .await
+            .expect("the handshake goes out");
+
+        // We opened the stream, so the reply is a bare message under UP.
+        let mut reader = FrameReader::with_kind(UP);
+        let mut buf = [0u8; 4096];
+        let answer = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(Some((_, content))) = reader.next_frame() {
+                    return content;
+                }
+                match recv.read(&mut buf).await {
+                    Ok(Some(n)) => reader.push(&buf[..n]),
+                    _ => return Vec::new(),
+                }
+            }
+        })
+        .await
+        .expect("the emulator answers in time");
+        assert!(
+            Handshake::decode(&mut &answer[..]).is_ok(),
+            "the emulator answers UP 0 with its own handshake"
         );
         Ok(())
     }

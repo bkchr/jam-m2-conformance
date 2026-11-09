@@ -6,8 +6,10 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use ed25519_consensus::SigningKey;
-use jamnp_s::endpoint::{Endpoint, EndpointConfig, EndpointError};
+use jamnp_s::clock;
+use jamnp_s::endpoint::{EndpointConfig, EndpointError};
 use jamnp_s::preferred::preferred_initiator;
+use jamnp_s::transport::{quic::QuicTransport, Conn, ReadError, Transport};
 use m2_scenario::dsl::{ObsKind, ObsLog};
 use m2_scenario::scenarios::n0;
 
@@ -43,7 +45,7 @@ pub async fn probe_nut(
     let secret = SigningKey::from([0u8; 32]); // throwaway emulator secret
     let result = tokio::time::timeout(
         timeout,
-        Endpoint::connect(
+        QuicTransport.connect(
             EndpointConfig {
                 genesis_hash,
                 builder: false,
@@ -139,7 +141,7 @@ pub async fn run_connectivity(
     for _ in &plan.initiate_now {
         outcomes.push(probe_nut(nut_addr, nut_san, genesis_hash, STARTUP_TIMEOUT).await);
     }
-    tokio::time::sleep(INITIATOR_GRACE).await;
+    clock::current().sleep(INITIATOR_GRACE).await;
     for _ in &plan.wait_then_connect {
         outcomes.push(probe_nut(nut_addr, nut_san, genesis_hash, STARTUP_TIMEOUT).await);
     }
@@ -187,7 +189,7 @@ pub async fn probe_builder_slots(
         seed[1] = i as u8;
         let connected = tokio::time::timeout(
             timeout,
-            Endpoint::connect(
+            QuicTransport.connect(
                 EndpointConfig {
                     genesis_hash,
                     builder: true,
@@ -223,7 +225,7 @@ pub async fn probe_builder_slots(
 /// node is free to reject the package's contents, and telling that apart from
 /// a refused stream kind needs the guaranteeing lane (N3), not this one. The
 /// detail says which was observed so a failure is diagnosable.
-async fn submit_ce133(connection: &quinn::Connection) -> (bool, Option<String>) {
+async fn submit_ce133(connection: &Conn) -> (bool, Option<String>) {
     let Ok((mut send, mut recv)) = connection.open_bi().await else {
         return (false, Some("the node refused a new stream".to_string()));
     };
@@ -236,7 +238,7 @@ async fn submit_ce133(connection: &quinn::Connection) -> (bool, Option<String>) 
             Some("the node reset the CE 133 stream on write".to_string()),
         );
     }
-    let _ = send.finish();
+    send.finish();
     let mut buf = [0u8; 1024];
     match recv.read(&mut buf).await {
         // Answered, or closed cleanly: the stream kind was accepted.
@@ -257,8 +259,8 @@ async fn submit_ce133(connection: &quinn::Connection) -> (bool, Option<String>) 
 /// close rather than a protocol-level refusal.
 const NO_ERROR_CODE: u64 = 0x100;
 
-fn is_clean_reset(e: &quinn::ReadError) -> bool {
-    matches!(e, quinn::ReadError::Reset(code) if code.into_inner() == NO_ERROR_CODE)
+fn is_clean_reset(e: &ReadError) -> bool {
+    matches!(e, ReadError::Reset(code) if *code == NO_ERROR_CODE)
 }
 
 /// Dial with an ALPN the node must not accept: the right version and suffix,
@@ -338,20 +340,21 @@ mod tests {
     async fn probe_nut_handshake_ok() {
         let secret = SigningKey::from([7u8; 32]);
         let san = san_for_key(&secret.verification_key());
-        let endpoint = Endpoint::serve(
-            EndpointConfig {
-                genesis_hash: GENESIS,
-                builder: false,
-            },
-            secret,
-            ([127, 0, 0, 1], 0).into(),
-        )
-        .await
-        .expect("endpoint serves");
+        let endpoint = QuicTransport
+            .listen(
+                EndpointConfig {
+                    genesis_hash: GENESIS,
+                    builder: false,
+                },
+                secret,
+                ([127, 0, 0, 1], 0).into(),
+            )
+            .await
+            .expect("endpoint serves");
         let addr = endpoint.local_addr();
         let server = tokio::spawn(async move {
             while let Some(conn) = endpoint.accept().await {
-                let _ = conn.await;
+                let _ = conn.established().await;
             }
         });
         let outcome = probe_nut(addr, &san, GENESIS, Duration::from_secs(2)).await;
@@ -364,20 +367,21 @@ mod tests {
     #[tokio::test]
     async fn probe_nut_bad_san() {
         let secret = SigningKey::from([7u8; 32]);
-        let endpoint = Endpoint::serve(
-            EndpointConfig {
-                genesis_hash: GENESIS,
-                builder: false,
-            },
-            secret,
-            ([127, 0, 0, 1], 0).into(),
-        )
-        .await
-        .expect("endpoint serves");
+        let endpoint = QuicTransport
+            .listen(
+                EndpointConfig {
+                    genesis_hash: GENESIS,
+                    builder: false,
+                },
+                secret,
+                ([127, 0, 0, 1], 0).into(),
+            )
+            .await
+            .expect("endpoint serves");
         let addr = endpoint.local_addr();
         let server = tokio::spawn(async move {
             while let Some(conn) = endpoint.accept().await {
-                let _ = conn.await;
+                let _ = conn.established().await;
             }
         });
         let wrong = SigningKey::from([9u8; 32]);

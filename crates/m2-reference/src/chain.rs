@@ -29,12 +29,18 @@ pub enum ChainError {
 }
 
 /// Current wall-clock slot (`(now - JAM_COMMON_ERA) / 6`).
+///
+/// "Now" is the installed clock's, not the machine's: the slot a run is in has
+/// to be the same number the trace's timestamps say, or the lanes would grade
+/// frames against a calendar nothing else is keeping.
 pub fn wall_clock_slot() -> u32 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = jamnp_s::clock::current().wall_ms() / 1000;
     (now.saturating_sub(jam_types::JAM_COMMON_ERA) / SLOT_PERIOD_SEC) as u32
+}
+
+/// The millisecond `slot` begins, on the same calendar as [`wall_clock_slot`].
+pub fn slot_start_ms(slot: u32) -> u64 {
+    (jam_types::JAM_COMMON_ERA + u64::from(slot) * SLOT_PERIOD_SEC) * 1000
 }
 
 /// First slot of the current epoch.
@@ -115,22 +121,48 @@ impl RefChain {
         nut_index: usize,
         chain_spec: jam_node::ChainSpec,
     ) -> Result<Self, ChainError> {
+        Self::with_keysets(chain_spec, |i| i != nut_index, nut_index)
+    }
+
+    /// A chain holding **only** validator `index`'s keys: what a node holds,
+    /// rather than what the harness holds.
+    ///
+    /// The difference is not cosmetic. An authoring harness runs the Safrole
+    /// lottery for every key in its keystore and puts the results in the
+    /// blocks it authors, so a chain built the other way round -- every key
+    /// but one -- authors blocks carrying five validators' tickets. A node
+    /// simulated on such a chain looks, to the lane grading it, like one
+    /// inventing tickets nobody sent it.
+    pub fn tiny_for(index: usize) -> Result<Self, ChainError> {
+        jam_types::ProtocolParameters::tiny().apply().map_err(|e| {
+            ChainError::Chain(format!("failed to apply tiny protocol parameters: {e}"))
+        })?;
+        Self::with_keysets(jam_node::hazmat::default_dev_spec(), |i| i == index, index)
+    }
+
+    /// Build the chain, taking the real keyset for every index `holds`
+    /// accepts and [`NON_VALIDATOR_KEYSET`] for the rest.
+    fn with_keysets(
+        chain_spec: jam_node::ChainSpec,
+        holds: impl Fn(usize) -> bool,
+        named_index: usize,
+    ) -> Result<Self, ChainError> {
         jam_types::ProtocolParameters::tiny().apply().map_err(|e| {
             ChainError::Chain(format!("failed to apply tiny protocol parameters: {e}"))
         })?;
         let validator_count = jam_types::max_val_count() as usize;
-        if nut_index >= validator_count {
+        if named_index >= validator_count {
             return Err(ChainError::Chain(format!(
-                "NUT index {nut_index} is outside the {validator_count}-validator set"
+                "validator index {named_index} is outside the {validator_count}-validator set"
             )));
         }
         let genesis_hash = chain_spec.genesis_header.hash();
         let genesis_slot = chain_spec.genesis_header.slot;
         let validators = SecretKeysets(FixedVec::from_fn(|i| {
-            if i == nut_index {
-                SecretKeyset::trivial(NON_VALIDATOR_KEYSET)
-            } else {
+            if holds(i) {
                 SecretKeyset::trivial(i as u32)
+            } else {
+                SecretKeyset::trivial(NON_VALIDATOR_KEYSET)
             }
         }));
         let harness = jam_node::hazmat::AuthoringHarness::new(

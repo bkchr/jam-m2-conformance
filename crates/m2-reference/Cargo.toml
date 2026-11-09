@@ -8,5 +8,6 @@ description = "Reference oracle over polkajam's hazmat engine: chain state, auth
 [dependencies]
 jam-node = { workspace = true }
 jam-std-common = { workspace = true }
+jamnp-s = { path = "../../crates/jamnp-s" }
 jam-types = { workspace = true }
 thiserror = { workspace = true }
