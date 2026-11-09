@@ -2014,6 +2014,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "m2-sim"
+version = "0.1.0"
+dependencies = [
+ "ed25519-consensus",
+ "jam-std-common",
+ "jam-types",
+ "jamnp-s",
+ "m2-emu",
+ "m2-reference",
+ "m2-runner",
+ "m2-scenario",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "macro_rules_attribute"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

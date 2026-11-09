@@ -6,6 +6,7 @@ members = [
     "crates/m2-emu",
     "crates/m2-scenario",
     "crates/m2-runner",
+    "crates/m2-sim",
 ]
 
 [workspace.package]

@@ -1,0 +1,22 @@
+[package]
+name = "m2-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A simulated node under test: an in-process stand-in the harness can grade, honest or deliberately broken"
+
+[dependencies]
+jam-types = { workspace = true }
+jam-std-common = { workspace = true }
+jamnp-s = { path = "../../crates/jamnp-s" }
+m2-reference = { path = "../../crates/m2-reference" }
+m2-emu = { path = "../../crates/m2-emu" }
+ed25519-consensus = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+m2-scenario = { path = "../../crates/m2-scenario" }
+# The self-test grades through the runner's own context assembly rather than a
+# copy of it; see `build_n1_ctx`.
+m2-runner = { path = "../../crates/m2-runner" }
