@@ -4,7 +4,7 @@
 use jam_node::hazmat::KeystoreSigner;
 use jam_std_common::{
     bandersnatch::{self, ring_vrf},
-    Entropy,
+    Entropy, TicketEnvelope,
 };
 
 use crate::chain::{ChainError, RefChain};
@@ -134,29 +134,68 @@ impl RefChain {
     /// Generate tickets for every keystore-backed author (the emulated set,
     /// excluding the NUT), one per attempt up to `tickets_per_validator(max_val_count())`.
     pub fn generate_tickets(&self, ctx: &TicketCtx) -> Result<Vec<EmulatedTicket>, ChainError> {
+        let count = ctx.pks.len();
+        let mut tickets = Vec::new();
+        for author in 0..count {
+            tickets.extend(self.generate_tickets_for(ctx, author)?);
+        }
+        Ok(tickets)
+    }
+
+    /// Offer tickets to the authoring pool, so a block this chain goes on to
+    /// author carries them.
+    ///
+    /// A narrow passthrough rather than public access to the harness: the
+    /// engine behind it can author, import and mutate state, and the chain's
+    /// invariants -- the lock held only for short synchronous sections, the
+    /// NUT's slots never claimed -- are not things a caller should be able to
+    /// step around.
+    ///
+    /// **The pool files by epoch, taken from the chain's next slot**
+    /// (`next_slot / epoch_period + 1`), so a ticket offered outside the
+    /// epoch it is submittable in is filed under one no block will ask for.
+    /// The pool also rejects duplicates and keeps only the lowest ids, which
+    /// is why an unsorted or repeated extrinsic cannot be produced this way.
+    pub fn submit_tickets(&self, candidates: &[TicketEnvelope]) {
+        self.harness().submit_tickets(candidates);
+    }
+
+    /// Generate one author's tickets, or none if the keystore does not hold
+    /// that validator's bandersnatch key.
+    ///
+    /// Separate from [`RefChain::generate_tickets`] because ring-VRF proving
+    /// is the harness's one hot path and a caller that wants one validator's
+    /// tickets -- a simulated node runs its own lottery, not everybody's --
+    /// would otherwise pay for the whole set and discard it.
+    pub fn generate_tickets_for(
+        &self,
+        ctx: &TicketCtx,
+        author: usize,
+    ) -> Result<Vec<EmulatedTicket>, ChainError> {
         let pks: Vec<bandersnatch::Public> =
             ctx.pks.iter().map(|p| bandersnatch::Public(*p)).collect();
+        let Some(pk) = pks.get(author).copied() else {
+            return Ok(Vec::new());
+        };
         let keystore = self.harness().keystore();
+        if !keystore.has_bandersnatch(&pk) {
+            return Ok(Vec::new());
+        }
+        let prover = ring_vrf::RingContext::prover(&pks, author);
         let mut tickets = Vec::new();
-        for (author, pk) in pks.iter().enumerate() {
-            if !keystore.has_bandersnatch(pk) {
-                continue;
-            }
-            let prover = ring_vrf::RingContext::prover(&pks, author);
-            for attempt in 0..jam_types::tickets_per_validator(jam_types::max_val_count()) {
-                let message = bandersnatch::Message::TicketSeal(Entropy(ctx.entropy), attempt);
-                let signature = keystore
-                    .bandersnatch_ring_sign(pk, &message, &[], &prover)
-                    .map_err(|e| ChainError::Tickets(format!("ring sign author {author}: {e}")))?;
-                let id = signature.vrf_output().0;
-                tickets.push(EmulatedTicket {
-                    id,
-                    author,
-                    attempt,
-                    proof: signature.0,
-                    proxy: proxy_index(&id, pks.len()),
-                });
-            }
+        for attempt in 0..jam_types::tickets_per_validator(jam_types::max_val_count()) {
+            let message = bandersnatch::Message::TicketSeal(Entropy(ctx.entropy), attempt);
+            let signature = keystore
+                .bandersnatch_ring_sign(&pk, &message, &[], &prover)
+                .map_err(|e| ChainError::Tickets(format!("ring sign author {author}: {e}")))?;
+            let id = signature.vrf_output().0;
+            tickets.push(EmulatedTicket {
+                id,
+                author,
+                attempt,
+                proof: signature.0,
+                proxy: proxy_index(&id, pks.len()),
+            });
         }
         Ok(tickets)
     }
