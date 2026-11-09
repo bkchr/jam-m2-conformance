@@ -194,8 +194,18 @@ fn ticket_contexts(data: &RealRunData) -> TicketContexts {
 }
 
 /// The ticket contexts a run can verify proofs against, keyed by target epoch.
-pub(crate) struct TicketContexts {
+pub struct TicketContexts {
     by_epoch: Vec<(u32, TicketCtx)>,
+}
+
+impl TicketContexts {
+    /// The contexts a self-test holds, newest-wins per epoch.
+    ///
+    /// Public for the same reason [`build_n1_ctx`] is: a simulated node is
+    /// graded through the harness's own trace-to-facts path, not a copy of it.
+    pub fn from_epochs(by_epoch: Vec<(u32, TicketCtx)>) -> Self {
+        Self { by_epoch }
+    }
 }
 
 impl TicketContexts {
@@ -218,7 +228,13 @@ impl TicketContexts {
 ///
 /// The chain is read before the imports run, so the reference best block is
 /// the one the run actually ended on and not one re-imported here.
-fn build_n1_ctx(
+/// Public so the self-test can grade a simulated node through the *same*
+/// assembly a live run uses.
+///
+/// A copy of this in a test would prove the N1 predicates again and say
+/// nothing about the step that has actually gone wrong twice: turning what
+/// came off the wire into the facts a lane reads.
+pub fn build_n1_ctx(
     ref_chain: &RefChain,
     nut_blocks: &[NutBlock],
     deliveries: &[DeliveredTicket],
@@ -329,7 +345,12 @@ fn build_n2_ctx(
 /// to accept, and a connection can die mid-run. The lane needs the difference,
 /// because a rule about a ticket the NUT never received was not exercised
 /// rather than broken.
-fn plan_emu_tickets(
+/// The emulator's own plan as the lanes read it, delivery facts folded in.
+///
+/// Public for the self-test, like [`build_n1_ctx`]: what the harness believes
+/// it delivered is half of every proxy-duty and inclusion verdict, and a copy
+/// of this in a test would grade the copy.
+pub fn plan_emu_tickets(
     plan: &[ScheduledTicket],
     ticket_ctx: &TicketCtx,
     deliveries: &[DeliveredTicket],
@@ -373,7 +394,13 @@ fn plan_emu_tickets(
 
 /// Every ticket the NUT distributed to the emulators (CE 131/132 frames the
 /// NUT sent), verified against the reference ticket context.
-fn collect_nut_tickets(trace: &Trace, contexts: &TicketContexts) -> Vec<NutTicketFacts> {
+/// Every CE 131/132 frame the node put on the wire, as the N2 lane's facts.
+///
+/// Public so a self-test can grade a simulated node through this step. It is
+/// the one that has gone wrong before: the CE 131 decoder defect closed on
+/// 2026-10-30 made the node's whole ticket output invisible, and every lane
+/// above it read an empty list as a node that had sent nothing.
+pub fn collect_nut_tickets(trace: &Trace, contexts: &TicketContexts) -> Vec<NutTicketFacts> {
     trace
         .records()
         .iter()
