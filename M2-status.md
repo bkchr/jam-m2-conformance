@@ -44,7 +44,7 @@ has no `finality lagging` at all.
 | Milestone | Lanes | Coverage | Status |
 |---|---|---|---|
 | **M2-A** — Foundations live | N0, N1 | 6 / 41 | ✅ **complete** — §1 |
-| **M2-B** — Self-tested | N2 | 8 / 41 | ⚠️ **partial** — the N2 lane is complete; the bar's second half is not. See below |
+| **M2-B** — Self-tested | N2 | 8 / 41 | ⚠️ **partial** — the N2 lane is complete; the self-test mechanism exists and has proven 19 of the 75 check rows, across N0, N1 and N2. See below |
 | **M2-C** — Guaranteeing | N3 | 21 / 41 | ⏳ not started |
 | **M2-D** — Availability | N4 | 30 / 41 | ⏳ not started |
 | **M2-E** — Audit & preimages | N5, N6 | 41 / 41 | ⏳ not started |
@@ -59,15 +59,27 @@ milestone: *before it, the harness reports; after it, the harness can be trusted
 implemented, the Faults column included: seven checks, graded live, with a catalogue of seven
 deliberately-broken ticket shapes injected into each run as the ticket budget allows, and every
 negative verdict gated on a control so that it cannot pass on a run in which the node did
-nothing. `N2-design.md` is the row-by-row account, including the three rows that assert
-deliberately less than the DESIGN wording reads like and the three items left out on purpose.
+nothing. Three rows deliberately assert less than the DESIGN wording reads like: the proxy
+rule's set membership is unobservable with this topology, a hard bound at the forward
+window's nominal upper edge would fail a conforming node under tiny, and "no forward" is not
+assertable for a fault delivered over CE 132. DESIGN §10 and §11 N2 record each one.
 
-*Proven by deliberately faulty simulated clients* does not. The faults are injected into the
-ticket stream of an otherwise honest emulator; there are no faulty **clients**, and no transport
-abstraction or virtual clock to build them on (§4). The distinction is not pedantic: two of the
-four hard failures ever observed were harness defects of exactly the kind simulated clients
-exist to catch (§3), and injected tickets would not have caught either, because both were in how
-the harness itself spoke to the node.
+*Proven by deliberately faulty simulated clients* is now **under way rather than absent**. The
+machinery exists — an in-process transport, a virtual clock and `m2-sim`, a node-shaped
+stand-in that can be broken in one named way at a time — and the first five check rows have
+been proven: each is shown to pass against an honest simulated node and to *fail, present in
+the report*, against one that gets exactly that thing wrong (`crates/m2-sim/tests/n0_sim_it.rs`,
+which grades six nodes in 0.07 s). That is 19 of the 75 rows across N0, N1 and N2 — five in N0,
+one in N1 on a block the simulated node authored itself, and thirteen in N2, on tickets it won
+in a real lottery, on tickets the harness delivered to it, and on what it then put in its own
+blocks. §4.2 lists the other 56 and what each one needs.
+
+The distinction this closes is not pedantic. Two of the four hard failures ever observed were
+harness defects of exactly the kind a faulty client catches, and N2's injected ticket faults
+would not have caught either, because both were in how the harness itself spoke to the node.
+What remains is coverage — the other 70 rows, and the N1 and N2 behaviour a simulated node
+would need before it can be graded on them — plus the fact that nothing drives a simulated run
+from the CLI yet: the proofs live in the test suite, which is where they run on every commit.
 
 This document records what each milestone required, the evidence that it holds, what is not
 covered, and how to point the suite at a third-party node.
@@ -156,9 +168,9 @@ Result: the node accepts every ticket the emulator offers. `invalid ticket signa
 
 | | |
 |---|---|
-| Crates | 5 (`jamnp-s`, `m2-reference`, `m2-emu`, `m2-scenario`, `m2-runner`) |
-| Rust | ~20.9k lines, 387 test functions |
-| `cargo test --workspace` | **404 passed / 0 failed** |
+| Crates | 6 (`jamnp-s`, `m2-reference`, `m2-emu`, `m2-scenario`, `m2-runner`, `m2-sim`) |
+| Rust | ~24.2k lines, 429 test functions |
+| `cargo test --workspace` | **428 passed / 0 failed**, 1 ignored |
 | `cargo fmt --all --check` | clean |
 | `cargo clippy --workspace --all-targets` | 3 warnings, all pre-existing |
 | Dry-run baseline | exits 0 — the harness's own expectations are satisfiable |
@@ -207,6 +219,47 @@ it detected the forgery and refused it — but did not reset the stream it arriv
 `n2_forward_stops_at_finality` reports itself unexercised: the node sends each ticket to each
 peer exactly once, so it never had a forward to stop, which is the expected verdict against
 this node rather than a gap to close (DESIGN §11 N2, "The stopping rule").
+
+**Five runs, 2026-11-09: what is stable and what is not.** The transport and clock work was
+verified by running the same 300 s command on the branch and on unmodified `main`, alternating,
+on one machine. The findings are not identical run to run, which is itself the most useful
+thing the exercise produced.
+
+| session | code | checks | findings |
+|---|---|---|---|
+| `control-1` | `main` | 256 | ce129, `n2_gen_proof_verified` ×4, finality-control, unknown-epoch |
+| `control-2` | `main` | 244 | the same five |
+| `transport-1` | branch, transport | 233 | the same five |
+| `clock-2` | branch, transport + clock | 267 | the same five, **plus** `n1_timing_within_slot` |
+| `clock-1` | branch, transport + clock | 273 | ce129, unknown-epoch, **`n2_proxy_duty_forwarded`**, bad-proof, repeat-control |
+
+**Stable in all five**, on both codebases: the two known node defects, and four
+`n2_gen_proof_verified` failures in four of the five -- every ticket the node generated for the
+run's *final* epoch, with the fifteen-odd before them passing. The four proofs are
+byte-identical across runs, so the node is deterministic here and the harness reaches the same
+verdict every time. These had never appeared before 2026-11-09, including in `unitB-9`, which
+saw 13 CE 131 tickets where these runs see 19. The likeliest reading is that a run reaching one
+epoch further than earlier ones asks the reference chain to verify a ring it has not caught up
+to -- a harness gap of the kind §3 already has two of, the harness failing the node for
+something it cannot yet check. `ticket.verified` is `Some(false)` rather than `None`, so the
+lane believed it held the context; if the context is in fact absent, the honest row is the soft
+`n2_gen_proof_unjudged` it already has. **Hypothesis, not diagnosis, and open.**
+
+**Intermittent**, each seen in exactly one run of five: `n2_proxy_duty_forwarded` (a ticket
+delivered on the wire and in time, forwarded to no peer at all, one slot before an injected
+bad-proof ticket the node also failed to reset the stream on) and `n1_timing_within_slot` (a
+block announced 8.7 s into a 6 s slot, on a machine that was building and grading at the same
+time). Neither reproduced on a second run of the same code, and neither is attributable to the
+transport or clock work: the branch produced the stable set in two runs of three, and `main`
+produced it in both of its own.
+
+**What this says about the harness.** Five runs of one command against one node produced four
+different finding sets. Check counts were already documented as varying; *findings* varying is
+a stronger statement, and it means **a single live run is not a verdict** -- not of a node, and
+not of a change to the harness. Attribution here needs alternating runs on both codebases, and
+even then an intermittent row cannot be pinned by one appearance. This is the gap M2-B exists
+to close: a simulated node on a virtual clock is reproducible by construction, and would turn
+each of these rows into something that either always happens or never does.
 
 #### 3.1 The delivery fixes, 2026-10-29
 
@@ -438,20 +491,309 @@ coverage beyond its own 6 / 41.
 - **Messages asserted: 8 of 41.** UP 0, CE 128, CE 129, CE 131, CE 132. Lanes N3–N7
   (guaranteeing, availability, auditing/disputes, preimages, adversarial) are designed in
   DESIGN §11 and not implemented.
-- **The transport abstraction has not been started**, and M2-B depends on it. The criterion is
-  *transport and clock injectable, QUIC behaviour unchanged* — a trait boundary with a real
-  QUIC implementation and an in-process mock behind it, plus a virtual clock, which is what
-  makes simulated faulty clients and sub-second deterministic runs possible. Today the workspace defines **zero traits**, `quinn`
-  appears at **33 sites above `jamnp-s`** (all in `m2-emu`), and there are **18 direct
-  `sleep`/`SystemTime::now`/`Instant::now` sites** above `jamnp-s`. The plan's estimate of
-  earlier estimate of "only 10 call sites" understates the work by roughly 3×; re-estimate
-  before scheduling it.
+- **Self-testing works, on 19 of the 75 check rows.** M2-B's criterion is *transport and clock
+  injectable, QUIC behaviour unchanged*, and all three pieces are built: `jamnp_s::transport`
+  with a QUIC carrier and an in-process mock, `jamnp_s::clock` with the machine's clock and a
+  virtual one, and `m2-sim`, a node-shaped stand-in that can be broken one named way at a time
+  (DESIGN §3). **No crate above `jamnp-s` depends on `quinn`**, so that half is enforced by the
+  build. The stand-in authors blocks and runs the Safrole lottery, so N1 and N2's generation
+  side can grade it, and it takes delivery of tickets, refuses what it cannot act on and
+  forwards what it is proxy for, and includes what it received in the blocks it authors. What
+  is missing is coverage: 56 rows have still never been shown to be capable of failing. §4.1 has
+  the shape of the work and §4.2 lists the rows.
 - **Negative testing exists in N2 only.** N2 injects its whole Faults column — bad proof, wrong
   proxy, wrong epoch, late, duplicate, plus an over-cap attempt DESIGN does not list — and gates
   every negative verdict on a control. Nothing equivalent exists for the other lanes, because the
   other lanes do not exist. And the faults are injected into an honest emulator's ticket stream,
   which is not the same thing as a faulty client (see M2-B above).
 - **One real node has been graded.** The suite has only ever run against polkajam.
+
+### 4.1 Re-estimating the transport and clock work
+
+*Measured 2026-11-09, on `main` at `b6a9f79`.* The delivery plan put this at "only 10 call
+sites". That number was an undercount, but the more useful correction is that it measures
+the wrong thing: the call sites are the refactor, and the refactor is not the deliverable.
+
+**The refactor is bounded, and smaller than it looks.** `quinn` appears at **33 sites above
+`jamnp-s`** — 30 in `m2-emu` (20 of them in `emu.rs`, 6 in `sync_probe.rs`, 2 each in
+`ticket_io.rs` and `nut_block.rs`) and 3 in `m2-runner/src/connectivity.rs` — not all in
+`m2-emu`, as earlier revisions of this section said. The surface those sites use is narrow:
+`Connection`, `SendStream`, `RecvStream`, and six methods — `open_bi`, `accept_bi`,
+`write_all`, `finish`, `stop`/`reset` — plus five raw read loops. Framing is already
+byte-level and transport-agnostic (`FrameReader` takes `&[u8]`), so none of the codec layer
+moves. One semantic has to survive the abstraction and is easy to lose in one: **a stream
+reset must stay distinguishable from any other read error**, because `quinn::ReadError::Reset`
+is how the harness sees a node refuse a ticket, and two N2 checks are built on it.
+
+**The clock is smaller still, and buys less than it appears to.** There are **22 direct
+`sleep`/`SystemTime::now`/`Instant::now` sites** above `jamnp-s` (17 in `m2-runner`, 3 in
+`m2-emu`, 2 in `m2-reference`), up from 18 before the N2 work — the coupling grows with each
+lane. Only about eight are protocol timing that a virtual clock must own: the wall-clock to
+slot mapping in `m2-reference/src/chain.rs`, the genesis alignment in `run.rs`, the sender's
+slot-target sleep in `ticket_io.rs`, the initiator grace, the probe delay and the observe
+window. The rest are process orchestration — waiting for a node process to come up, naming a
+session directory — and stay on the real clock. Note also that against a **real** node the
+virtual clock cannot make a run faster: the node's slots take six real seconds whatever the
+harness believes. Sub-second deterministic runs are a property of runs where the node under
+test is itself simulated, which is exactly the self-test case M2-B is about.
+
+**What the call-site count misses.** M2-B's bar is *checks proven by deliberately faulty
+simulated clients*, and a simulated client here is a **node in the NUT slot** — it has to
+connect, answer CE 128/129, author blocks, run the ticket lottery and respond to CE 131/132,
+or the lanes have nothing to grade. That is new code of roughly lane scale, reusing
+`m2-reference` and much of what `m2-emu` already does, plus one deliberately-broken variant
+for each harness defect class the suite wants to prove it catches. None of it is in the 33
+or the 22.
+
+So: the refactor is the small half and is well-defined; the simulated node is the large half
+and has not been scoped at all. Scope that before scheduling either.
+
+**Built since, 2026-11-09.** The refactor half is done, and the estimate above held. The
+boundary is `jamnp_s::transport`: `Transport`, `Listener`, `Incoming`, `Connection`,
+`SendStream` and `RecvStream`, with `transport::quic` over `quinn` and `transport::mock`
+between tasks in one process. All 33 call sites moved; `quinn` is gone from `m2-emu`'s and
+`m2-runner`'s manifests, so the count above is now **zero above `jamnp-s`** and cannot drift
+back without someone adding the dependency again. The two properties §4.1 flagged as easy to
+lose are asserted against *both* carriers by one set of tests
+(`crates/jamnp-s/tests/transport_it.rs`): a reset arrives as a reset carrying its code, and
+streams are independently numbered. `quinn` is still the only thing that authenticates — the
+mock has no TLS, certificate or ALPN — so the N0 rules about those remain gradable only over
+QUIC, which is recorded in DESIGN §3 rather than left for a reader to discover.
+
+*QUIC behaviour unchanged*, the other half of the criterion, is verified against a live node
+rather than asserted: `sessions/transport-1` (the ported harness) and `sessions/control-1`
+(unmodified `main`, same machine, same command) report the **same seven findings and the same
+set of exercised checks**. §3's five-run table has the fuller picture, including what varies
+between runs of identical code.
+
+**The clock, 2026-11-09.** `jamnp_s::clock` followed, and the count held too: eleven waits
+moved onto it — the slot boundary, the epoch wait, the ticket sender's delivery target and its
+readiness poll, the node-acceptance budget, the initiator grace in two places, the CE 129 probe
+delay, the observation window, and the two slot-clock readings in `m2-reference` — against the
+"about eight" estimated. The rest stayed on the machine's clock on purpose: waiting for a node
+process to come up or a port to answer is not protocol time, and virtualising it would mean a
+run that believes a program started when it has not.
+
+`trace::mono_ts` and `trace::wall_ts` read the installed clock, which is the part that makes it
+coherent rather than merely injectable: the lanes compute slots from trace timestamps, so a run
+whose waits were virtual and whose timestamps were real would grade frames against a calendar
+nothing was keeping. `crates/jamnp-s/tests/clock_it.rs` holds exactly that property — an epoch
+of protocol waiting advances the trace's clock by 72 seconds and costs no real time.
+
+The speed is latent, not yet banked: a virtual clock is only virtual on a runtime started
+paused, and nothing starts one yet because there is no simulated node to run there. Against a
+real node the clock is and must remain the machine's.
+
+**The simulated node, 2026-11-09.** `m2-sim` is the third piece, and the scoping question in
+this section is now answered by a working example rather than an estimate. A node-shaped
+stand-in that an N0 lane can grade is about 250 lines: accept a connection, answer UP 0 with a
+handshake, re-announce what it is told about, serve CE 128 and CE 129 — reusing the reference
+chain the harness already holds and `m2-emu`'s own `serve_ce128`/`serve_ce129`, since the point
+is to exercise the checks, not to write a second node.
+
+`SimFault` is the part that earns the milestone: one named deviation at a time, each the
+smallest change that should cost exactly one row. Five are built — silent on UP 0, a finalized
+head that is not genesis, never re-announcing, a descending CE 128 walk, and no CE 128 answer
+at all — and each is asserted to make its row **fail and appear**, not merely stop passing. A
+row the grading never produced caught nothing; treating its absence as proof would repeat the
+defect the lanes' own controls were added to prevent. The test's own negative control was run
+by hand: pointing a row at the honest node makes it fail with `must make
+nut_reannounces_learned_block fail; it reported Some(Pass)`.
+
+What is left of M2-B is coverage, not mechanism: 56 rows unproven, listed in §4.2.
+
+### 4.2 What each check row's evidence is, and the 56 without a faulty client
+
+*Counted 2026-11-09 from `m2-scenario/src/scenarios/{n0,n1,n2}.rs`, excluding test code.* The
+lanes report **75 rows**. "Unproven" below means *unproven end to end by a faulty client*,
+which is M2-B's bar — not untested. There are three grades of evidence that a row can fail,
+and they are not interchangeable:
+
+| evidence | rows | what it establishes |
+|---|---|---|
+| a lane unit test asserts the row failing | 56 | the **predicate** is right, against a fabricated context |
+| the row has failed in a live run | 11 | the predicate *and* the pipeline that fed it, for one shape of failure |
+| a faulty simulated client makes it fail | 19 | predicate and pipeline, for a failure chosen on purpose |
+
+The difference between the first grade and the others is the whole point of M2-B. A unit test
+hands the check a context built by hand; it cannot catch a context *builder* that never
+produces the faulty shape, and both harness defects of §3 lived exactly there — in how the
+harness spoke to the node and what it recorded, not in any predicate.
+
+**Proven by a faulty client (15).** N0: `up0_kind_byte_0`, `up0_final_is_genesis`,
+`nut_reannounces_learned_block`, `ce128_ascending_covers_reference`, `ce128_ascending_ordered`.
+N1: `n1_timing_within_slot`. N2: `n2_gen_ce131_observed`, `n2_gen_epoch_target`,
+`n2_gen_attempt_in_range`, `n2_gen_proof_verified`, `n2_gen_not_before_epoch_start`,
+`n2_gen_proxy_matches_rule`, `n2_gen_one_proxy_per_ticket`, `n2_self_proxy_ce132_all_peers`,
+`n2_self_proxy_proof_verified`, `n2_proxy_duty_forwarded`,
+`n2_proxy_duty_bad_proof_ignored`, `n2_unknown_epoch_reset_observed`,
+`n2_inclusion_covers_valid`.
+
+Two things reading the N2 checks closely settled, both of which shape what is left:
+
+- **A bad proof is isolable, but only by corrupting the right bytes.** A ticket's id *is* the
+  first 32 bytes of its ring signature, and the id decides the designated proxy, so breaking
+  the proof there moves the ticket to another proxy and fails the routing rows too. Flipping a
+  byte past the first 32 breaks verification and leaves id, attempt and proxy exactly where they
+  were, which is what makes `n2_gen_proof_verified` and `n2_self_proxy_proof_verified` provable
+  on their own. The test asserts the routing rows stay passing, so the isolation is held rather
+  than assumed.
+- **Two pairs of rows cannot be separated at all.** `n2_gen_one_proxy_per_ticket` and
+  `n2_gen_proxy_matches_rule` both require `peers.len() == 1`, so a ticket sent to two
+  validators fails both; the test asserts that explicitly rather than pretending otherwise. And
+  `n2_gen_within_attempts_per_epoch` counts *distinct* tickets, so exceeding the cap means a
+  fifth validly-signed ticket at attempt 4 — which fails `n2_gen_attempt_in_range` in the same
+  breath. Nothing a node can do breaks one without the other.
+
+The N1 one is the first row proven on a block the simulated node *authored*
+(`crates/m2-sim/tests/n1_sim_it.rs`). The node keeps its own reference chain -- one that holds
+its key rather than treating it as the absent validator -- imports what the emulated validators
+produce, and authors its own slot on top; the harness then learns of the block the only way it
+can, an announcement over UP 0 followed by a fetch by hash over CE 128. The facts are assembled
+by `m2_runner::real::build_n1_ctx`, the function a live run uses, which is the point: the lane's
+unit tests already prove the predicates, and the step that has twice gone wrong here is the one
+in between.
+
+`SimFault::AnnouncesLate` holds the block byte-for-byte and announces it two slots late, so the
+timing row fails while the parent, seal and state-root rows are asserted to stay passing. That
+discipline is what the N1 faults will keep running into: most deviations worth testing -- a
+forged parent, a stale state root -- break the seal as well, so several rows fail at once and
+the verdict stops saying which check caught what. Faults that leave the block intact are the
+ones that isolate a row, and there are not many of them.
+
+**No evidence of any kind (14).** These have never been seen to fail, in a test or in a run:
+`tls_cert_ed25519_sig_alg`, `tls_cert_key_matches_onchain`, `alpn_offered_when_initiating`,
+`endpoint_dialed_exact_addr`, `emulated_author_announces`, `ce128_respects_max`,
+`ce128_both_halves_fin`, `ce129_served`, `ce129_len_prefixed_values`, `no_nut_blocks_observed`,
+`n2_gen_ce131_observed`, `n2_self_proxy_none`, `n2_self_proxy_proof_verified`,
+`n2_self_proxy_proof_unjudged`.
+
+One of those cannot fail at all: `n2_self_proxy_none` is `log::check("n2_self_proxy_none",
+true, Severity::Hard)` — a literal `true`. It marks "this run self-proxied nothing", which is
+ordinary, but it reports as a **hard pass**, which claims a guarantee the harness never made.
+By the standard the N0 audit set, that is not a check; it should be soft and named for what it
+is. Open.
+
+*Caveat on the 56:* counted by a row name appearing within 300 characters of a failure
+assertion in the same test module, so it is an upper bound — a test asserting one row may
+mention another nearby. The N2 figure was cross-checked by a second, stricter method and
+agreed.
+
+**N0 — 22 unproven of 27.**
+
+| check | rows | what proving them needs |
+|---|---|---|
+| `tls_cert` | `tls_cert_ed25519_sig_alg`, `tls_cert_key_matches_onchain`, `tls_cert_single_san_e_base32`, `tls_cert_connection_established` | a **QUIC-carried** sim node with a bad certificate — the mock has no TLS, so these cannot be reached on it at all |
+| `alpn` | `alpn_version1_accepted`, `alpn_offered_when_initiating`, `alpn_wrong_version_rejected` | a QUIC-carried sim node that negotiates ALPN wrongly |
+| `builder_slots` | `builder_slots_ge_20`, `alpn_builder_suffix_accepted`, `ce133_accepted_on_builder` | a QUIC-carried sim node that refuses builder connections |
+| `preferred_initiator` | `nut_initiates_where_preferred`, `nut_waits_where_not_preferred`, `nut_initiates_within_grace` | a sim node that **dials**, or refuses to; today it only listens |
+| `endpoint_decoding` | `endpoint_dialed_exact_addr` | a sim node that dials the wrong address |
+| `up0_announce` | `emulated_author_announces` | nothing a node does: it asserts the *emulator* announced, so only a broken harness could fail it |
+| `ce128_serve` | `ce128_respects_max`, `ce128_both_halves_fin` | reachable today — a `SimFault` that over-serves `max_blocks`, and one that leaves a half open |
+| `ce129_serve` | `ce129_served`, `ce129_keys_sorted`, `ce129_boundary_parent_before_child`, `ce129_size_cap`, `ce129_len_prefixed_values` | reachable today, but the stand-in serves an *empty* state, so each needs it to serve a populated one first |
+
+**N1 — 12 unproven of 13** (`n1_timing_within_slot` is proven). `n1_parent_is_reference_best`,
+`n1_parent_is_known`, `n1_parent_no_equivocation`; `n1_header_seal_import_ok`;
+`n1_state_root_prior_matches`, `n1_state_root_posterior_matches`;
+`n1_extrinsic_includes_delivered`, `n1_extrinsic_no_undelivered`, `n1_extrinsic_no_repeat`,
+`n1_extrinsic_empty_at_tail`; `n1_skipped_slots_valid_parent`, `no_nut_blocks_observed`.
+
+The authoring stand-in they were waiting on now exists, so these are no longer blocked on
+mechanism — they are blocked on **faults that do not break the seal**. Authoring on the wrong
+parent or with a doctored state root changes the header, and the header is signed, so
+`n1_header_seal_import_ok` fails alongside whatever was meant to be tested. Reaching them needs
+either a way to author a *validly sealed* block that is nonetheless wrong — which the reference
+engine can do for the parent case, by authoring on an older head — or acceptance that some rows
+can only be shown to fail in company.
+
+**N2 — 22 unproven of 35.** Thirteen are proven. Nine on the generation side
+(`crates/m2-sim/tests/n2_sim_it.rs`): the simulated node runs a real Safrole lottery -- ring
+signatures over its own key, from its own chain's entropy -- and distributes what it wins, CE
+131 to the proxy its id names and CE 132 to everyone for the ones it proxies itself. The facts
+come from `m2_runner::real::collect_nut_tickets`, the harness's own trace-to-facts step, which
+is the one that has actually failed: the CE 131 decoder defect closed on 2026-10-30 made the
+node's whole ticket output invisible and every check above it read the silence as a node that
+had sent nothing.
+
+The node is validator **2** in that test, and the choice is load-bearing rather than tidy. A
+ticket's proxy follows from its id, so the entropy decides which rules a run exercises: at the
+test's clock anchor, validator 2 proxies two of its four tickets itself and sends the other two
+on, and it is the only index of the six that exercises the CE 131 path and the CE 132 broadcast
+in one run. As validator 0 -- the first configuration tried -- all four tickets go to other
+validators and `n2_self_proxy_ce132_all_peers` is never produced, so the fault for it could not
+have been proven. That is the same not-exercised trap the lane's own controls guard against,
+met from the other side.
+
+Still unproven: `n2_gen_proof_unjudged`, `n2_gen_within_attempts_per_epoch`;
+`n2_self_proxy_none`, `n2_self_proxy_proof_unjudged`; `n2_proxy_duty_ticket_delivered`,
+`n2_proxy_duty_delivered_in_time`, `n2_proxy_forward_after_arrival`;
+`n2_proxy_duty_ticket_delivered`, `n2_proxy_duty_bad_proof_ignored`,
+`n2_proxy_duty_delivered_in_time`, `n2_proxy_duty_forwarded`, `n2_proxy_forward_after_arrival`;
+`n2_forward_finality_control_absent`, `n2_forward_repeat_control_absent`,
+`n2_forward_stops_at_finality`; `n2_inclusion_every_ticket_delivered`,
+`n2_inclusion_no_block_in_epoch`, `n2_inclusion_control_absent`, `n2_inclusion_empty_at_tail`,
+`n2_inclusion_sorted_dedup`, `n2_inclusion_no_extra`, `n2_inclusion_covers_valid`;
+`n2_unknown_epoch_probed`, `n2_unknown_epoch_reset_observed`; `n2_fault_injected`,
+`n2_fault_forward_control_absent`, `n2_fault_not_forwarded`,
+`n2_fault_inclusion_control_absent`, `n2_fault_not_included`.
+
+The receiving half exists too (`crates/m2-sim/tests/n2_proxy_sim_it.rs`): the harness delivers
+tickets to the node, the node refuses what it cannot act on by resetting the stream -- a forged
+proof, or an epoch past its horizon -- and forwards what it is proxy for over CE 132. Three more
+rows are proven there, each with its negative control run by hand.
+
+Four things that cost real debugging and are worth not rediscovering:
+
+- **A node must serve streams on connections it dialled**, not only on ones dialled to it. The
+  emulator's ticket sender uses whichever connection it has, so a stand-in that only served
+  inbound connections silently ignored every ticket proxied to it, and `n2_proxy_duty_forwarded`
+  failed for a reason that had nothing to do with forwarding.
+- **The node's chain must not drift from the harness's.** A block of its own the harness never
+  imported moves its entropy, and the harness's ring proofs then fail to verify against the
+  node's context -- so it refuses every honest ticket, and the bad-proof row passes for the
+  wrong reason.
+- **A block has to be announced, not just authored.** The harness learns what the node considers
+  final only from the node's re-announcement, and the ticket sender gates on it; authoring
+  without broadcasting leaves the gate shut and every delivery withheld.
+- **A deliberately stale ticket has to be marked as a fault** or the sender withholds it, since
+  sending a stale ticket would manufacture a refusal the node was right to make.
+
+**Inclusion is built too** (`crates/m2-sim/tests/n2_inclusion_sim_it.rs`): the node pools what
+it is sent through a new `RefChain::submit_tickets` passthrough, and the blocks it authors carry
+three tickets each. `n2_inclusion_covers_valid` is proven -- the honest node carries what it was
+sent, `OmitsDeliveredTickets` carries nothing -- and the honest and faulty paths are one line
+apart, both sealing validly, which is the isolation N1's faults could not get.
+
+Getting there needed three corrections that are worth not repeating:
+
+- **A node's chain must hold only its own keys.** `RefChain::tiny(k)` holds every key *but*
+  `k`, and an authoring harness runs the Safrole lottery for every key in its keystore -- so a
+  node simulated on such a chain authors blocks carrying five validators' tickets and looks, to
+  the lane, like one inventing tickets nobody sent. `RefChain::tiny_for(index)` is the
+  complement, and is what a node holds.
+- **A ticket for any epoch but the next one must be refused**, not merely one past the horizon.
+  polkajam refuses both -- its log says `bad ticket epoch value` -- and a node that pooled a
+  stale ticket put in its block something the harness never owed it.
+- **A peer's plan is taken once.** `set_ticket_plans` called a second time is never sent,
+  because the first connection to a peer takes its plan and the sender runs once. The first
+  version of the test re-planned every epoch and graded an epoch whose tickets had gone out an
+  epoch earlier.
+
+**`n2_inclusion_no_extra` is not provable with this stand-in**, and the test records why rather
+than leaving a gap: the authoring engine pools its *own* lottery tickets independently of
+anything the simulated node distributes, so its blocks carry ids the harness has no account of
+and the row fails on a node that is behaving correctly. Announcing exactly those would mean
+reading the engine's pool, which `hazmat` does not expose. An `#[ignore]`d test holds the shape
+of the problem and will fail if that ever changes.
+
+**A caveat on what "proving" a row means here.** Thirteen of the 70 are *not* assertions about
+the node: they report that a run did not exercise something (`n2_fault_injected`,
+`n2_inclusion_control_absent`, `n2_forward_*_control_absent`, `n2_self_proxy_none`,
+`no_nut_blocks_observed`, `n2_proxy_duty_delivered_in_time` and the `_unjudged` pair among
+them). Making one of those fire means under-exercising the *harness*, not breaking the node,
+and several already have unit tests in their own lane doing exactly that. They are counted here
+because they appear in the report as rows, but a faulty client is the wrong instrument for
+them.
 
 ---
 
@@ -617,7 +959,7 @@ have been failed for it.
 ./scripts/prepare-nut.sh
 
 # Harness checks.
-cargo test --workspace            # 404 passed / 0 failed
+cargo test --workspace            # 428 passed / 0 failed
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets
 
