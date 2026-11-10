@@ -14,7 +14,7 @@ artefact the NUT produces against the polkajam `hazmat` reference engine.
 (connectivity/sync), **N1** (block authoring), and **N2** (Safrole tickets). See [DESIGN.md](DESIGN.md)
 for the design; this README documents the current implementation state.
 
-- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **428 passed / 0 failed** ✓,
+- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **432 passed / 0 failed** ✓,
   `cargo fmt --all --check` ✓, no `unwrap`/`panic`/`expect`/`todo!` in non-test code.
 - Dry-run baseline: `cargo run -p m2-runner -- --preset mock --dry-run --session-dir /tmp/x`
   exits 0 with **all N0+N1+N2 checks HARD PASS** — the harness's own expectations are satisfiable.

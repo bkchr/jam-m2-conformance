@@ -87,6 +87,18 @@ pub enum SimFault {
     /// Accept a ticket for an epoch past its horizon, instead of resetting
     /// the stream (`simple.md:335-337`).
     AcceptsUnknownEpoch,
+    /// Forward every proxied ticket twice, a slot apart, both while the
+    /// lottery is still open.
+    ///
+    /// Not itself a defect -- the stopping rule bounds forwarding *after*
+    /// finality, not repetition before it -- but it is what gives that rule
+    /// something to bound. Against a node that forwards each ticket once the
+    /// rule holds however it is written, and the row reports itself
+    /// unexercised.
+    RepeatsForwards,
+    /// Forward a ticket again after a block of this node's own carried it and
+    /// was announced as final.
+    ReForwardsAfterFinality,
     /// Take delivery of a ticket and never offer it to its own pool, so the
     /// block it authors leaves it out. Seals just as validly.
     OmitsDeliveredTickets,
@@ -128,6 +140,9 @@ pub struct SimNode {
     /// Blocks this node authored. Not in the harness's reference chain, so
     /// only this node can serve them when it fetches by hash over CE 128.
     own_blocks: Mutex<Vec<Block>>,
+    /// Tickets this node forwarded as proxy, by id, so it can forward one
+    /// again once a block of its own carries it.
+    forwarded: Mutex<Vec<([u8; 32], TicketDistribution)>>,
 }
 
 impl SimNode {
@@ -147,6 +162,7 @@ impl SimNode {
             peers: Mutex::new(Vec::new()),
             announce: broadcast::Sender::new(16),
             own_blocks: Mutex::new(Vec::new()),
+            forwarded: Mutex::new(Vec::new()),
         }
     }
 
@@ -156,6 +172,31 @@ impl SimNode {
     /// hears the announcement.
     pub fn publish(self: &Arc<Self>, block: Block) {
         let wire = m2_emu::emu::announcement_wire(&block, &self.chain);
+        if self.fault == SimFault::ReForwardsAfterFinality {
+            // Announcing this block names it final, so anything it carries is
+            // finalized-included from here. Forwarding one again a slot later
+            // is what the stopping rule forbids.
+            let carried: Vec<[u8; 32]> = block.extrinsic.tickets.iter().map(|t| t.id().0).collect();
+            let again: Vec<TicketDistribution> = self
+                .forwarded
+                .lock()
+                .expect("sim forwards")
+                .iter()
+                .filter(|(id, _)| carried.contains(id))
+                .map(|(_, d)| *d)
+                .collect();
+            if !again.is_empty() {
+                let node = Arc::clone(self);
+                tokio::spawn(async move {
+                    clock::current()
+                        .sleep(Duration::from_millis(jam_types::slot_period_sec() * 1000))
+                        .await;
+                    for distribution in again {
+                        node.broadcast_ticket(&distribution).await;
+                    }
+                });
+            }
+        }
         self.own_blocks.lock().expect("sim blocks").push(block);
         if self.fault == SimFault::AnnouncesLate {
             let node = Arc::clone(self);
@@ -503,7 +544,20 @@ impl SimNode {
         if proxy_index(&id, usize::from(jam_types::max_val_count())) != self.index {
             return;
         }
+        self.forwarded
+            .lock()
+            .expect("sim forwards")
+            .push((id, distribution));
         self.broadcast_ticket(&distribution).await;
+        if self.fault == SimFault::RepeatsForwards {
+            let node = Arc::clone(self);
+            tokio::spawn(async move {
+                clock::current()
+                    .sleep(Duration::from_millis(jam_types::slot_period_sec() * 1000))
+                    .await;
+                node.broadcast_ticket(&distribution).await;
+            });
+        }
     }
 
     /// Serve a block request from the reference chain.

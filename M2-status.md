@@ -44,7 +44,7 @@ has no `finality lagging` at all.
 | Milestone | Lanes | Coverage | Status |
 |---|---|---|---|
 | **M2-A** — Foundations live | N0, N1 | 6 / 41 | ✅ **complete** — §1 |
-| **M2-B** — Self-tested | N2 | 8 / 41 | ⚠️ **partial** — the N2 lane is complete; the self-test mechanism exists and has proven 19 of the 75 check rows, across N0, N1 and N2. See below |
+| **M2-B** — Self-tested | N2 | 8 / 41 | ⚠️ **partial** — the N2 lane is complete; the self-test mechanism exists and has proven 20 of the 75 check rows, across N0, N1 and N2. See below |
 | **M2-C** — Guaranteeing | N3 | 21 / 41 | ⏳ not started |
 | **M2-D** — Availability | N4 | 30 / 41 | ⏳ not started |
 | **M2-E** — Audit & preimages | N5, N6 | 41 / 41 | ⏳ not started |
@@ -69,10 +69,11 @@ machinery exists — an in-process transport, a virtual clock and `m2-sim`, a no
 stand-in that can be broken in one named way at a time — and the first five check rows have
 been proven: each is shown to pass against an honest simulated node and to *fail, present in
 the report*, against one that gets exactly that thing wrong (`crates/m2-sim/tests/n0_sim_it.rs`,
-which grades six nodes in 0.07 s). That is 19 of the 75 rows across N0, N1 and N2 — five in N0,
-one in N1 on a block the simulated node authored itself, and thirteen in N2, on tickets it won
-in a real lottery, on tickets the harness delivered to it, and on what it then put in its own
-blocks. §4.2 lists the other 56 and what each one needs.
+which grades six nodes in 0.07 s). That is 20 of the 75 rows across N0, N1 and N2 — five in N0,
+one in N1 on a block the simulated node authored itself, and fourteen in N2, on tickets it won
+in a real lottery, on tickets the harness delivered to it, on what it then put in its own
+blocks, and on what it went on forwarding afterwards. §4.2 lists the other 55 and what each one
+needs.
 
 The distinction this closes is not pedantic. Two of the four hard failures ever observed were
 harness defects of exactly the kind a faulty client catches, and N2's injected ticket faults
@@ -170,7 +171,7 @@ Result: the node accepts every ticket the emulator offers. `invalid ticket signa
 |---|---|
 | Crates | 6 (`jamnp-s`, `m2-reference`, `m2-emu`, `m2-scenario`, `m2-runner`, `m2-sim`) |
 | Rust | ~24.2k lines, 429 test functions |
-| `cargo test --workspace` | **428 passed / 0 failed**, 1 ignored |
+| `cargo test --workspace` | **432 passed / 0 failed** |
 | `cargo fmt --all --check` | clean |
 | `cargo clippy --workspace --all-targets` | 3 warnings, all pre-existing |
 | Dry-run baseline | exits 0 — the harness's own expectations are satisfiable |
@@ -491,7 +492,7 @@ coverage beyond its own 6 / 41.
 - **Messages asserted: 8 of 41.** UP 0, CE 128, CE 129, CE 131, CE 132. Lanes N3–N7
   (guaranteeing, availability, auditing/disputes, preimages, adversarial) are designed in
   DESIGN §11 and not implemented.
-- **Self-testing works, on 19 of the 75 check rows.** M2-B's criterion is *transport and clock
+- **Self-testing works, on 20 of the 75 check rows.** M2-B's criterion is *transport and clock
   injectable, QUIC behaviour unchanged*, and all three pieces are built: `jamnp_s::transport`
   with a QUIC carrier and an in-process mock, `jamnp_s::clock` with the machine's clock and a
   virtual one, and `m2-sim`, a node-shaped stand-in that can be broken one named way at a time
@@ -499,7 +500,7 @@ coverage beyond its own 6 / 41.
   build. The stand-in authors blocks and runs the Safrole lottery, so N1 and N2's generation
   side can grade it, and it takes delivery of tickets, refuses what it cannot act on and
   forwards what it is proxy for, and includes what it received in the blocks it authors. What
-  is missing is coverage: 56 rows have still never been shown to be capable of failing. §4.1 has
+  is missing is coverage: 55 rows have still never been shown to be capable of failing. §4.1 has
   the shape of the work and §4.2 lists the rows.
 - **Negative testing exists in N2 only.** N2 injects its whole Faults column — bad proof, wrong
   proxy, wrong epoch, late, duplicate, plus an over-cap attempt DESIGN does not list — and gates
@@ -600,9 +601,9 @@ defect the lanes' own controls were added to prevent. The test's own negative co
 by hand: pointing a row at the honest node makes it fail with `must make
 nut_reannounces_learned_block fail; it reported Some(Pass)`.
 
-What is left of M2-B is coverage, not mechanism: 56 rows unproven, listed in §4.2.
+What is left of M2-B is coverage, not mechanism: 55 rows unproven, listed in §4.2.
 
-### 4.2 What each check row's evidence is, and the 56 without a faulty client
+### 4.2 What each check row's evidence is, and the 55 without a faulty client
 
 *Counted 2026-11-09 from `m2-scenario/src/scenarios/{n0,n1,n2}.rs`, excluding test code.* The
 lanes report **75 rows**. "Unproven" below means *unproven end to end by a faulty client*,
@@ -613,7 +614,7 @@ and they are not interchangeable:
 |---|---|---|
 | a lane unit test asserts the row failing | 56 | the **predicate** is right, against a fabricated context |
 | the row has failed in a live run | 11 | the predicate *and* the pipeline that fed it, for one shape of failure |
-| a faulty simulated client makes it fail | 19 | predicate and pipeline, for a failure chosen on purpose |
+| a faulty simulated client makes it fail | 20 | predicate and pipeline, for a failure chosen on purpose |
 
 The difference between the first grade and the others is the whole point of M2-B. A unit test
 hands the check a context built by hand; it cannot catch a context *builder* that never
@@ -627,7 +628,17 @@ N1: `n1_timing_within_slot`. N2: `n2_gen_ce131_observed`, `n2_gen_epoch_target`,
 `n2_gen_proxy_matches_rule`, `n2_gen_one_proxy_per_ticket`, `n2_self_proxy_ce132_all_peers`,
 `n2_self_proxy_proof_verified`, `n2_proxy_duty_forwarded`,
 `n2_proxy_duty_bad_proof_ignored`, `n2_unknown_epoch_reset_observed`,
-`n2_inclusion_covers_valid`.
+`n2_inclusion_covers_valid`, `n2_forward_stops_at_finality`.
+
+The last one could not have been proven any other way. polkajam sends one CE 132 frame per
+ticket per peer and never repeats, so against it the rule holds however it is written and the
+row reports itself unexercised -- which is what `sessions/unitB-9` recorded and what this
+check was written expecting. The simulated node supplies the behaviour the rule bounds:
+`RepeatsForwards` repeats a forward *before* finality, which the rule permits and which the
+test asserts passes, and `ReForwardsAfterFinality` forwards again once a block of the node's
+own carried the ticket and was announced as final. Both controls are exercised in the same
+test, including the one that fires against an honest node
+(`crates/m2-sim/tests/n2_finality_sim_it.rs`).
 
 Two things reading the N2 checks closely settled, both of which shape what is left:
 
@@ -638,12 +649,15 @@ Two things reading the N2 checks closely settled, both of which shape what is le
   were, which is what makes `n2_gen_proof_verified` and `n2_self_proxy_proof_verified` provable
   on their own. The test asserts the routing rows stay passing, so the isolation is held rather
   than assumed.
-- **Two pairs of rows cannot be separated at all.** `n2_gen_one_proxy_per_ticket` and
+- **One pair of rows cannot be separated.** `n2_gen_one_proxy_per_ticket` and
   `n2_gen_proxy_matches_rule` both require `peers.len() == 1`, so a ticket sent to two
-  validators fails both; the test asserts that explicitly rather than pretending otherwise. And
-  `n2_gen_within_attempts_per_epoch` counts *distinct* tickets, so exceeding the cap means a
-  fifth validly-signed ticket at attempt 4 — which fails `n2_gen_attempt_in_range` in the same
-  breath. Nothing a node can do breaks one without the other.
+  validators fails both; the test asserts that explicitly rather than pretending otherwise.
+- **`n2_gen_attempt_in_range` *is* isolable, but only with a real signature.** An earlier
+  version relabelled an honest ticket with an over-cap attempt, which also broke its proof and
+  its count. `RefChain::generate_ticket_at` signs at the cap attempt instead, so the proof and
+  per-epoch-count rows keep passing and the test asserts that. `n2_gen_within_attempts_per_epoch`
+  remains unproven: it counts *distinct* tickets, so exceeding the cap needs a fifth valid
+  ticket, which fails the attempt-range row in the same breath.
 
 The N1 one is the first row proven on a block the simulated node *authored*
 (`crates/m2-sim/tests/n1_sim_it.rs`). The node keeps its own reference chain -- one that holds
@@ -706,7 +720,7 @@ either a way to author a *validly sealed* block that is nonetheless wrong — wh
 engine can do for the parent case, by authoring on an older head — or acceptance that some rows
 can only be shown to fail in company.
 
-**N2 — 22 unproven of 35.** Thirteen are proven. Nine on the generation side
+**N2 — 21 unproven of 35.** Fourteen are proven. Nine on the generation side
 (`crates/m2-sim/tests/n2_sim_it.rs`): the simulated node runs a real Safrole lottery -- ring
 signatures over its own key, from its own chain's entropy -- and distributes what it wins, CE
 131 to the proxy its id names and CE 132 to everyone for the ones it proxies itself. The facts
@@ -729,8 +743,7 @@ Still unproven: `n2_gen_proof_unjudged`, `n2_gen_within_attempts_per_epoch`;
 `n2_proxy_duty_delivered_in_time`, `n2_proxy_forward_after_arrival`;
 `n2_proxy_duty_ticket_delivered`, `n2_proxy_duty_bad_proof_ignored`,
 `n2_proxy_duty_delivered_in_time`, `n2_proxy_duty_forwarded`, `n2_proxy_forward_after_arrival`;
-`n2_forward_finality_control_absent`, `n2_forward_repeat_control_absent`,
-`n2_forward_stops_at_finality`; `n2_inclusion_every_ticket_delivered`,
+`n2_forward_finality_control_absent`, `n2_forward_repeat_control_absent`; `n2_inclusion_every_ticket_delivered`,
 `n2_inclusion_no_block_in_epoch`, `n2_inclusion_control_absent`, `n2_inclusion_empty_at_tail`,
 `n2_inclusion_sorted_dedup`, `n2_inclusion_no_extra`, `n2_inclusion_covers_valid`;
 `n2_unknown_epoch_probed`, `n2_unknown_epoch_reset_observed`; `n2_fault_injected`,
@@ -959,7 +972,7 @@ have been failed for it.
 ./scripts/prepare-nut.sh
 
 # Harness checks.
-cargo test --workspace            # 428 passed / 0 failed
+cargo test --workspace            # 432 passed / 0 failed
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets
 
