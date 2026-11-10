@@ -44,7 +44,7 @@ has no `finality lagging` at all.
 | Milestone | Lanes | Coverage | Status |
 |---|---|---|---|
 | **M2-A** — Foundations live | N0, N1 | 6 / 41 | ✅ **complete** — §1 |
-| **M2-B** — Self-tested | N2 | 8 / 41 | ⚠️ **partial** — the N2 lane is complete; the self-test mechanism exists and has proven 26 of the 75 check rows, across N0, N1 and N2. See below |
+| **M2-B** — Self-tested | N2 | 8 / 41 | ⚠️ **partial** — the N2 lane is complete; the self-test mechanism exists and has proven 26 of the 66 check rows a node can cause, across N0, N1 and N2. See below |
 | **M2-C** — Guaranteeing | N3 | 21 / 41 | ⏳ not started |
 | **M2-D** — Availability | N4 | 30 / 41 | ⏳ not started |
 | **M2-E** — Audit & preimages | N5, N6 | 41 / 41 | ⏳ not started |
@@ -69,11 +69,11 @@ machinery exists — an in-process transport, a virtual clock and `m2-sim`, a no
 stand-in that can be broken in one named way at a time — and the first five check rows have
 been proven: each is shown to pass against an honest simulated node and to *fail, present in
 the report*, against one that gets exactly that thing wrong (`crates/m2-sim/tests/n0_sim_it.rs`,
-which grades six nodes in 0.07 s). That is 26 of the 75 rows across N0, N1 and N2 — five in N0,
+which grades six nodes in 0.07 s). That is 26 of the 66 rows a node can cause — five in N0,
 one in N1 on a block the simulated node authored itself, and twenty in N2, on tickets it won
 in a real lottery, on tickets the harness delivered to it, on what it then put in its own
-blocks, and on when and how long it went on forwarding. §4.2 lists the other 49 and what each
-one needs.
+blocks, and on when and how long it went on forwarding. §4.2 lists the other 40 a node could
+still be made to fail, and the nine no node can.
 
 The distinction this closes is not pedantic. Two of the four hard failures ever observed were
 harness defects of exactly the kind a faulty client catches, and N2's injected ticket faults
@@ -492,7 +492,7 @@ coverage beyond its own 6 / 41.
 - **Messages asserted: 8 of 41.** UP 0, CE 128, CE 129, CE 131, CE 132. Lanes N3–N7
   (guaranteeing, availability, auditing/disputes, preimages, adversarial) are designed in
   DESIGN §11 and not implemented.
-- **Self-testing works, on 26 of the 75 check rows.** M2-B's criterion is *transport and clock
+- **Self-testing works, on 26 of the 66 check rows a node can cause.** M2-B's criterion is *transport and clock
   injectable, QUIC behaviour unchanged*, and all three pieces are built: `jamnp_s::transport`
   with a QUIC carrier and an in-process mock, `jamnp_s::clock` with the machine's clock and a
   virtual one, and `m2-sim`, a node-shaped stand-in that can be broken one named way at a time
@@ -500,8 +500,8 @@ coverage beyond its own 6 / 41.
   build. The stand-in authors blocks and runs the Safrole lottery, so N1 and N2's generation
   side can grade it, and it takes delivery of tickets, refuses what it cannot act on and
   forwards what it is proxy for, and includes what it received in the blocks it authors. What
-  is missing is coverage: 49 rows have still never been shown to be capable of failing. §4.1 has
-  the shape of the work and §4.2 lists the rows.
+  is missing is coverage: 40 rows a node could make fire have still never been shown to. §4.1
+  has the shape of the work and §4.2 lists them, with the nine that are out of scope and why.
 - **Negative testing exists in N2 only.** N2 injects its whole Faults column — bad proof, wrong
   proxy, wrong epoch, late, duplicate, plus an over-cap attempt DESIGN does not list — and gates
   every negative verdict on a control. Nothing equivalent exists for the other lanes, because the
@@ -601,9 +601,9 @@ defect the lanes' own controls were added to prevent. The test's own negative co
 by hand: pointing a row at the honest node makes it fail with `must make
 nut_reannounces_learned_block fail; it reported Some(Pass)`.
 
-What is left of M2-B is coverage, not mechanism: 49 rows unproven, listed in §4.2.
+What is left of M2-B is coverage, not mechanism: 40 reachable rows unproven, listed in §4.2.
 
-### 4.2 What each check row's evidence is, and the 49 without a faulty client
+### 4.2 What each check row's evidence is, and the 40 a node could still be made to fail
 
 *Counted 2026-11-09 from `m2-scenario/src/scenarios/{n0,n1,n2}.rs`, excluding test code.* The
 lanes report **75 rows**. "Unproven" below means *unproven end to end by a faulty client*,
@@ -614,12 +614,32 @@ and they are not interchangeable:
 |---|---|---|
 | a lane unit test asserts the row failing | 56 | the **predicate** is right, against a fabricated context |
 | the row has failed in a live run | 11 | the predicate *and* the pipeline that fed it, for one shape of failure |
-| a faulty simulated client makes it fail | 26 | predicate and pipeline, for a failure chosen on purpose |
+| a faulty simulated client makes it fail | 26 of 66 | predicate and pipeline, for a failure chosen on purpose |
 
 The difference between the first grade and the others is the whole point of M2-B. A unit test
 hands the check a context built by hand; it cannot catch a context *builder* that never
 produces the faulty shape, and both harness defects of §3 lived exactly there — in how the
 harness spoke to the node and what it recorded, not in any predicate.
+
+**The bar, and why it is not 75.** A faulty client can only prove a row that some *node*
+behaviour makes fire. Nine of the 75 are not like that:
+
+| row | why no node can cause it |
+|---|---|
+| `emulated_author_announces` | asserts the *emulator* announced |
+| `n2_gen_proof_unjudged`, `n2_self_proxy_proof_unjudged` | the harness holds no ticket context for that epoch |
+| `n2_proxy_duty_ticket_delivered` | the harness never put the ticket on the wire |
+| `n2_proxy_duty_delivered_in_time` | the harness delivered too late to demand a forward |
+| `n2_inclusion_every_ticket_delivered` | the harness withheld planned tickets |
+| `n2_unknown_epoch_probed` | the harness scheduled no probe |
+| `n2_fault_injected` | the harness injected no fault |
+| `n2_self_proxy_none` | `log::check(.., true, Hard)` — a literal `true`, so it cannot fire at all |
+
+Eight of those belong to the lane unit tests, which already drive most of them by
+under-exercising the harness; the ninth is a defect, recorded below. **So M2-B's reachable
+target is 66 rows, and 26 of them are proven.** A control row *is* in scope where a node causes
+it — `n2_forward_repeat_control_absent` fires because a node never repeats a forward, and
+`n2_inclusion_no_block_in_epoch` because it authored nothing.
 
 **Proven by a faulty client (15).** N0: `up0_kind_byte_0`, `up0_final_is_genesis`,
 `nut_reannounces_learned_block`, `ce128_ascending_covers_reference`, `ce128_ascending_ordered`.
