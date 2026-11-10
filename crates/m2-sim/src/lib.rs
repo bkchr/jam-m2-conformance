@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_consensus::SigningKey;
-use jam_std_common::{bandersnatch::ring_vrf, Block, TicketEnvelope};
+use jam_std_common::{bandersnatch::ring_vrf, Block, Extrinsic, TicketEnvelope};
 use jam_types::{Decode, Encode, HeaderHash};
 use jamnp_s::clock;
 use jamnp_s::codec::ce128_129::{BlockRequest, BlockResponse, Direction, StateRequest};
@@ -99,6 +99,22 @@ pub enum SimFault {
     /// Forward a ticket again after a block of this node's own carried it and
     /// was announced as final.
     ReForwardsAfterFinality,
+    /// Serve a block whose extrinsic carries the same ticket twice.
+    ///
+    /// The body is rewritten after authoring, so the header -- and therefore
+    /// the hash the harness fetches by -- is untouched and only the extrinsic
+    /// disagrees with it. That is the one way to produce an extrinsic the
+    /// authoring engine will not: its pool rejects duplicates and orders by
+    /// id. The same rewrite necessarily fails N1's seal row, because the body
+    /// no longer matches the header's extrinsic hash; these rows cannot be
+    /// reached without that.
+    ServesDuplicateTicket,
+    /// Serve a block authored in the epoch tail with a ticket in it.
+    ///
+    /// Rewritten the same way and for the same reason: past
+    /// `epoch_tail_start` the provisioner offers no tickets at all, so a tail
+    /// block the engine authored is always empty.
+    ServesTicketsInTail,
     /// Hold a proxied ticket until the lottery has shut, then forward it.
     ///
     /// The forward itself is well formed and goes to every validator; only
@@ -179,6 +195,7 @@ impl SimNode {
     /// hears the announcement.
     pub fn publish(self: &Arc<Self>, block: Block) {
         let wire = m2_emu::emu::announcement_wire(&block, &self.chain);
+        let block = self.rewrite_body(block);
         if self.fault == SimFault::ReForwardsAfterFinality {
             // Announcing this block names it final, so anything it carries is
             // finalized-included from here. Forwarding one again a slot later
@@ -217,6 +234,42 @@ impl SimNode {
             return;
         }
         let _ = self.announce.send(wire);
+    }
+
+    /// Rewrite a block's extrinsic, for the two faults that need a body the
+    /// authoring engine will not produce.
+    ///
+    /// Only the body: the header is left as authored, so the block keeps the
+    /// hash it was announced under and the harness can still fetch it.
+    fn rewrite_body(&self, block: Block) -> Block {
+        let tail = block.header.slot % jam_types::epoch_period() >= jam_types::epoch_tail_start();
+        let seed = match self.fault {
+            SimFault::ServesDuplicateTicket if !tail => block.extrinsic.tickets.first().cloned(),
+            SimFault::ServesTicketsInTail if tail => self
+                .own_blocks
+                .lock()
+                .expect("sim blocks")
+                .iter()
+                .find_map(|b| b.extrinsic.tickets.first().cloned()),
+            _ => None,
+        };
+        let Some(ticket) = seed else {
+            return block;
+        };
+        let mut extrinsic = Extrinsic::default();
+        let repeats = if self.fault == SimFault::ServesDuplicateTicket {
+            2
+        } else {
+            1
+        };
+        for _ in 0..repeats {
+            if extrinsic.tickets.try_push(ticket.clone()).is_err() {
+                break;
+            }
+        }
+        let mut block = block;
+        block.extrinsic = Arc::new(extrinsic);
+        block
     }
 
     /// Dial the emulated validators, keyed by index. A peer that cannot be

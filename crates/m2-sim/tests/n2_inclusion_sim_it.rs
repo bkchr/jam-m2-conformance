@@ -204,23 +204,7 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
     let ctx = N2Ctx {
         target_epoch,
         epoch_start_slot: target_epoch * period,
-        emu_plan: {
-            let p = plan_emu_tickets(&plan, &ticket_ctx.expect("a context"), &deliveries);
-            eprintln!(
-                "PLAN {fault:?}: {} entries, delivered {}, valid {}, epochs {:?}, blocks {:?}",
-                p.len(),
-                p.iter().filter(|t| t.delivered_at_ms.is_some()).count(),
-                p.iter().filter(|t| t.valid).count(),
-                p.iter()
-                    .map(|t| t.target_epoch)
-                    .collect::<std::collections::BTreeSet<_>>(),
-                blocks
-                    .iter()
-                    .map(|b| (b.slot, b.ticket_ids.len()))
-                    .collect::<Vec<_>>(),
-            );
-            p
-        },
+        emu_plan: plan_emu_tickets(&plan, &ticket_ctx.expect("a context"), &deliveries),
         nut_tickets: Vec::new(),
         nut_blocks: blocks,
         nut_finals: Vec::new(),
@@ -233,13 +217,19 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         tickets_per_validator: jam_types::tickets_per_validator(jam_types::max_val_count()),
         max_tickets_per_block: jam_types::max_tickets_per_block(),
     };
-    for r in
-        (m2_scenario::scenarios::n2::n2_fault_handling(&ctx).run)(&m2_scenario::dsl::ObsLog::new())
-    {
-        if r.name == "n2_fault_not_included" && r.outcome != Outcome::Pass {
-            eprintln!("  {fault:?} :: {:?}", r.detail);
-        }
-    }
+    // N1's seal row on the same blocks, so the coupling a rewritten body
+    // creates is measured rather than asserted in a comment.
+    let n1_ctx = m2_runner::real::build_n1_ctx(
+        &harness_chain,
+        &nut_blocks.lock().expect("the NUT blocks"),
+        &deliveries,
+        Vec::new(),
+    );
+    let seal: Vec<(&'static str, Outcome)> = (m2_scenario::scenarios::n1::n1_header_seal(&n1_ctx)
+        .run)(&m2_scenario::dsl::ObsLog::new())
+    .into_iter()
+    .map(|r| (r.name, r.outcome))
+    .collect();
     let rows = [
         n2::n2_inclusion(&ctx),
         // `plan_tickets` injects the Faults column itself, so the same blocks
@@ -249,6 +239,7 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
     .into_iter()
     .flat_map(|check| (check.run)(&m2_scenario::dsl::ObsLog::new()))
     .map(|row| (row.name, row.outcome))
+    .chain(seal)
     .collect();
 
     dialing.abort();
@@ -317,6 +308,31 @@ async fn the_inclusion_checks_catch_a_node_that_mishandles_its_extrinsic() {
         failed(&forged, "n2_fault_not_included"),
         "a node that pools the forgery must fail the inclusion prohibition; it reported {:?}",
         outcomes_of(&forged, "n2_fault_not_included")
+    );
+
+    // Two rows the authoring engine cannot be made to break: its pool
+    // rejects duplicates and orders by id, and past the tail it offers no
+    // tickets at all. Reaching them means rewriting the body the node serves,
+    // which also breaks N1's seal row -- so these two fail in company, and the
+    // test says so rather than claiming an isolation it does not have.
+    for row in ["n2_inclusion_sorted_dedup", "n2_inclusion_empty_at_tail"] {
+        assert!(
+            passed(&honest, row),
+            "the honest node must pass {row}; it reported {:?}",
+            outcomes_of(&honest, row)
+        );
+    }
+    let duplicated = grade(SimFault::ServesDuplicateTicket).await;
+    assert!(
+        failed(&duplicated, "n2_inclusion_sorted_dedup"),
+        "a block carrying the same ticket twice must fail; it reported {:?}",
+        outcomes_of(&duplicated, "n2_inclusion_sorted_dedup")
+    );
+    let in_tail = grade(SimFault::ServesTicketsInTail).await;
+    assert!(
+        failed(&in_tail, "n2_inclusion_empty_at_tail"),
+        "a tail block carrying a ticket must fail; it reported {:?}",
+        outcomes_of(&in_tail, "n2_inclusion_empty_at_tail")
     );
 
     let omitted = grade(SimFault::OmitsDeliveredTickets).await;
