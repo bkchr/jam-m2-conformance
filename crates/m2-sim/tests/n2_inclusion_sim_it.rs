@@ -275,35 +275,34 @@ async fn the_inclusion_checks_catch_a_node_that_mishandles_its_extrinsic() {
         outcomes_of(&honest, "n2_inclusion_covers_valid")
     );
 
-    let omitted = grade(SimFault::OmitsDeliveredTickets).await;
-    assert!(
-        failed(&omitted, "n2_inclusion_covers_valid"),
-        "a node that pools nothing must fail the coverage row; it reported {:?}",
-        outcomes_of(&omitted, "n2_inclusion_covers_valid")
-    );
-}
-
-/// `n2_inclusion_no_extra` is **not** provable with this stand-in, and the
-/// reason is worth recording rather than leaving as a gap.
-///
-/// The row asks that a block carry nothing the node was neither sent nor
-/// announced. The authoring engine runs the Safrole lottery for its own
-/// keystore and pools the result itself, independently of anything the
-/// simulated node chooses to distribute -- so its blocks carry tickets of its
-/// own whose ids the harness has no account of, and the row fails on a node
-/// that is behaving correctly. Making the node announce exactly those would
-/// mean reading the engine's own pool, which `hazmat` does not expose.
-///
-/// This test holds the shape of the problem so it is not rediscovered: the
-/// honest node *does* fail the row, on one block out of six.
-#[tokio::test(start_paused = true)]
-#[ignore = "documents a limitation; see the doc comment"]
-async fn no_extra_cannot_be_isolated_with_this_stand_in() {
-    let honest = grade(SimFault::None).await;
+    // `n2_inclusion_no_extra` is **not** provable with this stand-in, and the
+    // reason is worth recording rather than leaving as a gap.
+    //
+    // The row asks that a block carry nothing the node was neither sent nor
+    // announced. The authoring engine runs the Safrole lottery for its own
+    // keystore and pools the result itself, independently of anything the
+    // simulated node chooses to distribute -- so its blocks carry tickets of its
+    // own whose ids the harness has no account of, and the row fails on a node
+    // that is behaving correctly. Making the node announce exactly those would
+    // mean reading the engine's own pool, which `hazmat` does not expose.
+    //
+    // This holds the shape of the problem so it is not rediscovered: the
+    // honest node *does* fail the row, on one block out of six.
+    //
+    // Checked here rather than in a test of its own: the clock is installed
+    // once per process, so a second test in this binary would run on the
+    // machine's clock or make this one's install fail.
     assert!(
         failed(&honest, "n2_inclusion_no_extra"),
         "if this ever passes, the engine stopped pooling its own tickets and the row \
          became provable: {:?}",
         outcomes_of(&honest, "n2_inclusion_no_extra")
+    );
+
+    let omitted = grade(SimFault::OmitsDeliveredTickets).await;
+    assert!(
+        failed(&omitted, "n2_inclusion_covers_valid"),
+        "a node that pools nothing must fail the coverage row; it reported {:?}",
+        outcomes_of(&omitted, "n2_inclusion_covers_valid")
     );
 }

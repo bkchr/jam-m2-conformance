@@ -222,16 +222,23 @@ impl SimNode {
         };
         // Its own only: proving the other five would cost five times the
         // ring-VRF work for nothing.
-        let Ok(tickets) = self.chain.generate_tickets_for(&ctx, self.index) else {
+        let Ok(mut tickets) = self.chain.generate_tickets_for(&ctx, self.index) else {
             return;
         };
+        if self.fault == SimFault::TicketAttemptOverCap {
+            // Its last honest attempt swapped for one at the cap, signed over
+            // that attempt: the count stays within the cap and the proof
+            // verifies, so the attempt row is the only one broken.
+            let cap = jam_types::tickets_per_validator(jam_types::max_val_count());
+            let Ok(Some(over)) = self.chain.generate_ticket_at(&ctx, self.index, cap) else {
+                return;
+            };
+            tickets.pop();
+            tickets.push(over);
+        }
         let val_count = usize::from(jam_types::max_val_count());
         for ticket in tickets.iter() {
-            let attempt = if self.fault == SimFault::TicketAttemptOverCap {
-                jam_types::tickets_per_validator(jam_types::max_val_count())
-            } else {
-                ticket.attempt
-            };
+            let attempt = ticket.attempt;
             let epoch = if self.fault == SimFault::TicketWrongEpoch {
                 target_epoch.saturating_add(1)
             } else {
@@ -256,8 +263,14 @@ impl SimNode {
             } else {
                 let proxy = if self.fault == SimFault::TicketWrongProxy {
                     // The next validator along that is not us, which is a
-                    // peer the rule did not name.
-                    (ticket.proxy + 1) % val_count
+                    // peer the rule did not name. Landing on ourselves would
+                    // send nothing at all.
+                    let next = (ticket.proxy + 1) % val_count;
+                    if next == self.index {
+                        (next + 1) % val_count
+                    } else {
+                        next
+                    }
                 } else {
                     ticket.proxy
                 };

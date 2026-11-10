@@ -248,6 +248,17 @@ async fn the_n2_generation_checks_catch_a_node_that_distributes_wrongly() {
         outcomes_of(&bad_proof, "n2_gen_one_proxy_per_ticket"),
     );
 
+    // An over-cap attempt is isolable only because its proof is signed over
+    // that attempt; relabelling an honest ticket broke the proof row as well.
+    let over_cap = grade(&harness_chain, &node_chain, SimFault::TicketAttemptOverCap).await;
+    assert!(
+        passed(&over_cap, "n2_gen_proof_verified")
+            && passed(&over_cap, "n2_gen_within_attempts_per_epoch"),
+        "an over-cap attempt must not disturb the proof or count rows: {:?} / {:?}",
+        outcomes_of(&over_cap, "n2_gen_proof_verified"),
+        outcomes_of(&over_cap, "n2_gen_within_attempts_per_epoch"),
+    );
+
     // Sending one ticket to two validators cannot be isolated at all: both
     // `n2_gen_one_proxy_per_ticket` and `n2_gen_proxy_matches_rule` require
     // `peers.len() == 1`, so the second necessarily fails with the first. That

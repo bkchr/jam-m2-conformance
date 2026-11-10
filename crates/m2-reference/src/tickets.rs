@@ -172,6 +172,34 @@ impl RefChain {
         ctx: &TicketCtx,
         author: usize,
     ) -> Result<Vec<EmulatedTicket>, ChainError> {
+        let attempts = 0..jam_types::tickets_per_validator(jam_types::max_val_count());
+        self.sign_tickets(ctx, author, attempts)
+    }
+
+    /// One author's ticket for any `attempt`, including one past the
+    /// per-validator cap, with a proof genuinely signed over that attempt.
+    /// `None` if the keystore does not hold that validator's key.
+    ///
+    /// For a simulated node that breaks the attempt rule and only that rule:
+    /// rewriting an honest ticket's attempt would also break its proof, which
+    /// is signed over the attempt.
+    pub fn generate_ticket_at(
+        &self,
+        ctx: &TicketCtx,
+        author: usize,
+        attempt: jam_types::TicketAttempt,
+    ) -> Result<Option<EmulatedTicket>, ChainError> {
+        Ok(self
+            .sign_tickets(ctx, author, std::iter::once(attempt))?
+            .pop())
+    }
+
+    fn sign_tickets(
+        &self,
+        ctx: &TicketCtx,
+        author: usize,
+        attempts: impl Iterator<Item = jam_types::TicketAttempt>,
+    ) -> Result<Vec<EmulatedTicket>, ChainError> {
         let pks: Vec<bandersnatch::Public> =
             ctx.pks.iter().map(|p| bandersnatch::Public(*p)).collect();
         let Some(pk) = pks.get(author).copied() else {
@@ -183,7 +211,7 @@ impl RefChain {
         }
         let prover = ring_vrf::RingContext::prover(&pks, author);
         let mut tickets = Vec::new();
-        for attempt in 0..jam_types::tickets_per_validator(jam_types::max_val_count()) {
+        for attempt in attempts {
             let message = bandersnatch::Message::TicketSeal(Entropy(ctx.entropy), attempt);
             let signature = keystore
                 .bandersnatch_ring_sign(&pk, &message, &[], &prover)

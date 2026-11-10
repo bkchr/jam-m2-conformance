@@ -35,9 +35,13 @@ pub struct MockNetwork {
 
 #[derive(Debug, Default)]
 struct Net {
-    bound: HashMap<SocketAddr, mpsc::UnboundedSender<MockIncoming>>,
+    /// Each address's listener, tagged with the id of the bind that made it.
+    bound: HashMap<SocketAddr, (u64, mpsc::UnboundedSender<MockIncoming>)>,
     /// Hands out ports for binds that asked for "any".
     next_port: u16,
+    /// Tags each bind, so closing a listener cannot unbind a later one that
+    /// took over its address.
+    next_listener: u64,
 }
 
 impl MockNetwork {
@@ -65,7 +69,7 @@ impl Transport for MockNetwork {
         addr: SocketAddr,
     ) -> Result<Box<dyn Listener>, EndpointError> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let addr = {
+        let (addr, id) = {
             let mut net = self.inner.lock().expect("mock network");
             // Port 0 means "any". The counter starts high enough not to
             // collide with a port a caller named.
@@ -81,11 +85,14 @@ impl Transport for MockNetwork {
                     format!("{addr} is already bound on this mock network"),
                 )));
             }
-            net.bound.insert(addr, tx);
-            addr
+            let id = net.next_listener;
+            net.next_listener += 1;
+            net.bound.insert(addr, (id, tx));
+            (addr, id)
         };
         Ok(Box::new(MockListener {
             addr,
+            id,
             incoming: tokio::sync::Mutex::new(rx),
             net: self.clone(),
         }))
@@ -100,7 +107,7 @@ impl Transport for MockNetwork {
     ) -> Result<Conn, EndpointError> {
         let listener = {
             let net = self.inner.lock().expect("mock network");
-            net.bound.get(&addr).cloned()
+            net.bound.get(&addr).map(|(_, tx)| tx.clone())
         };
         let Some(listener) = listener else {
             return Err(EndpointError::Io(io::Error::new(
@@ -127,6 +134,8 @@ impl Transport for MockNetwork {
 #[derive(Debug)]
 struct MockListener {
     addr: SocketAddr,
+    /// Which bind this is; see [`Net::next_listener`].
+    id: u64,
     incoming: tokio::sync::Mutex<mpsc::UnboundedReceiver<MockIncoming>>,
     net: MockNetwork,
 }
@@ -143,13 +152,17 @@ impl Listener for MockListener {
     }
 
     fn close(&self) {
-        // Dropping the sender refuses later dials and wakes `accept`.
-        self.net
-            .inner
-            .lock()
-            .expect("mock network")
+        // Dropping the sender refuses later dials and wakes `accept`. Only
+        // while the address is still ours: this runs again on drop, by which
+        // time another listener may have bound it.
+        let mut net = self.net.inner.lock().expect("mock network");
+        if net
             .bound
-            .remove(&self.addr);
+            .get(&self.addr)
+            .is_some_and(|(id, _)| *id == self.id)
+        {
+            net.bound.remove(&self.addr);
+        }
     }
 }
 
@@ -303,8 +316,37 @@ impl SendStream for MockSend {
     }
 }
 
+/// Dropped without a finish or a reset, the stream ends cleanly, as quinn
+/// 0.11 finishes a dropped `SendStream`. Without this a reader on the other
+/// side would wait forever where over QUIC it sees the end.
+impl Drop for MockSend {
+    fn drop(&mut self) {
+        let mut state = self.pipe.state.lock().expect("mock pipe");
+        if state.fin || state.reset.is_some() {
+            return;
+        }
+        state.fin = true;
+        drop(state);
+        self.pipe.wake.notify_waiters();
+    }
+}
+
 struct MockRecv {
     pipe: Arc<Pipe>,
+}
+
+/// Dropped before the stream ended, it asks the writer to stop with code 0,
+/// as quinn does for a dropped `RecvStream`.
+impl Drop for MockRecv {
+    fn drop(&mut self) {
+        let mut state = self.pipe.state.lock().expect("mock pipe");
+        if state.fin || state.reset.is_some() || state.stopped.is_some() {
+            return;
+        }
+        state.stopped = Some(0);
+        drop(state);
+        self.pipe.wake.notify_waiters();
+    }
 }
 
 #[async_trait]
@@ -535,6 +577,67 @@ mod tests {
             .connect(config(), key(), "peer".to_string(), bound)
             .await
             .is_err());
+    }
+
+    /// A send half dropped without finishing ends the stream for the reader
+    /// instead of leaving it parked, as over QUIC.
+    #[tokio::test]
+    async fn a_dropped_send_half_reads_as_a_clean_end() {
+        let net = MockNetwork::new();
+        let (_listener, dialer, accepted) = connected(&net, addr(4007)).await;
+
+        let (mut send, _recv) = dialer.open_bi().await.expect("the dialer opens");
+        send.write_all(b"partial").await.expect("it lands");
+        let (_peer_send, mut peer_recv) = accepted.accept_bi().await.expect("the peer accepts");
+        drop(send);
+
+        let mut buf = [0u8; 16];
+        let n = peer_recv
+            .read(&mut buf)
+            .await
+            .expect("a read")
+            .expect("bytes");
+        assert_eq!(&buf[..n], b"partial");
+        assert!(
+            peer_recv.read(&mut buf).await.expect("a read").is_none(),
+            "a dropped send half ends the stream"
+        );
+    }
+
+    /// A receive half dropped early tells the writer to stop, as quinn's
+    /// STOP_SENDING on drop does.
+    #[tokio::test]
+    async fn a_dropped_recv_half_stops_the_writer() {
+        let net = MockNetwork::new();
+        let (_listener, dialer, accepted) = connected(&net, addr(4008)).await;
+
+        let (mut send, _recv) = dialer.open_bi().await.expect("the dialer opens");
+        send.write_all(b"first").await.expect("it lands");
+        let (_peer_send, peer_recv) = accepted.accept_bi().await.expect("the peer accepts");
+        drop(peer_recv);
+        assert!(send.write_all(b"second").await.is_err());
+    }
+
+    /// Dropping a listener that was already closed must not unbind the one
+    /// that has bound its address since.
+    #[tokio::test]
+    async fn dropping_a_closed_listener_leaves_its_successor_bound() {
+        let net = MockNetwork::new();
+        let first = net
+            .listen(config(), key(), addr(4009))
+            .await
+            .expect("the mock binds");
+        first.close();
+        let second = net
+            .listen(config(), key(), addr(4009))
+            .await
+            .expect("the address is free again");
+        drop(first);
+        assert!(net.is_bound(second.local_addr()));
+        assert!(net
+            .connect(config(), key(), "peer".to_string(), second.local_addr())
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
