@@ -44,7 +44,7 @@ has no `finality lagging` at all.
 | Milestone | Lanes | Coverage | Status |
 |---|---|---|---|
 | **M2-A** — Foundations live | N0, N1 | 6 / 41 | ✅ **complete** — §1 |
-| **M2-B** — Self-tested | N2 | 8 / 41 | ⚠️ **partial** — the N2 lane is complete; the self-test mechanism exists and has proven 22 of the 75 check rows, across N0, N1 and N2. See below |
+| **M2-B** — Self-tested | N2 | 8 / 41 | ⚠️ **partial** — the N2 lane is complete; the self-test mechanism exists and has proven 24 of the 75 check rows, across N0, N1 and N2. See below |
 | **M2-C** — Guaranteeing | N3 | 21 / 41 | ⏳ not started |
 | **M2-D** — Availability | N4 | 30 / 41 | ⏳ not started |
 | **M2-E** — Audit & preimages | N5, N6 | 41 / 41 | ⏳ not started |
@@ -69,10 +69,10 @@ machinery exists — an in-process transport, a virtual clock and `m2-sim`, a no
 stand-in that can be broken in one named way at a time — and the first five check rows have
 been proven: each is shown to pass against an honest simulated node and to *fail, present in
 the report*, against one that gets exactly that thing wrong (`crates/m2-sim/tests/n0_sim_it.rs`,
-which grades six nodes in 0.07 s). That is 22 of the 75 rows across N0, N1 and N2 — five in N0,
-one in N1 on a block the simulated node authored itself, and sixteen in N2, on tickets it won
+which grades six nodes in 0.07 s). That is 24 of the 75 rows across N0, N1 and N2 — five in N0,
+one in N1 on a block the simulated node authored itself, and eighteen in N2, on tickets it won
 in a real lottery, on tickets the harness delivered to it, on what it then put in its own
-blocks, and on when and how long it went on forwarding. §4.2 lists the other 53 and what each
+blocks, and on when and how long it went on forwarding. §4.2 lists the other 51 and what each
 one needs.
 
 The distinction this closes is not pedantic. Two of the four hard failures ever observed were
@@ -492,7 +492,7 @@ coverage beyond its own 6 / 41.
 - **Messages asserted: 8 of 41.** UP 0, CE 128, CE 129, CE 131, CE 132. Lanes N3–N7
   (guaranteeing, availability, auditing/disputes, preimages, adversarial) are designed in
   DESIGN §11 and not implemented.
-- **Self-testing works, on 22 of the 75 check rows.** M2-B's criterion is *transport and clock
+- **Self-testing works, on 24 of the 75 check rows.** M2-B's criterion is *transport and clock
   injectable, QUIC behaviour unchanged*, and all three pieces are built: `jamnp_s::transport`
   with a QUIC carrier and an in-process mock, `jamnp_s::clock` with the machine's clock and a
   virtual one, and `m2-sim`, a node-shaped stand-in that can be broken one named way at a time
@@ -500,7 +500,7 @@ coverage beyond its own 6 / 41.
   build. The stand-in authors blocks and runs the Safrole lottery, so N1 and N2's generation
   side can grade it, and it takes delivery of tickets, refuses what it cannot act on and
   forwards what it is proxy for, and includes what it received in the blocks it authors. What
-  is missing is coverage: 53 rows have still never been shown to be capable of failing. §4.1 has
+  is missing is coverage: 51 rows have still never been shown to be capable of failing. §4.1 has
   the shape of the work and §4.2 lists the rows.
 - **Negative testing exists in N2 only.** N2 injects its whole Faults column — bad proof, wrong
   proxy, wrong epoch, late, duplicate, plus an over-cap attempt DESIGN does not list — and gates
@@ -601,9 +601,9 @@ defect the lanes' own controls were added to prevent. The test's own negative co
 by hand: pointing a row at the honest node makes it fail with `must make
 nut_reannounces_learned_block fail; it reported Some(Pass)`.
 
-What is left of M2-B is coverage, not mechanism: 53 rows unproven, listed in §4.2.
+What is left of M2-B is coverage, not mechanism: 51 rows unproven, listed in §4.2.
 
-### 4.2 What each check row's evidence is, and the 53 without a faulty client
+### 4.2 What each check row's evidence is, and the 51 without a faulty client
 
 *Counted 2026-11-09 from `m2-scenario/src/scenarios/{n0,n1,n2}.rs`, excluding test code.* The
 lanes report **75 rows**. "Unproven" below means *unproven end to end by a faulty client*,
@@ -614,7 +614,7 @@ and they are not interchangeable:
 |---|---|---|
 | a lane unit test asserts the row failing | 56 | the **predicate** is right, against a fabricated context |
 | the row has failed in a live run | 11 | the predicate *and* the pipeline that fed it, for one shape of failure |
-| a faulty simulated client makes it fail | 22 | predicate and pipeline, for a failure chosen on purpose |
+| a faulty simulated client makes it fail | 24 | predicate and pipeline, for a failure chosen on purpose |
 
 The difference between the first grade and the others is the whole point of M2-B. A unit test
 hands the check a context built by hand; it cannot catch a context *builder* that never
@@ -629,7 +629,8 @@ N1: `n1_timing_within_slot`. N2: `n2_gen_ce131_observed`, `n2_gen_epoch_target`,
 `n2_self_proxy_proof_verified`, `n2_proxy_duty_forwarded`,
 `n2_proxy_duty_bad_proof_ignored`, `n2_unknown_epoch_reset_observed`,
 `n2_inclusion_covers_valid`, `n2_forward_stops_at_finality`,
-`n2_proxy_forward_after_arrival`, `n2_forward_repeat_control_absent`.
+`n2_proxy_forward_after_arrival`, `n2_forward_repeat_control_absent`,
+`n2_fault_not_forwarded`, `n2_fault_not_included`.
 
 The last of those is a *control* row, and it counts: a node that never repeats a forward is
 what makes it fire, so it is caused by node behaviour and is now shown to happen. Most of the
@@ -726,7 +727,7 @@ either a way to author a *validly sealed* block that is nonetheless wrong — wh
 engine can do for the parent case, by authoring on an older head — or acceptance that some rows
 can only be shown to fail in company.
 
-**N2 — 19 unproven of 35.** Sixteen are proven. Nine on the generation side
+**N2 — 17 unproven of 35.** Eighteen are proven. Nine on the generation side
 (`crates/m2-sim/tests/n2_sim_it.rs`): the simulated node runs a real Safrole lottery -- ring
 signatures over its own key, from its own chain's entropy -- and distributes what it wins, CE
 131 to the proxy its id names and CE 132 to everyone for the ones it proxies itself. The facts
@@ -744,14 +745,13 @@ validators and `n2_self_proxy_ce132_all_peers` is never produced, so the fault f
 have been proven. That is the same not-exercised trap the lane's own controls guard against,
 met from the other side.
 
-Still unproven (19): `n2_gen_proof_unjudged`, `n2_gen_within_attempts_per_epoch`,
+Still unproven (17): `n2_gen_proof_unjudged`, `n2_gen_within_attempts_per_epoch`,
 `n2_self_proxy_none`, `n2_self_proxy_proof_unjudged`, `n2_proxy_duty_ticket_delivered`,
 `n2_proxy_duty_delivered_in_time`, `n2_forward_finality_control_absent`,
 `n2_inclusion_every_ticket_delivered`, `n2_inclusion_no_block_in_epoch`,
 `n2_inclusion_control_absent`, `n2_inclusion_empty_at_tail`, `n2_inclusion_sorted_dedup`,
 `n2_inclusion_no_extra`, `n2_unknown_epoch_probed`, `n2_fault_injected`,
-`n2_fault_forward_control_absent`, `n2_fault_not_forwarded`,
-`n2_fault_inclusion_control_absent`, `n2_fault_not_included`.
+`n2_fault_forward_control_absent`, `n2_fault_inclusion_control_absent`.
 
 The receiving half exists too (`crates/m2-sim/tests/n2_proxy_sim_it.rs`): the harness delivers
 tickets to the node, the node refuses what it cannot act on by resetting the stream -- a forged
@@ -795,12 +795,15 @@ Getting there needed three corrections that are worth not repeating:
   version of the test re-planned every epoch and graded an epoch whose tickets had gone out an
   epoch earlier.
 
-**`n2_inclusion_no_extra` is not provable with this stand-in**, and the test records why rather
-than leaving a gap: the authoring engine pools its *own* lottery tickets independently of
-anything the simulated node distributes, so its blocks carry ids the harness has no account of
-and the row fails on a node that is behaving correctly. Announcing exactly those would mean
-reading the engine's pool, which `hazmat` does not expose. An `#[ignore]`d test holds the shape
-of the problem and will fail if that ever changes.
+**`n2_inclusion_no_extra` was recorded as unprovable here. That was wrong**, and the correction
+is worth more than the claim was. The blame fell on the authoring engine pooling its own lottery
+tickets; the real cause was the simulated node pooling tickets it should have refused -- one
+misrouted to it over CE 131, and one over the per-validator attempt cap. Both are rules DESIGN
+§11 N2 states and the node did not implement. With them in, the honest node passes the row.
+
+No fault makes it fail yet: the node's blocks carry only what it was sent, so planting an
+unaccounted id means getting one into the authoring pool that the harness has no record of, and
+withholding one of the node's own winnings does not do it -- the engine does not pool them.
 
 **A caveat on what "proving" a row means here.** Thirteen of the 70 are *not* assertions about
 the node: they report that a run did not exercise something (`n2_fault_injected`,

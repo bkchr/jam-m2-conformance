@@ -233,11 +233,23 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         tickets_per_validator: jam_types::tickets_per_validator(jam_types::max_val_count()),
         max_tickets_per_block: jam_types::max_tickets_per_block(),
     };
-    let rows = [n2::n2_inclusion(&ctx)]
-        .into_iter()
-        .flat_map(|check| (check.run)(&m2_scenario::dsl::ObsLog::new()))
-        .map(|row| (row.name, row.outcome))
-        .collect();
+    for r in
+        (m2_scenario::scenarios::n2::n2_fault_handling(&ctx).run)(&m2_scenario::dsl::ObsLog::new())
+    {
+        if r.name == "n2_fault_not_included" && r.outcome != Outcome::Pass {
+            eprintln!("  {fault:?} :: {:?}", r.detail);
+        }
+    }
+    let rows = [
+        n2::n2_inclusion(&ctx),
+        // `plan_tickets` injects the Faults column itself, so the same blocks
+        // answer whether the node kept a broken ticket out of them.
+        n2::n2_fault_handling(&ctx),
+    ]
+    .into_iter()
+    .flat_map(|check| (check.run)(&m2_scenario::dsl::ObsLog::new()))
+    .map(|row| (row.name, row.outcome))
+    .collect();
 
     dialing.abort();
     accepting.abort();
@@ -275,28 +287,36 @@ async fn the_inclusion_checks_catch_a_node_that_mishandles_its_extrinsic() {
         outcomes_of(&honest, "n2_inclusion_covers_valid")
     );
 
-    // `n2_inclusion_no_extra` is **not** provable with this stand-in, and the
-    // reason is worth recording rather than leaving as a gap.
-    //
-    // The row asks that a block carry nothing the node was neither sent nor
-    // announced. The authoring engine runs the Safrole lottery for its own
-    // keystore and pools the result itself, independently of anything the
-    // simulated node chooses to distribute -- so its blocks carry tickets of its
-    // own whose ids the harness has no account of, and the row fails on a node
-    // that is behaving correctly. Making the node announce exactly those would
-    // mean reading the engine's own pool, which `hazmat` does not expose.
-    //
-    // This holds the shape of the problem so it is not rediscovered: the
-    // honest node *does* fail the row, on one block out of six.
-    //
-    // Checked here rather than in a test of its own: the clock is installed
-    // once per process, so a second test in this binary would run on the
-    // machine's clock or make this one's install fail.
+    // `n2_inclusion_no_extra` was recorded as unprovable here, blamed on the
+    // authoring engine pooling its own lottery tickets. That was wrong. The
+    // node was pooling tickets it should have refused -- one misrouted to it
+    // over CE 131, and one over the attempt cap -- and those were the ids the
+    // harness could not account for. With both refused the row passes, and a
+    // node that pools a ticket nobody sent it is what makes it fail.
     assert!(
-        failed(&honest, "n2_inclusion_no_extra"),
-        "if this ever passes, the engine stopped pooling its own tickets and the row \
-         became provable: {:?}",
+        passed(&honest, "n2_inclusion_no_extra"),
+        "the honest node must carry nothing it was not sent; it reported {:?}",
         outcomes_of(&honest, "n2_inclusion_no_extra")
+    );
+    // No fault here makes it fail yet. The node's blocks carry only what it
+    // was sent, so planting an unaccounted id means getting one into the
+    // authoring pool that the harness has no record of -- and withholding one
+    // of the node's own winnings does not do it, because the engine does not
+    // pool them in the first place.
+
+    assert!(
+        passed(&honest, "n2_fault_not_included"),
+        "the honest node must keep a broken ticket out of its block; it reported {:?}",
+        outcomes_of(&honest, "n2_fault_not_included")
+    );
+
+    // Accepting a forgery is also pooling it, and a block of the node's own
+    // then carries a ticket the harness deliberately broke.
+    let forged = grade(SimFault::AcceptsBadProof).await;
+    assert!(
+        failed(&forged, "n2_fault_not_included"),
+        "a node that pools the forgery must fail the inclusion prohibition; it reported {:?}",
+        outcomes_of(&forged, "n2_fault_not_included")
     );
 
     let omitted = grade(SimFault::OmitsDeliveredTickets).await;

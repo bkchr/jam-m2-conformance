@@ -530,6 +530,15 @@ impl SimNode {
             send.reset(TICKET_REFUSED_CODE);
             return;
         }
+        // At or above the per-validator cap there is no lawful attempt index,
+        // so the proof cannot belong to this epoch's lottery however well it
+        // verifies. polkajam refuses these too ("bad ticket attempt value").
+        if distribution.ticket.attempt
+            >= jam_types::tickets_per_validator(jam_types::max_val_count())
+        {
+            send.reset(TICKET_REFUSED_CODE);
+            return;
+        }
         let verifies = self
             .chain
             .ticket_ctx()
@@ -542,6 +551,16 @@ impl SimNode {
             })
             .unwrap_or(false);
         if !verifies && self.fault != SimFault::AcceptsBadProof {
+            send.reset(TICKET_REFUSED_CODE);
+            return;
+        }
+        // A CE 131 arrival is a ticket sent to this node *as proxy*, so one
+        // the proxy rule names another validator for was misrouted: refuse it
+        // rather than pass it on or carry it. A CE 132 arrival is a broadcast
+        // and belongs to no proxy, so it is kept whoever it names.
+        let id = ticket_id(&distribution.ticket.proof);
+        let proxies_here = proxy_index(&id, usize::from(jam_types::max_val_count())) == self.index;
+        if kind == CE131 && !proxies_here {
             send.reset(TICKET_REFUSED_CODE);
             return;
         }
@@ -558,10 +577,6 @@ impl SimNode {
         // Only a CE 131 arrival is this node's to pass on: a CE 132 one is
         // already a broadcast.
         if kind != CE131 || self.fault == SimFault::NeverForwards {
-            return;
-        }
-        let id = ticket_id(&distribution.ticket.proof);
-        if proxy_index(&id, usize::from(jam_types::max_val_count())) != self.index {
             return;
         }
         self.forwarded
