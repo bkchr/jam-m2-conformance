@@ -2,8 +2,6 @@
 //! authoring harness, authoring blocks for every emulated validator and
 //! skipping the NUT's slots.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
 use jam_node::hazmat::SecretKeysets;
 use jam_std_common::{Block, SecretKeyset};
 use jam_types::{FixedVec, HeaderHash};
@@ -51,14 +49,6 @@ pub fn slot_start_ms(slot: u32) -> u64 {
 pub fn current_epoch_start_slot() -> u32 {
     let now = wall_clock_slot();
     now - (now % jam_types::epoch_period())
-}
-
-/// Wall-clock instant at which `slot` begins.
-///
-/// Used to pace authoring on slot boundaries rather than by sleeping a slot
-/// period at a time, which would drift by the cost of each round over a run.
-pub fn slot_start(slot: u32) -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(jam_types::JAM_COMMON_ERA + slot as u64 * SLOT_PERIOD_SEC)
 }
 
 /// The keyset handed to the NUT's slot in the harness keystore.
@@ -286,6 +276,8 @@ impl RefChain {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use std::collections::HashSet;
 
     use super::*;
