@@ -27,7 +27,9 @@ use ed25519_consensus::SigningKey;
 use jam_std_common::{bandersnatch::ring_vrf, Block, Extrinsic, TicketEnvelope};
 use jam_types::{Decode, Encode, HeaderHash};
 use jamnp_s::clock;
-use jamnp_s::codec::ce128_129::{BlockRequest, BlockResponse, Direction, StateRequest};
+use jamnp_s::codec::ce128_129::{
+    BlockRequest, BlockResponse, BoundaryNode, Direction, KeyValue, StateRequest, StateResponse,
+};
 use jamnp_s::codec::ce131_136::{Ticket, TicketDistribution};
 use jamnp_s::codec::up0::{Announcement, Final, Handshake};
 use jamnp_s::endpoint::{EndpointConfig, EndpointError};
@@ -99,6 +101,23 @@ pub enum SimFault {
     /// Forward a ticket again after a block of this node's own carried it and
     /// was announced as final.
     ReForwardsAfterFinality,
+    /// Return more blocks than the request's `max_blocks` allows.
+    Ce128OverMax,
+    /// Finish the CE 128 stream in the middle of a frame.
+    ///
+    /// Not "never FIN": the probe has no timeout, so a node that holds the
+    /// stream open produces no probe at all and the row is never reported. A
+    /// dirty close is the reachable defect -- the complete response still
+    /// decodes, and only the end of the stream is wrong.
+    Ce128DirtyClose,
+    /// Return CE 129 keys out of ascending order.
+    Ce129UnsortedKeys,
+    /// Return boundary nodes with a child before its parent.
+    Ce129ChildBeforeParent,
+    /// Return more key/value bytes than the request's `max_size` allows.
+    Ce129OverSize,
+    /// Refuse a CE 129 request by resetting its stream.
+    Ce129Refuses,
     /// Serve a block whose extrinsic carries the same ticket twice.
     ///
     /// The body is rewritten after authoring, so the header -- and therefore
@@ -234,6 +253,59 @@ impl SimNode {
             return;
         }
         let _ = self.announce.send(wire);
+    }
+
+    /// The state slice this node answers CE 129 with.
+    ///
+    /// The reference chain exports no state, so an honest answer is empty --
+    /// and an empty answer satisfies every content rule vacuously. These
+    /// faults supply content that breaks exactly one of them.
+    fn state_response(&self, request: &StateRequest) -> StateResponse {
+        let in_range = |n: u8| {
+            let mut key = request.start;
+            key[30] = key[30].saturating_add(n);
+            key
+        };
+        match self.fault {
+            SimFault::Ce129UnsortedKeys => StateResponse {
+                boundary_nodes: vec![],
+                entries: vec![
+                    KeyValue {
+                        key: in_range(2),
+                        value: vec![1],
+                    },
+                    KeyValue {
+                        key: in_range(1),
+                        value: vec![2],
+                    },
+                ],
+            },
+            SimFault::Ce129ChildBeforeParent => {
+                // A parent refers to a child by blake2b-256 of its 64 bytes
+                // with the top bit cleared -- that bit is the branch/leaf
+                // discriminator, not part of the hash. So the parent has to be
+                // built from the child's hash, and listed after it.
+                let child = [0x11u8; 64];
+                let digest = blake2b_simd::Params::new().hash_length(32).hash(&child);
+                let mut parent = [0u8; 64];
+                parent[..32].copy_from_slice(digest.as_bytes());
+                parent[0] &= 0b0111_1111;
+                StateResponse {
+                    boundary_nodes: vec![BoundaryNode(child), BoundaryNode(parent)],
+                    entries: vec![],
+                }
+            }
+            SimFault::Ce129OverSize => StateResponse {
+                boundary_nodes: vec![],
+                entries: (0..3)
+                    .map(|i| KeyValue {
+                        key: in_range(i),
+                        value: vec![0u8; request.max_size as usize],
+                    })
+                    .collect(),
+            },
+            _ => m2_emu::emu::serve_ce129(request),
+        }
     }
 
     /// Rewrite a block's extrinsic, for the two faults that need a body the
@@ -688,7 +760,23 @@ impl SimNode {
             // it asked for is there, so only the ordering rule can catch it.
             response.blocks.reverse();
         }
+        if self.fault == SimFault::Ce128OverMax {
+            // One past the cap the *request* named, which is the bound the row
+            // reads -- the chain is usually shorter than it, so serving one
+            // more block than it holds would not exceed anything. The last
+            // block is repeated rather than a new one invented, so only the
+            // count is wrong.
+            if let Some(last) = response.blocks.last().cloned() {
+                while response.blocks.len() as u32 <= request.max_blocks {
+                    response.blocks.push(last.clone());
+                }
+            }
+        }
         let _ = send.write_all(&frame_message(&response.encode())).await;
+        if self.fault == SimFault::Ce128DirtyClose {
+            // Two bytes of a four-byte length prefix, then FIN.
+            let _ = send.write_all(&[0xff, 0xff]).await;
+        }
         send.finish();
     }
 
@@ -700,7 +788,12 @@ impl SimNode {
         let Ok(request) = StateRequest::decode(&mut &content[..]) else {
             return;
         };
-        let (boundary, entries) = m2_emu::emu::serve_ce129(&request).messages();
+        if self.fault == SimFault::Ce129Refuses {
+            send.reset(TICKET_REFUSED_CODE);
+            return;
+        }
+        let response = self.state_response(&request);
+        let (boundary, entries) = response.messages();
         for message in [boundary, entries] {
             if send.write_all(&frame_message(&message)).await.is_err() {
                 return;

@@ -153,6 +153,19 @@ async fn the_n0_checks_catch_a_node_that_gets_one_thing_wrong() {
         "nut_reannounces_learned_block",
         "ce128_ascending_covers_reference",
         "ce128_ascending_ordered",
+        "ce128_respects_max",
+        "ce128_both_halves_fin",
+        // The reference chain exports no state, so an honest CE 129 answer is
+        // empty and these pass vacuously. The faults below supply content that
+        // breaks one rule each, which is what makes the rows mean anything.
+        "ce129_served",
+        "ce129_keys_sorted",
+        "ce129_boundary_parent_before_child",
+        "ce129_size_cap",
+        // Always passes: `probe.decoded` is true exactly when `probe.error` is
+        // none, and the row is only reported when it is -- so no response can
+        // fail it. Recorded in M2-status 4.2 beside `n2_self_proxy_none`.
+        "ce129_len_prefixed_values",
     ] {
         assert!(
             passed(&honest, row),
@@ -171,6 +184,15 @@ async fn the_n0_checks_catch_a_node_that_gets_one_thing_wrong() {
         (SimFault::NeverReannounces, "nut_reannounces_learned_block"),
         (SimFault::Ce128Descending, "ce128_ascending_ordered"),
         (SimFault::Ce128Silent, "ce128_ascending_covers_reference"),
+        (SimFault::Ce128OverMax, "ce128_respects_max"),
+        (SimFault::Ce128DirtyClose, "ce128_both_halves_fin"),
+        (SimFault::Ce129Refuses, "ce129_served"),
+        (SimFault::Ce129UnsortedKeys, "ce129_keys_sorted"),
+        (
+            SimFault::Ce129ChildBeforeParent,
+            "ce129_boundary_parent_before_child",
+        ),
+        (SimFault::Ce129OverSize, "ce129_size_cap"),
     ] {
         let rows = grade(&chain, fault).await;
         assert!(

@@ -2017,6 +2017,7 @@ dependencies = [
 name = "m2-sim"
 version = "0.1.0"
 dependencies = [
+ "blake2b_simd",
  "ed25519-consensus",
  "jam-std-common",
  "jam-types",
