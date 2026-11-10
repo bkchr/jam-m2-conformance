@@ -99,6 +99,13 @@ pub enum SimFault {
     /// Forward a ticket again after a block of this node's own carried it and
     /// was announced as final.
     ReForwardsAfterFinality,
+    /// Hold a proxied ticket until the lottery has shut, then forward it.
+    ///
+    /// The forward itself is well formed and goes to every validator; only
+    /// its slot is wrong. Nothing can act on a ticket distributed past
+    /// `epoch_tail_start`, so passing it on then is the proxy doing its duty
+    /// too late to be a duty.
+    ForwardsInTail,
     /// Take delivery of a ticket and never offer it to its own pool, so the
     /// block it authors leaves it out. Seals just as validly.
     OmitsDeliveredTickets,
@@ -326,6 +333,19 @@ impl SimNode {
         }
     }
 
+    /// Wait until the lottery has shut for this epoch, or the next one if it
+    /// already has.
+    async fn sleep_until_tail(&self) {
+        let period = jam_types::epoch_period();
+        let now = m2_reference::chain::wall_clock_slot();
+        let tail = now - now % period + jam_types::epoch_tail_start();
+        let tail = if tail <= now { tail + period } else { tail };
+        let target = m2_reference::chain::slot_start_ms(tail);
+        if let Some(wait) = target.checked_sub(clock::current().wall_ms()) {
+            clock::current().sleep(Duration::from_millis(wait)).await;
+        }
+    }
+
     /// CE 132: a self-proxied ticket goes to every current validator.
     async fn broadcast_ticket(self: &Arc<Self>, wire: &TicketDistribution) {
         let targets: Vec<u16> = {
@@ -548,6 +568,9 @@ impl SimNode {
             .lock()
             .expect("sim forwards")
             .push((id, distribution));
+        if self.fault == SimFault::ForwardsInTail {
+            self.sleep_until_tail().await;
+        }
         self.broadcast_ticket(&distribution).await;
         if self.fault == SimFault::RepeatsForwards {
             let node = Arc::clone(self);

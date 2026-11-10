@@ -101,9 +101,13 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
     node.connect_to(&transport, SigningKey::from([0x91u8; 32]), &peers)
         .await;
 
-    // Author and announce a few slots, so the node advertises a head the
-    // emulator's readiness gate accepts.
-    let start = harness_chain.next_slot() + 1;
+    // From an epoch boundary, so the submission window is whole. The clock is
+    // monotonic across every variant this test grades, so a run that started
+    // wherever the previous one left off would plan late in an epoch and have
+    // its deliveries withheld -- which reads as a node that was never sent
+    // anything rather than one that mishandled what it got.
+    let period = jam_types::epoch_period();
+    let start = (m2_reference::chain::wall_clock_slot() / period + 1) * period;
     for slot in start..start + WARMUP_SLOTS {
         at_slot(slot).await;
         if let Ok(Some(block)) = harness_chain.author_block(slot) {
@@ -181,9 +185,12 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
     }
     emu.set_ticket_plans(by_peer);
 
-    // Let the deliveries go out and the forwards come back.
+    // Long enough for the deliveries, the forwards, and a forward deliberately
+    // held back to the lottery's close -- which can be most of an epoch away.
     clock::current()
-        .sleep(Duration::from_millis(8 * slot_ms()))
+        .sleep(Duration::from_millis(
+            u64::from(jam_types::epoch_period() + 4) * slot_ms(),
+        ))
         .await;
 
     let deliveries = emu.deliveries();
@@ -268,6 +275,11 @@ async fn the_proxy_duty_checks_catch_a_node_that_mishandles_a_delivery() {
     );
 
     assert!(
+        passed(&honest, "n2_proxy_forward_after_arrival"),
+        "the honest node must forward inside the lottery; it reported {:?}",
+        outcomes_of(&honest, "n2_proxy_forward_after_arrival")
+    );
+    assert!(
         passed(&honest, "n2_unknown_epoch_reset_observed"),
         "the honest node must refuse a ticket for an epoch past its horizon; it \
          reported {:?}",
@@ -281,6 +293,7 @@ async fn the_proxy_duty_checks_catch_a_node_that_mishandles_a_delivery() {
             SimFault::AcceptsUnknownEpoch,
             "n2_unknown_epoch_reset_observed",
         ),
+        (SimFault::ForwardsInTail, "n2_proxy_forward_after_arrival"),
     ] {
         let rows = grade(fault).await;
         assert!(
