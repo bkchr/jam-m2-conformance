@@ -225,9 +225,19 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         &deliveries,
         Vec::new(),
     );
-    let seal: Vec<(&'static str, Outcome)> = (m2_scenario::scenarios::n1::n1_header_seal(&n1_ctx)
-        .run)(&m2_scenario::dsl::ObsLog::new())
+    use m2_scenario::scenarios::n1;
+    // The whole N1 lane on the same blocks: several N2 faults disturb it, and
+    // which ones is a fact worth holding rather than a comment.
+    let n1_rows: Vec<(&'static str, Outcome)> = [
+        n1::n1_timing(&n1_ctx),
+        n1::n1_parent(&n1_ctx),
+        n1::n1_header_seal(&n1_ctx),
+        n1::n1_state_root(&n1_ctx),
+        n1::n1_extrinsic_completeness(&n1_ctx),
+        n1::n1_skipped_slots(&n1_ctx),
+    ]
     .into_iter()
+    .flat_map(|c| (c.run)(&m2_scenario::dsl::ObsLog::new()))
     .map(|r| (r.name, r.outcome))
     .collect();
     let rows = [
@@ -239,7 +249,7 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
     .into_iter()
     .flat_map(|check| (check.run)(&m2_scenario::dsl::ObsLog::new()))
     .map(|row| (row.name, row.outcome))
-    .chain(seal)
+    .chain(n1_rows)
     .collect();
 
     dialing.abort();
@@ -272,6 +282,20 @@ async fn the_inclusion_checks_catch_a_node_that_mishandles_its_extrinsic() {
         .expect("nothing has read the clock yet");
 
     let honest = grade(SimFault::None).await;
+    for row in [
+        "n1_header_seal_import_ok",
+        "n1_parent_is_reference_best",
+        "n1_extrinsic_includes_delivered",
+        "n1_extrinsic_no_repeat",
+        "n1_extrinsic_empty_at_tail",
+        "n1_state_root_prior_matches",
+    ] {
+        assert!(
+            passed(&honest, row),
+            "the honest node must pass {row}; it reported {:?}",
+            outcomes_of(&honest, row)
+        );
+    }
     assert!(
         passed(&honest, "n2_inclusion_covers_valid"),
         "the honest node must carry the tickets it was sent; it reported {:?}",
@@ -335,7 +359,49 @@ async fn the_inclusion_checks_catch_a_node_that_mishandles_its_extrinsic() {
         outcomes_of(&in_tail, "n2_inclusion_empty_at_tail")
     );
 
+    // N1 on the same blocks. Only one of these is isolated; the rest fail in
+    // company with the seal row, because a rewritten body is the only way to
+    // produce the extrinsic they describe.
+    assert!(
+        failed(&in_tail, "n1_extrinsic_empty_at_tail")
+            && failed(&in_tail, "n1_header_seal_import_ok"),
+        "a tail block with a ticket fails N1's tail row, and the rewritten body fails \
+         the seal row with it: {:?} / {:?}",
+        outcomes_of(&in_tail, "n1_extrinsic_empty_at_tail"),
+        outcomes_of(&in_tail, "n1_header_seal_import_ok")
+    );
+    assert!(
+        failed(&in_tail, "n1_extrinsic_no_repeat"),
+        "and the tail block repeats a ticket an earlier one carried; it reported {:?}",
+        outcomes_of(&in_tail, "n1_extrinsic_no_repeat")
+    );
+    assert!(
+        failed(&duplicated, "n1_header_seal_import_ok"),
+        "the duplicate-ticket body must fail the seal row too, which is the company \
+         these rows keep; it reported {:?}",
+        outcomes_of(&duplicated, "n1_header_seal_import_ok")
+    );
+
     let omitted = grade(SimFault::OmitsDeliveredTickets).await;
+    // Isolated, and the only N1 row that is: leaving a delivered ticket out of
+    // the block touches nothing else.
+    assert!(
+        failed(&omitted, "n1_extrinsic_includes_delivered"),
+        "a node that pools nothing must fail N1's completeness row; it reported {:?}",
+        outcomes_of(&omitted, "n1_extrinsic_includes_delivered")
+    );
+    for row in [
+        "n1_header_seal_import_ok",
+        "n1_parent_is_reference_best",
+        "n1_extrinsic_no_repeat",
+        "n1_extrinsic_empty_at_tail",
+    ] {
+        assert!(
+            passed(&omitted, row),
+            "omitting a ticket must not disturb {row}; it reported {:?}",
+            outcomes_of(&omitted, row)
+        );
+    }
     assert!(
         failed(&omitted, "n2_inclusion_covers_valid"),
         "a node that pools nothing must fail the coverage row; it reported {:?}",
