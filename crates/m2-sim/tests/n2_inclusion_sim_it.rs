@@ -204,23 +204,7 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
     let ctx = N2Ctx {
         target_epoch,
         epoch_start_slot: target_epoch * period,
-        emu_plan: {
-            let p = plan_emu_tickets(&plan, &ticket_ctx.expect("a context"), &deliveries);
-            eprintln!(
-                "PLAN {fault:?}: {} entries, delivered {}, valid {}, epochs {:?}, blocks {:?}",
-                p.len(),
-                p.iter().filter(|t| t.delivered_at_ms.is_some()).count(),
-                p.iter().filter(|t| t.valid).count(),
-                p.iter()
-                    .map(|t| t.target_epoch)
-                    .collect::<std::collections::BTreeSet<_>>(),
-                blocks
-                    .iter()
-                    .map(|b| (b.slot, b.ticket_ids.len()))
-                    .collect::<Vec<_>>(),
-            );
-            p
-        },
+        emu_plan: plan_emu_tickets(&plan, &ticket_ctx.expect("a context"), &deliveries),
         nut_tickets: Vec::new(),
         nut_blocks: blocks,
         nut_finals: Vec::new(),
@@ -233,11 +217,40 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         tickets_per_validator: jam_types::tickets_per_validator(jam_types::max_val_count()),
         max_tickets_per_block: jam_types::max_tickets_per_block(),
     };
-    let rows = [n2::n2_inclusion(&ctx)]
-        .into_iter()
-        .flat_map(|check| (check.run)(&m2_scenario::dsl::ObsLog::new()))
-        .map(|row| (row.name, row.outcome))
-        .collect();
+    // N1's seal row on the same blocks, so the coupling a rewritten body
+    // creates is measured rather than asserted in a comment.
+    let n1_ctx = m2_runner::real::build_n1_ctx(
+        &harness_chain,
+        &nut_blocks.lock().expect("the NUT blocks"),
+        &deliveries,
+        Vec::new(),
+    );
+    use m2_scenario::scenarios::n1;
+    // The whole N1 lane on the same blocks: several N2 faults disturb it, and
+    // which ones is a fact worth holding rather than a comment.
+    let n1_rows: Vec<(&'static str, Outcome)> = [
+        n1::n1_timing(&n1_ctx),
+        n1::n1_parent(&n1_ctx),
+        n1::n1_header_seal(&n1_ctx),
+        n1::n1_state_root(&n1_ctx),
+        n1::n1_extrinsic_completeness(&n1_ctx),
+        n1::n1_skipped_slots(&n1_ctx),
+    ]
+    .into_iter()
+    .flat_map(|c| (c.run)(&m2_scenario::dsl::ObsLog::new()))
+    .map(|r| (r.name, r.outcome))
+    .collect();
+    let rows = [
+        n2::n2_inclusion(&ctx),
+        // `plan_tickets` injects the Faults column itself, so the same blocks
+        // answer whether the node kept a broken ticket out of them.
+        n2::n2_fault_handling(&ctx),
+    ]
+    .into_iter()
+    .flat_map(|check| (check.run)(&m2_scenario::dsl::ObsLog::new()))
+    .map(|row| (row.name, row.outcome))
+    .chain(n1_rows)
+    .collect();
 
     dialing.abort();
     accepting.abort();
@@ -269,37 +282,126 @@ async fn the_inclusion_checks_catch_a_node_that_mishandles_its_extrinsic() {
         .expect("nothing has read the clock yet");
 
     let honest = grade(SimFault::None).await;
+    for row in [
+        "n1_header_seal_import_ok",
+        "n1_parent_is_reference_best",
+        "n1_extrinsic_includes_delivered",
+        "n1_extrinsic_no_repeat",
+        "n1_extrinsic_empty_at_tail",
+        "n1_state_root_prior_matches",
+    ] {
+        assert!(
+            passed(&honest, row),
+            "the honest node must pass {row}; it reported {:?}",
+            outcomes_of(&honest, row)
+        );
+    }
     assert!(
         passed(&honest, "n2_inclusion_covers_valid"),
         "the honest node must carry the tickets it was sent; it reported {:?}",
         outcomes_of(&honest, "n2_inclusion_covers_valid")
     );
 
-    // `n2_inclusion_no_extra` is **not** provable with this stand-in, and the
-    // reason is worth recording rather than leaving as a gap.
-    //
-    // The row asks that a block carry nothing the node was neither sent nor
-    // announced. The authoring engine runs the Safrole lottery for its own
-    // keystore and pools the result itself, independently of anything the
-    // simulated node chooses to distribute -- so its blocks carry tickets of its
-    // own whose ids the harness has no account of, and the row fails on a node
-    // that is behaving correctly. Making the node announce exactly those would
-    // mean reading the engine's own pool, which `hazmat` does not expose.
-    //
-    // This holds the shape of the problem so it is not rediscovered: the
-    // honest node *does* fail the row, on one block out of six.
-    //
-    // Checked here rather than in a test of its own: the clock is installed
-    // once per process, so a second test in this binary would run on the
-    // machine's clock or make this one's install fail.
+    // `n2_inclusion_no_extra` was recorded as unprovable here, blamed on the
+    // authoring engine pooling its own lottery tickets. That was wrong. The
+    // node was pooling tickets it should have refused -- one misrouted to it
+    // over CE 131, and one over the attempt cap -- and those were the ids the
+    // harness could not account for. With both refused the row passes, and a
+    // node that pools a ticket nobody sent it is what makes it fail.
     assert!(
-        failed(&honest, "n2_inclusion_no_extra"),
-        "if this ever passes, the engine stopped pooling its own tickets and the row \
-         became provable: {:?}",
+        passed(&honest, "n2_inclusion_no_extra"),
+        "the honest node must carry nothing it was not sent; it reported {:?}",
         outcomes_of(&honest, "n2_inclusion_no_extra")
+    );
+    // No fault here makes it fail yet. The node's blocks carry only what it
+    // was sent, so planting an unaccounted id means getting one into the
+    // authoring pool that the harness has no record of -- and withholding one
+    // of the node's own winnings does not do it, because the engine does not
+    // pool them in the first place.
+
+    assert!(
+        passed(&honest, "n2_fault_not_included"),
+        "the honest node must keep a broken ticket out of its block; it reported {:?}",
+        outcomes_of(&honest, "n2_fault_not_included")
+    );
+
+    // Accepting a forgery is also pooling it, and a block of the node's own
+    // then carries a ticket the harness deliberately broke.
+    let forged = grade(SimFault::AcceptsBadProof).await;
+    assert!(
+        failed(&forged, "n2_fault_not_included"),
+        "a node that pools the forgery must fail the inclusion prohibition; it reported {:?}",
+        outcomes_of(&forged, "n2_fault_not_included")
+    );
+
+    // Two rows the authoring engine cannot be made to break: its pool
+    // rejects duplicates and orders by id, and past the tail it offers no
+    // tickets at all. Reaching them means rewriting the body the node serves,
+    // which also breaks N1's seal row -- so these two fail in company, and the
+    // test says so rather than claiming an isolation it does not have.
+    for row in ["n2_inclusion_sorted_dedup", "n2_inclusion_empty_at_tail"] {
+        assert!(
+            passed(&honest, row),
+            "the honest node must pass {row}; it reported {:?}",
+            outcomes_of(&honest, row)
+        );
+    }
+    let duplicated = grade(SimFault::ServesDuplicateTicket).await;
+    assert!(
+        failed(&duplicated, "n2_inclusion_sorted_dedup"),
+        "a block carrying the same ticket twice must fail; it reported {:?}",
+        outcomes_of(&duplicated, "n2_inclusion_sorted_dedup")
+    );
+    let in_tail = grade(SimFault::ServesTicketsInTail).await;
+    assert!(
+        failed(&in_tail, "n2_inclusion_empty_at_tail"),
+        "a tail block carrying a ticket must fail; it reported {:?}",
+        outcomes_of(&in_tail, "n2_inclusion_empty_at_tail")
+    );
+
+    // N1 on the same blocks. Only one of these is isolated; the rest fail in
+    // company with the seal row, because a rewritten body is the only way to
+    // produce the extrinsic they describe.
+    assert!(
+        failed(&in_tail, "n1_extrinsic_empty_at_tail")
+            && failed(&in_tail, "n1_header_seal_import_ok"),
+        "a tail block with a ticket fails N1's tail row, and the rewritten body fails \
+         the seal row with it: {:?} / {:?}",
+        outcomes_of(&in_tail, "n1_extrinsic_empty_at_tail"),
+        outcomes_of(&in_tail, "n1_header_seal_import_ok")
+    );
+    assert!(
+        failed(&in_tail, "n1_extrinsic_no_repeat"),
+        "and the tail block repeats a ticket an earlier one carried; it reported {:?}",
+        outcomes_of(&in_tail, "n1_extrinsic_no_repeat")
+    );
+    assert!(
+        failed(&duplicated, "n1_header_seal_import_ok"),
+        "the duplicate-ticket body must fail the seal row too, which is the company \
+         these rows keep; it reported {:?}",
+        outcomes_of(&duplicated, "n1_header_seal_import_ok")
     );
 
     let omitted = grade(SimFault::OmitsDeliveredTickets).await;
+    // Isolated, and the only N1 row that is: leaving a delivered ticket out of
+    // the block touches nothing else.
+    assert!(
+        failed(&omitted, "n1_extrinsic_includes_delivered"),
+        "a node that pools nothing must fail N1's completeness row; it reported {:?}",
+        outcomes_of(&omitted, "n1_extrinsic_includes_delivered")
+    );
+    for row in [
+        "n1_header_seal_import_ok",
+        "n1_parent_is_reference_best",
+        "n1_extrinsic_no_repeat",
+        "n1_extrinsic_empty_at_tail",
+    ] {
+        assert!(
+            passed(&omitted, row),
+            "omitting a ticket must not disturb {row}; it reported {:?}",
+            outcomes_of(&omitted, row)
+        );
+    }
     assert!(
         failed(&omitted, "n2_inclusion_covers_valid"),
         "a node that pools nothing must fail the coverage row; it reported {:?}",

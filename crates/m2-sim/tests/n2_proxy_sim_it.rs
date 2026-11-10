@@ -18,7 +18,7 @@ use jamnp_s::clock::{self, VirtualClock};
 use jamnp_s::transport::mock::MockNetwork;
 use jamnp_s::transport::Transport;
 use m2_reference::chain::RefChain;
-use m2_reference::tickets::{plan_tickets, TicketDelivery, TicketFault};
+use m2_reference::tickets::plan_tickets;
 use m2_runner::real::plan_emu_tickets;
 use m2_scenario::ctx::N2Ctx;
 use m2_scenario::dsl::Outcome;
@@ -101,9 +101,13 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
     node.connect_to(&transport, SigningKey::from([0x91u8; 32]), &peers)
         .await;
 
-    // Author and announce a few slots, so the node advertises a head the
-    // emulator's readiness gate accepts.
-    let start = harness_chain.next_slot() + 1;
+    // From an epoch boundary, so the submission window is whole. The clock is
+    // monotonic across every variant this test grades, so a run that started
+    // wherever the previous one left off would plan late in an epoch and have
+    // its deliveries withheld -- which reads as a node that was never sent
+    // anything rather than one that mishandled what it got.
+    let period = jam_types::epoch_period();
+    let start = (m2_reference::chain::wall_clock_slot() / period + 1) * period;
     for slot in start..start + WARMUP_SLOTS {
         at_slot(slot).await;
         if let Ok(Some(block)) = harness_chain.author_block(slot) {
@@ -138,37 +142,18 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
     let now = m2_reference::chain::wall_clock_slot();
     let target_epoch = now / jam_types::epoch_period() + 1;
     let mut plan = plan_tickets(&tickets, NUT_INDEX, now + 1, target_epoch);
-    plan.retain(|s| s.delivery == TicketDelivery::Ce131);
     assert!(
         !plan.is_empty(),
         "the entropy must proxy at least one emulated ticket to the node"
     );
-    let forged = {
-        let mut forged = plan[0].clone();
-        // Past the first 32 bytes, so the id and therefore the proxy are
-        // unchanged and only the proof is wrong.
-        forged.ticket.proof[100] ^= 0xff;
-        forged.fault = Some(TicketFault::BadProof);
-        forged.slot = plan[0].slot + 1;
-        forged
-    };
-    plan.push(forged);
-    // A ticket for an epoch no validator can hold the entropy for yet
-    // (`simple.md:335-337`). The node must refuse it by resetting the stream,
-    // and the lane judges each probe's own refusal.
-    let probe = {
-        let mut probe = plan[0].clone();
-        probe.target_epoch = target_epoch + 1;
-        probe.slot = plan[0].slot + 2;
-        // Marked as the injected fault it is. The sender withholds a ticket
-        // whose target epoch is not the next one -- sending a stale ticket
-        // would manufacture a refusal the node was right to make -- and lets a
-        // deliberate fault through regardless, because being wrong is the
-        // stimulus.
-        probe.fault = Some(TicketFault::UnknownEpoch);
-        probe
-    };
-    plan.push(probe);
+    // The faults come from `plan_tickets` itself -- a bad proof, a wrong
+    // proxy, a ticket for an epoch past the node's horizon -- and it withdraws
+    // the honest delivery of every ticket a fault reuses. Hand-building one
+    // here does not: an earlier version cloned an honest entry for the
+    // unknown-epoch probe, so the two shared an `(attempt, proof)` identity
+    // and `forwards_of` credited the honest ticket's forwards to the probe.
+    // The honest node then looked like one that had passed on a ticket it had
+    // in fact refused.
     for (index, entry) in plan.iter_mut().enumerate() {
         entry.plan_index = index;
     }
@@ -181,9 +166,12 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
     }
     emu.set_ticket_plans(by_peer);
 
-    // Let the deliveries go out and the forwards come back.
+    // Long enough for the deliveries, the forwards, and a forward deliberately
+    // held back to the lottery's close -- which can be most of an epoch away.
     clock::current()
-        .sleep(Duration::from_millis(8 * slot_ms()))
+        .sleep(Duration::from_millis(
+            u64::from(jam_types::epoch_period() + 4) * slot_ms(),
+        ))
         .await;
 
     let deliveries = emu.deliveries();
@@ -204,11 +192,17 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         tickets_per_validator: jam_types::tickets_per_validator(jam_types::max_val_count()),
         max_tickets_per_block: jam_types::max_tickets_per_block(),
     };
-    let rows = [n2::n2_proxy_duty(&ctx), n2::n2_unknown_epoch_reset(&ctx)]
-        .into_iter()
-        .flat_map(|check| (check.run)(&m2_scenario::dsl::ObsLog::new()))
-        .map(|row| (row.name, row.outcome))
-        .collect();
+    let rows = [
+        n2::n2_proxy_duty(&ctx),
+        n2::n2_unknown_epoch_reset(&ctx),
+        // The forged ticket in this plan is also what the Faults column
+        // judges: a node must not pass on a ticket the harness broke.
+        n2::n2_fault_handling(&ctx),
+    ]
+    .into_iter()
+    .flat_map(|check| (check.run)(&m2_scenario::dsl::ObsLog::new()))
+    .map(|row| (row.name, row.outcome))
+    .collect();
 
     dialing.abort();
     accepting.abort();
@@ -268,6 +262,16 @@ async fn the_proxy_duty_checks_catch_a_node_that_mishandles_a_delivery() {
     );
 
     assert!(
+        passed(&honest, "n2_fault_not_forwarded"),
+        "the honest node must not pass on the forged ticket; it reported {:?}",
+        outcomes_of(&honest, "n2_fault_not_forwarded")
+    );
+    assert!(
+        passed(&honest, "n2_proxy_forward_after_arrival"),
+        "the honest node must forward inside the lottery; it reported {:?}",
+        outcomes_of(&honest, "n2_proxy_forward_after_arrival")
+    );
+    assert!(
         passed(&honest, "n2_unknown_epoch_reset_observed"),
         "the honest node must refuse a ticket for an epoch past its horizon; it \
          reported {:?}",
@@ -281,6 +285,9 @@ async fn the_proxy_duty_checks_catch_a_node_that_mishandles_a_delivery() {
             SimFault::AcceptsUnknownEpoch,
             "n2_unknown_epoch_reset_observed",
         ),
+        (SimFault::ForwardsInTail, "n2_proxy_forward_after_arrival"),
+        // Accepting the forgery is also forwarding it: the node is its proxy.
+        (SimFault::AcceptsBadProof, "n2_fault_not_forwarded"),
     ] {
         let rows = grade(fault).await;
         assert!(

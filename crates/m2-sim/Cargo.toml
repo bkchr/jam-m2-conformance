@@ -11,6 +11,7 @@ jam-std-common = { workspace = true }
 jamnp-s = { path = "../../crates/jamnp-s" }
 m2-reference = { path = "../../crates/m2-reference" }
 m2-emu = { path = "../../crates/m2-emu" }
+blake2b_simd = { workspace = true }
 ed25519-consensus = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }

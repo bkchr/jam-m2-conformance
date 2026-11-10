@@ -24,10 +24,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_consensus::SigningKey;
-use jam_std_common::{bandersnatch::ring_vrf, Block, TicketEnvelope};
+use jam_std_common::{bandersnatch::ring_vrf, Block, Extrinsic, TicketEnvelope};
 use jam_types::{Decode, Encode, HeaderHash};
 use jamnp_s::clock;
-use jamnp_s::codec::ce128_129::{BlockRequest, BlockResponse, Direction, StateRequest};
+use jamnp_s::codec::ce128_129::{
+    BlockRequest, BlockResponse, BoundaryNode, Direction, KeyValue, StateRequest, StateResponse,
+};
 use jamnp_s::codec::ce131_136::{Ticket, TicketDistribution};
 use jamnp_s::codec::up0::{Announcement, Final, Handshake};
 use jamnp_s::endpoint::{EndpointConfig, EndpointError};
@@ -87,6 +89,62 @@ pub enum SimFault {
     /// Accept a ticket for an epoch past its horizon, instead of resetting
     /// the stream (`simple.md:335-337`).
     AcceptsUnknownEpoch,
+    /// Forward every proxied ticket twice, a slot apart, both while the
+    /// lottery is still open.
+    ///
+    /// Not itself a defect -- the stopping rule bounds forwarding *after*
+    /// finality, not repetition before it -- but it is what gives that rule
+    /// something to bound. Against a node that forwards each ticket once the
+    /// rule holds however it is written, and the row reports itself
+    /// unexercised.
+    RepeatsForwards,
+    /// Forward a ticket again after a block of this node's own carried it and
+    /// was announced as final.
+    ReForwardsAfterFinality,
+    /// Return more blocks than the request's `max_blocks` allows.
+    Ce128OverMax,
+    /// Finish the CE 128 stream in the middle of a frame.
+    ///
+    /// Not "never FIN": the probe has no timeout, so a node that holds the
+    /// stream open produces no probe at all and the row is never reported. A
+    /// dirty close is the reachable defect -- the complete response still
+    /// decodes, and only the end of the stream is wrong.
+    Ce128DirtyClose,
+    /// Dial nobody, including the peers this node is preferred initiator for.
+    NeverDials,
+    /// Dial every peer, including the ones that should dial this node.
+    DialsEveryone,
+    /// Return CE 129 keys out of ascending order.
+    Ce129UnsortedKeys,
+    /// Return boundary nodes with a child before its parent.
+    Ce129ChildBeforeParent,
+    /// Return more key/value bytes than the request's `max_size` allows.
+    Ce129OverSize,
+    /// Refuse a CE 129 request by resetting its stream.
+    Ce129Refuses,
+    /// Serve a block whose extrinsic carries the same ticket twice.
+    ///
+    /// The body is rewritten after authoring, so the header -- and therefore
+    /// the hash the harness fetches by -- is untouched and only the extrinsic
+    /// disagrees with it. That is the one way to produce an extrinsic the
+    /// authoring engine will not: its pool rejects duplicates and orders by
+    /// id. The same rewrite necessarily fails N1's seal row, because the body
+    /// no longer matches the header's extrinsic hash; these rows cannot be
+    /// reached without that.
+    ServesDuplicateTicket,
+    /// Serve a block authored in the epoch tail with a ticket in it.
+    ///
+    /// Rewritten the same way and for the same reason: past
+    /// `epoch_tail_start` the provisioner offers no tickets at all, so a tail
+    /// block the engine authored is always empty.
+    ServesTicketsInTail,
+    /// Hold a proxied ticket until the lottery has shut, then forward it.
+    ///
+    /// The forward itself is well formed and goes to every validator; only
+    /// its slot is wrong. Nothing can act on a ticket distributed past
+    /// `epoch_tail_start`, so passing it on then is the proxy doing its duty
+    /// too late to be a duty.
+    ForwardsInTail,
     /// Take delivery of a ticket and never offer it to its own pool, so the
     /// block it authors leaves it out. Seals just as validly.
     OmitsDeliveredTickets,
@@ -128,6 +186,9 @@ pub struct SimNode {
     /// Blocks this node authored. Not in the harness's reference chain, so
     /// only this node can serve them when it fetches by hash over CE 128.
     own_blocks: Mutex<Vec<Block>>,
+    /// Tickets this node forwarded as proxy, by id, so it can forward one
+    /// again once a block of its own carries it.
+    forwarded: Mutex<Vec<([u8; 32], TicketDistribution)>>,
 }
 
 impl SimNode {
@@ -147,6 +208,7 @@ impl SimNode {
             peers: Mutex::new(Vec::new()),
             announce: broadcast::Sender::new(16),
             own_blocks: Mutex::new(Vec::new()),
+            forwarded: Mutex::new(Vec::new()),
         }
     }
 
@@ -156,6 +218,32 @@ impl SimNode {
     /// hears the announcement.
     pub fn publish(self: &Arc<Self>, block: Block) {
         let wire = m2_emu::emu::announcement_wire(&block, &self.chain);
+        let block = self.rewrite_body(block);
+        if self.fault == SimFault::ReForwardsAfterFinality {
+            // Announcing this block names it final, so anything it carries is
+            // finalized-included from here. Forwarding one again a slot later
+            // is what the stopping rule forbids.
+            let carried: Vec<[u8; 32]> = block.extrinsic.tickets.iter().map(|t| t.id().0).collect();
+            let again: Vec<TicketDistribution> = self
+                .forwarded
+                .lock()
+                .expect("sim forwards")
+                .iter()
+                .filter(|(id, _)| carried.contains(id))
+                .map(|(_, d)| *d)
+                .collect();
+            if !again.is_empty() {
+                let node = Arc::clone(self);
+                tokio::spawn(async move {
+                    clock::current()
+                        .sleep(Duration::from_millis(jam_types::slot_period_sec() * 1000))
+                        .await;
+                    for distribution in again {
+                        node.broadcast_ticket(&distribution).await;
+                    }
+                });
+            }
+        }
         self.own_blocks.lock().expect("sim blocks").push(block);
         if self.fault == SimFault::AnnouncesLate {
             let node = Arc::clone(self);
@@ -169,6 +257,95 @@ impl SimNode {
             return;
         }
         let _ = self.announce.send(wire);
+    }
+
+    /// The state slice this node answers CE 129 with.
+    ///
+    /// The reference chain exports no state, so an honest answer is empty --
+    /// and an empty answer satisfies every content rule vacuously. These
+    /// faults supply content that breaks exactly one of them.
+    fn state_response(&self, request: &StateRequest) -> StateResponse {
+        let in_range = |n: u8| {
+            let mut key = request.start;
+            key[30] = key[30].saturating_add(n);
+            key
+        };
+        match self.fault {
+            SimFault::Ce129UnsortedKeys => StateResponse {
+                boundary_nodes: vec![],
+                entries: vec![
+                    KeyValue {
+                        key: in_range(2),
+                        value: vec![1],
+                    },
+                    KeyValue {
+                        key: in_range(1),
+                        value: vec![2],
+                    },
+                ],
+            },
+            SimFault::Ce129ChildBeforeParent => {
+                // A parent refers to a child by blake2b-256 of its 64 bytes
+                // with the top bit cleared -- that bit is the branch/leaf
+                // discriminator, not part of the hash. So the parent has to be
+                // built from the child's hash, and listed after it.
+                let child = [0x11u8; 64];
+                let digest = blake2b_simd::Params::new().hash_length(32).hash(&child);
+                let mut parent = [0u8; 64];
+                parent[..32].copy_from_slice(digest.as_bytes());
+                parent[0] &= 0b0111_1111;
+                StateResponse {
+                    boundary_nodes: vec![BoundaryNode(child), BoundaryNode(parent)],
+                    entries: vec![],
+                }
+            }
+            SimFault::Ce129OverSize => StateResponse {
+                boundary_nodes: vec![],
+                entries: (0..3)
+                    .map(|i| KeyValue {
+                        key: in_range(i),
+                        value: vec![0u8; request.max_size as usize],
+                    })
+                    .collect(),
+            },
+            _ => m2_emu::emu::serve_ce129(request),
+        }
+    }
+
+    /// Rewrite a block's extrinsic, for the two faults that need a body the
+    /// authoring engine will not produce.
+    ///
+    /// Only the body: the header is left as authored, so the block keeps the
+    /// hash it was announced under and the harness can still fetch it.
+    fn rewrite_body(&self, block: Block) -> Block {
+        let tail = block.header.slot % jam_types::epoch_period() >= jam_types::epoch_tail_start();
+        let seed = match self.fault {
+            SimFault::ServesDuplicateTicket if !tail => block.extrinsic.tickets.first().cloned(),
+            SimFault::ServesTicketsInTail if tail => self
+                .own_blocks
+                .lock()
+                .expect("sim blocks")
+                .iter()
+                .find_map(|b| b.extrinsic.tickets.first().cloned()),
+            _ => None,
+        };
+        let Some(ticket) = seed else {
+            return block;
+        };
+        let mut extrinsic = Extrinsic::default();
+        let repeats = if self.fault == SimFault::ServesDuplicateTicket {
+            2
+        } else {
+            1
+        };
+        for _ in 0..repeats {
+            if extrinsic.tickets.try_push(ticket.clone()).is_err() {
+                break;
+            }
+        }
+        let mut block = block;
+        block.extrinsic = Arc::new(extrinsic);
+        block
     }
 
     /// Dial the emulated validators, keyed by index. A peer that cannot be
@@ -198,6 +375,38 @@ impl SimNode {
                 tokio::spawn(Arc::clone(self).serve_connection(conn));
             }
         }
+    }
+
+    /// Dial only the peers this node is the preferred initiator for
+    /// (`simple.md:70-80`), and wait to be dialled by the rest.
+    ///
+    /// Separate from [`SimNode::connect_to`], which dials everything it is
+    /// given: the ticket lanes need a path to every validator for CE 132, and
+    /// in a live run the node has one either way because the peers dial it.
+    /// Here the point is *who opened the connection*, so the split has to be
+    /// the node's own decision.
+    pub async fn dial_preferred(
+        self: &Arc<Self>,
+        transport: &Arc<dyn Transport>,
+        secret: SigningKey,
+        peers: &[(u16, SocketAddr, String)],
+    ) {
+        if self.fault == SimFault::NeverDials {
+            return;
+        }
+        let mine = validator_key(self.index);
+        let chosen: Vec<(u16, SocketAddr, String)> = peers
+            .iter()
+            .filter(|(index, _, _)| {
+                self.fault == SimFault::DialsEveryone
+                    || jamnp_s::preferred::preferred_initiator(
+                        &mine,
+                        &validator_key(usize::from(*index)),
+                    )
+            })
+            .cloned()
+            .collect();
+        self.connect_to(transport, secret, &chosen).await;
     }
 
     /// Run the Safrole lottery for `target_epoch` and distribute it: CE 132
@@ -282,6 +491,19 @@ impl SimNode {
                     }
                 }
             }
+        }
+    }
+
+    /// Wait until the lottery has shut for this epoch, or the next one if it
+    /// already has.
+    async fn sleep_until_tail(&self) {
+        let period = jam_types::epoch_period();
+        let now = m2_reference::chain::wall_clock_slot();
+        let tail = now - now % period + jam_types::epoch_tail_start();
+        let tail = if tail <= now { tail + period } else { tail };
+        let target = m2_reference::chain::slot_start_ms(tail);
+        if let Some(wait) = target.checked_sub(clock::current().wall_ms()) {
+            clock::current().sleep(Duration::from_millis(wait)).await;
         }
     }
 
@@ -469,6 +691,15 @@ impl SimNode {
             send.reset(TICKET_REFUSED_CODE);
             return;
         }
+        // At or above the per-validator cap there is no lawful attempt index,
+        // so the proof cannot belong to this epoch's lottery however well it
+        // verifies. polkajam refuses these too ("bad ticket attempt value").
+        if distribution.ticket.attempt
+            >= jam_types::tickets_per_validator(jam_types::max_val_count())
+        {
+            send.reset(TICKET_REFUSED_CODE);
+            return;
+        }
         let verifies = self
             .chain
             .ticket_ctx()
@@ -481,6 +712,16 @@ impl SimNode {
             })
             .unwrap_or(false);
         if !verifies && self.fault != SimFault::AcceptsBadProof {
+            send.reset(TICKET_REFUSED_CODE);
+            return;
+        }
+        // A CE 131 arrival is a ticket sent to this node *as proxy*, so one
+        // the proxy rule names another validator for was misrouted: refuse it
+        // rather than pass it on or carry it. A CE 132 arrival is a broadcast
+        // and belongs to no proxy, so it is kept whoever it names.
+        let id = ticket_id(&distribution.ticket.proof);
+        let proxies_here = proxy_index(&id, usize::from(jam_types::max_val_count())) == self.index;
+        if kind == CE131 && !proxies_here {
             send.reset(TICKET_REFUSED_CODE);
             return;
         }
@@ -499,11 +740,23 @@ impl SimNode {
         if kind != CE131 || self.fault == SimFault::NeverForwards {
             return;
         }
-        let id = ticket_id(&distribution.ticket.proof);
-        if proxy_index(&id, usize::from(jam_types::max_val_count())) != self.index {
-            return;
+        self.forwarded
+            .lock()
+            .expect("sim forwards")
+            .push((id, distribution));
+        if self.fault == SimFault::ForwardsInTail {
+            self.sleep_until_tail().await;
         }
         self.broadcast_ticket(&distribution).await;
+        if self.fault == SimFault::RepeatsForwards {
+            let node = Arc::clone(self);
+            tokio::spawn(async move {
+                clock::current()
+                    .sleep(Duration::from_millis(jam_types::slot_period_sec() * 1000))
+                    .await;
+                node.broadcast_ticket(&distribution).await;
+            });
+        }
     }
 
     /// Serve a block request from the reference chain.
@@ -543,7 +796,23 @@ impl SimNode {
             // it asked for is there, so only the ordering rule can catch it.
             response.blocks.reverse();
         }
+        if self.fault == SimFault::Ce128OverMax {
+            // One past the cap the *request* named, which is the bound the row
+            // reads -- the chain is usually shorter than it, so serving one
+            // more block than it holds would not exceed anything. The last
+            // block is repeated rather than a new one invented, so only the
+            // count is wrong.
+            if let Some(last) = response.blocks.last().cloned() {
+                while response.blocks.len() as u32 <= request.max_blocks {
+                    response.blocks.push(last.clone());
+                }
+            }
+        }
         let _ = send.write_all(&frame_message(&response.encode())).await;
+        if self.fault == SimFault::Ce128DirtyClose {
+            // Two bytes of a four-byte length prefix, then FIN.
+            let _ = send.write_all(&[0xff, 0xff]).await;
+        }
         send.finish();
     }
 
@@ -555,7 +824,12 @@ impl SimNode {
         let Ok(request) = StateRequest::decode(&mut &content[..]) else {
             return;
         };
-        let (boundary, entries) = m2_emu::emu::serve_ce129(&request).messages();
+        if self.fault == SimFault::Ce129Refuses {
+            send.reset(TICKET_REFUSED_CODE);
+            return;
+        }
+        let response = self.state_response(&request);
+        let (boundary, entries) = response.messages();
         for message in [boundary, entries] {
             if send.write_all(&frame_message(&message)).await.is_err() {
                 return;
@@ -563,6 +837,13 @@ impl SimNode {
         }
         send.finish();
     }
+}
+
+/// The Ed25519 public key validator `index` is known by, which is what the
+/// preferred-initiator rule compares.
+pub fn validator_key(index: usize) -> [u8; 32] {
+    let secret = jam_std_common::SecretKeyset::trivial(index as u32).ed25519;
+    ed25519_consensus::VerificationKey::from(&SigningKey::from(secret.to_bytes())).to_bytes()
 }
 
 /// Incremental frame reader. One read routinely delivers several frames, so a

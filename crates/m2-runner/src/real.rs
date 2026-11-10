@@ -440,7 +440,10 @@ pub fn collect_nut_tickets(trace: &Trace, contexts: &TicketContexts) -> Vec<NutT
 /// an announcement is a header followed by the `Final`, a handshake is the
 /// `Final` followed by the leaves, and only one of the two decodes -- so a
 /// frame that is neither is skipped rather than guessed at.
-fn collect_nut_finals(trace: &Trace) -> Vec<NutFinal> {
+/// Public alongside [`collect_nut_tickets`]: the stopping rule is judged
+/// against the node's own account of finality, so a self-test has to read it
+/// off the wire the same way a live run does.
+pub fn collect_nut_finals(trace: &Trace) -> Vec<NutFinal> {
     trace
         .records()
         .iter()
