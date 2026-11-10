@@ -110,6 +110,10 @@ pub enum SimFault {
     /// dirty close is the reachable defect -- the complete response still
     /// decodes, and only the end of the stream is wrong.
     Ce128DirtyClose,
+    /// Dial nobody, including the peers this node is preferred initiator for.
+    NeverDials,
+    /// Dial every peer, including the ones that should dial this node.
+    DialsEveryone,
     /// Return CE 129 keys out of ascending order.
     Ce129UnsortedKeys,
     /// Return boundary nodes with a child before its parent.
@@ -371,6 +375,38 @@ impl SimNode {
                 tokio::spawn(Arc::clone(self).serve_connection(conn));
             }
         }
+    }
+
+    /// Dial only the peers this node is the preferred initiator for
+    /// (`simple.md:70-80`), and wait to be dialled by the rest.
+    ///
+    /// Separate from [`SimNode::connect_to`], which dials everything it is
+    /// given: the ticket lanes need a path to every validator for CE 132, and
+    /// in a live run the node has one either way because the peers dial it.
+    /// Here the point is *who opened the connection*, so the split has to be
+    /// the node's own decision.
+    pub async fn dial_preferred(
+        self: &Arc<Self>,
+        transport: &Arc<dyn Transport>,
+        secret: SigningKey,
+        peers: &[(u16, SocketAddr, String)],
+    ) {
+        if self.fault == SimFault::NeverDials {
+            return;
+        }
+        let mine = validator_key(self.index);
+        let chosen: Vec<(u16, SocketAddr, String)> = peers
+            .iter()
+            .filter(|(index, _, _)| {
+                self.fault == SimFault::DialsEveryone
+                    || jamnp_s::preferred::preferred_initiator(
+                        &mine,
+                        &validator_key(usize::from(*index)),
+                    )
+            })
+            .cloned()
+            .collect();
+        self.connect_to(transport, secret, &chosen).await;
     }
 
     /// Run the Safrole lottery for `target_epoch` and distribute it: CE 132
@@ -801,6 +837,13 @@ impl SimNode {
         }
         send.finish();
     }
+}
+
+/// The Ed25519 public key validator `index` is known by, which is what the
+/// preferred-initiator rule compares.
+pub fn validator_key(index: usize) -> [u8; 32] {
+    let secret = jam_std_common::SecretKeyset::trivial(index as u32).ed25519;
+    ed25519_consensus::VerificationKey::from(&SigningKey::from(secret.to_bytes())).to_bytes()
 }
 
 /// Incremental frame reader. One read routinely delivers several frames, so a

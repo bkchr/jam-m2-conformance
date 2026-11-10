@@ -8,6 +8,7 @@
 //! ALPN, so `tls_cert`, `alpn` and the builder probe belong to the QUIC
 //! carrier.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use ed25519_consensus::{SigningKey, VerificationKey};
 use jamnp_s::cert::san_for_key;
 use jamnp_s::clock::{self, VirtualClock};
 use jamnp_s::transport::mock::MockNetwork;
+use jamnp_s::transport::Transport;
 use m2_emu::emu::{dial_nut, Emulator};
 use m2_reference::chain::RefChain;
 use m2_scenario::dsl::Outcome;
@@ -100,6 +102,76 @@ async fn grade(chain: &Arc<RefChain>, fault: SimFault) -> Vec<(&'static str, Out
     rows
 }
 
+/// The validator the simulated node is when the dialling split is graded.
+const DIAL_NUT_INDEX: usize = 0;
+/// Every other validator, so the preferred-initiator split has both sides.
+const DIAL_PEERS: [usize; 5] = [1, 2, 3, 4, 5];
+
+/// Grade the preferred-initiator split: who opened each connection.
+///
+/// Its own setup rather than the serving one above, because it needs several
+/// peers for the split to have two sides, and because the rows it reads are
+/// about *who dialled* rather than what was served.
+async fn grade_dialing(fault: SimFault) -> Vec<(&'static str, Outcome)> {
+    let net = MockNetwork::new();
+    let transport = Arc::new(net) as Arc<dyn Transport>;
+    let chain = Arc::new(RefChain::tiny_for(DIAL_NUT_INDEX).expect("the node's chain"));
+    let genesis = chain.genesis_hash();
+
+    let node = Arc::new(SimNode::at_index(Arc::clone(&chain), fault, DIAL_NUT_INDEX));
+    let (_addr, serving) = Arc::clone(&node)
+        .listen(
+            Arc::clone(&transport),
+            SigningKey::from([0x90u8; 32]),
+            "127.0.0.1:9600".parse::<SocketAddr>().expect("an address"),
+        )
+        .await
+        .expect("the simulated node binds");
+    let emu = Emulator::n0_on(Arc::clone(&transport), DIAL_PEERS.to_vec(), genesis, 40_700)
+        .await
+        .expect("the emulated validators bind");
+    let accepting = emu.accept_loop(Arc::clone(&chain));
+
+    let peers: Vec<(u16, SocketAddr, String)> = DIAL_PEERS
+        .iter()
+        .zip(emu.local_addrs())
+        .map(|(&index, addr)| {
+            (
+                index as u16,
+                addr,
+                san_for_key(&VerificationKey::from(&SigningKey::from(
+                    m2_sim::validator_key(index),
+                ))),
+            )
+        })
+        .collect();
+    node.dial_preferred(&transport, SigningKey::from([0x91u8; 32]), &peers)
+        .await;
+    clock::current()
+        .sleep(std::time::Duration::from_secs(2))
+        .await;
+
+    let mine = m2_sim::validator_key(DIAL_NUT_INDEX);
+    let (nut_preferred, emu_preferred): (Vec<u16>, Vec<u16>) =
+        DIAL_PEERS.iter().map(|&i| i as u16).partition(|&i| {
+            jamnp_s::preferred::preferred_initiator(&mine, &m2_sim::validator_key(usize::from(i)))
+        });
+    assert!(
+        !nut_preferred.is_empty() && !emu_preferred.is_empty(),
+        "the split must have both sides or neither row can fail: {nut_preferred:?} / \
+         {emu_preferred:?}"
+    );
+    let obs = emu.obs();
+    let obs = obs.lock().expect("the observation log");
+    let rows = (n0::preferred_initiator(nut_preferred, emu_preferred).run)(&obs)
+        .into_iter()
+        .map(|r| (r.name, r.outcome))
+        .collect();
+    accepting.abort();
+    serving.abort();
+    rows
+}
+
 /// Whether `row` passed, or `None` if the grading never produced it.
 /// Every outcome reported under `row`.
 ///
@@ -173,6 +245,32 @@ async fn the_n0_checks_catch_a_node_that_gets_one_thing_wrong() {
             outcomes_of(&honest, row)
         );
     }
+
+    // Who opened each connection, which the serving setup above does not
+    // exercise at all.
+    let dialled = grade_dialing(SimFault::None).await;
+    for row in [
+        "nut_initiates_where_preferred",
+        "nut_waits_where_not_preferred",
+    ] {
+        assert!(
+            passed(&dialled, row),
+            "the honest node must pass {row}; it reported {:?}",
+            outcomes_of(&dialled, row)
+        );
+    }
+    let silent = grade_dialing(SimFault::NeverDials).await;
+    assert!(
+        failed(&silent, "nut_initiates_where_preferred"),
+        "a node that dials nobody must fail the initiation row; it reported {:?}",
+        outcomes_of(&silent, "nut_initiates_where_preferred")
+    );
+    let eager = grade_dialing(SimFault::DialsEveryone).await;
+    assert!(
+        failed(&eager, "nut_waits_where_not_preferred"),
+        "a node that dials everyone must fail the waiting row; it reported {:?}",
+        outcomes_of(&eager, "nut_waits_where_not_preferred")
+    );
 
     // Each fault, and the one row it must cost. Timed, because the point of
     // the virtual clock is that six gradings of a node that each wait out a
