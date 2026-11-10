@@ -9,6 +9,7 @@ description = "Independent JAMNP-S protocol implementation (QUIC/TLS, cert/SAN, 
 jam-types = { workspace = true }
 jam-std-common = { workspace = true }
 codec = { package = "jam-codec", version = "0.1.1", default-features = false, features = ["derive", "max-encoded-len"] }
+async-trait = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }

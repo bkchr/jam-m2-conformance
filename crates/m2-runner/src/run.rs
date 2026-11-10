@@ -243,7 +243,9 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             let nut_san = nut_san.clone();
             let index = emu_indices[i];
             dial_tasks.push(tokio::spawn(async move {
-                tokio::time::sleep(connectivity::INITIATOR_GRACE).await;
+                jamnp_s::clock::current()
+                    .sleep(connectivity::INITIATOR_GRACE)
+                    .await;
                 // The NUT is the preferred initiator for this peer. The grace
                 // is there so the pair still connects if it never dials, not
                 // so we open a second connection alongside its first.
@@ -314,7 +316,9 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     };
 
     if !dial_tasks.is_empty() {
-        tokio::time::sleep(Duration::from_secs(cli.observe_secs)).await;
+        jamnp_s::clock::current()
+            .sleep(Duration::from_secs(cli.observe_secs))
+            .await;
     }
     // Abort rather than drop: dropping a `JoinHandle` detaches the task, so the
     // slot driver would keep authoring into the reference chain while the
@@ -515,13 +519,22 @@ async fn wait_until_the_node_can_accept_tickets(shared: &m2_emu::emu::EmuShared,
     // Half the observation window, capped at an epoch: past an epoch the
     // lottery has moved on and the wait has bought nothing.
     let cap = u64::from(jam_types::epoch_period()) * m2_scenario::ctx::SLOT_PERIOD_MS / 1000;
-    let deadline = Instant::now() + Duration::from_secs((budget_secs / 2).min(cap));
-    while Instant::now() < deadline {
+    // Protocol time, not orchestration time: the budget is counted in slots
+    // and the loop reads the slot clock, so the deadline has to be on the same
+    // clock as the thing it is waiting for. Measured against a machine clock
+    // while the slots came from a virtual one, this would never expire.
+    let clock = jamnp_s::clock::current();
+    let deadline = clock
+        .mono_ms()
+        .saturating_add((budget_secs / 2).min(cap).saturating_mul(1000));
+    while clock.mono_ms() < deadline {
         let now_slot = m2_reference::chain::wall_clock_slot();
         if m2_emu::ticket_io::node_can_accept_tickets(shared.nut_final_slot(), now_slot) {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(NODE_READINESS_POLL_MS)).await;
+        clock
+            .sleep(Duration::from_millis(NODE_READINESS_POLL_MS))
+            .await;
     }
 }
 
@@ -530,10 +543,11 @@ async fn wait_for_next_epoch(ref_chain: &RefChain) {
     let period = jam_types::epoch_period();
     let now = ref_chain.next_slot();
     let slots = period - now % period;
-    tokio::time::sleep(Duration::from_millis(
-        u64::from(slots) * m2_scenario::ctx::SLOT_PERIOD_MS,
-    ))
-    .await;
+    jamnp_s::clock::current()
+        .sleep(Duration::from_millis(
+            u64::from(slots) * m2_scenario::ctx::SLOT_PERIOD_MS,
+        ))
+        .await;
 }
 
 /// Author each slot as the wall clock reaches it and announce every block, for
@@ -551,9 +565,10 @@ async fn drive_slots(
     loop {
         // Wait for the slot to actually begin. Sleeping to the boundary rather
         // than for one slot period keeps the pacing from drifting over a run.
-        let start = m2_reference::chain::slot_start(next);
-        if let Ok(delay) = start.duration_since(std::time::SystemTime::now()) {
-            tokio::time::sleep(delay).await;
+        let start = m2_reference::chain::slot_start_ms(next);
+        let clock = jamnp_s::clock::current();
+        if let Some(delay) = start.checked_sub(clock.wall_ms()) {
+            clock.sleep(Duration::from_millis(delay)).await;
         }
         // The head no longer moves only when this task authors: a NUT block
         // adopted into the chain can already occupy this slot or a later one,

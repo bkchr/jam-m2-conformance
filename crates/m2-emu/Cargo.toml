@@ -15,4 +15,3 @@ ed25519-consensus = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
-quinn = { workspace = true }

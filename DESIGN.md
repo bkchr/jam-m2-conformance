@@ -77,14 +77,58 @@ content` messages (`:122-130`). Stream kinds: UP 0; CE 128, 129, 131, 132, 133, 
 
 | crate | responsibility |
 |---|---|
-| `jamnp-s` | Independent JAMNP-S: QUIC endpoint (quinn 0.11 + rustls), Ed25519 self-signed cert and SAN derivation, ALPN, preferred-initiator rule, stream-kind byte, `u32 LE` framing, typed codecs for every UP/CE message (GP codec via `jam-types`/`codec`), request/response helpers, full message trace recording. No policy. |
+| `jamnp-s` | Independent JAMNP-S: QUIC endpoint (quinn 0.11 + rustls), Ed25519 self-signed cert and SAN derivation, ALPN, preferred-initiator rule, stream-kind byte, `u32 LE` framing, typed codecs for every UP/CE message (GP codec via `jam-types`/`codec`), request/response helpers, full message trace recording, and the transport and clock boundaries below. No policy. |
 | `m2-reference` | Wrapper over `polkajam-fuzz` (lib) + `jam-node` (`hazmat`): reference chain state for the 6-validator net; authors blocks for emulated slots; signs tickets/guarantees/assurances/judgments/audit announcements with the five emulated keysets; refines work packages; erasure-codes bundles and builds justifications; imports NUT blocks and diffs state. |
 | `m2-emu` | The five emulated validators plus an optional builder / non-validator peer. One `jamnp-s` endpoint each; reactive handlers (serve CE 128/129/137/138/139/140/147/148/136/143; accept UP 0, CE 131/132/134/135/141/142/144/145/133/146); every inbound and outbound message goes to the observation log. Behaviour is data-driven by the scenario: `m2-emu` executes **no core protocol logic** — every value (report results, segments, shards, proofs) and every decision (audit verdicts, assurance bits) is computed once by `m2-reference` and injected; `m2-emu` only keeps per-peer state, frames, and signs. |
 | `m2-scenario` | Scenario model and scheduler: steps keyed by `(slot_rel, offset_ms)`; actions (emulated side) and expectations (NUT side) with severity; lanes are scenario collections. |
 | `m2-runner` | CLI: generates spec and keys, launches the NUT (command template / preset), runs the scenario, writes report and traces, sets the exit code. |
+| `m2-sim` | A simulated node under test: an in-process stand-in the harness can grade, honest or deliberately broken. Not a node — it keeps no state machine and validates nothing — but node-shaped enough for a lane to grade, which is what makes a check's ability to fail testable. |
 
 Dependencies on polkajam are git dependencies pinned to a commit (see §8 for the small changes
 polkajam needs first).
+
+**The transport boundary.** `jamnp_s::transport` is what everything above `jamnp-s` sees of a
+connection: open a bidirectional stream, accept one, write, finish, reset, read, stop. Two
+carriers implement it — `transport::quic` over QUIC, which is what grades a real node, and
+`transport::mock`, which carries the same streams between tasks in one process. No crate above
+`jamnp-s` depends on `quinn` at all, so the boundary is enforced by the build and not by
+convention.
+
+Two properties of that boundary are load-bearing, because a lane reads them rather than the
+bytes. **A reset is not an error**: `ReadError::Reset` carries the peer's application error
+code, which is how the harness sees a node refuse a ticket (`simple.md:335-337`) and what two
+N2 checks are built on. **A stream has a number**, unique for the life of its connection, which
+is how a trace groups frames. Both are asserted against both carriers by the same tests, so a
+carrier that lost one would fail rather than quietly make a check unobservable.
+
+The mock authenticates nothing: no TLS, no certificate, no ALPN. The N0 rules about those are
+properties of the QUIC carrier and are graded there; a run on the mock cannot exercise them.
+
+**The clock boundary.** `jamnp_s::clock` is the other injectable the milestone asks for. A run
+is a calendar — which slot a frame belongs to, when a ticket is due, how long to watch before
+grading — and all of it is arithmetic on a timestamp. `SystemClock` is the machine's clock and
+is what grades a real node, whose slots really do take six seconds. `VirtualClock` is time that
+moves only when the runtime moves it, so a run against a *simulated* node costs the time the
+computation takes rather than the time the protocol describes. One clock is installed per
+process, before anything reads it, and `trace::mono_ts`/`trace::wall_ts` read it — a trace has
+to carry the same calendar the waits that produced it were keeping, or the lanes would grade
+frames against a clock nothing else is on.
+
+Only the protocol's own waits moved onto it: the slot boundary, the epoch wait, the ticket
+sender's delivery target and readiness poll, the initiator grace, the CE 129 probe delay and
+the observation window. Waiting for a node *process* to start, or for a port to answer, is not
+protocol time — it is about another program on this machine — and stays on the real clock
+however the harness is run.
+
+**What the two seams are for.** A check is an assertion about a node, and until a node makes
+the mistake it describes, nobody knows whether it can fail. Every live run this harness has
+done was against polkajam, which does not make those mistakes — which is why two harness
+defects survived for weeks, passing a check that was grading the harness's own intentions.
+`m2-sim` closes that: on the in-process carrier and the virtual clock, a deliberately broken
+node can be graded in milliseconds, and a check that fails against it and passes against the
+honest one has been *shown* to work. The test asserts the broken row is present **and**
+failing: a row the grading never produced caught nothing, and accepting its absence would be
+the same vacuous pass the lanes' own controls exist to prevent.
 
 ## 4. Run lifecycle
 

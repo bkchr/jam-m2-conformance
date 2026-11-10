@@ -1687,6 +1687,7 @@ dependencies = [
 name = "jamnp-s"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blake2b_simd",
  "ed25519-consensus",
  "futures",
@@ -1964,7 +1965,6 @@ dependencies = [
  "jamnp-s",
  "m2-reference",
  "m2-scenario",
- "quinn 0.11.11",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -1976,6 +1976,7 @@ dependencies = [
  "jam-node",
  "jam-std-common",
  "jam-types",
+ "jamnp-s",
  "thiserror 2.0.20",
 ]
 
@@ -1995,7 +1996,6 @@ dependencies = [
  "m2-emu",
  "m2-reference",
  "m2-scenario",
- "quinn 0.11.11",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -2011,6 +2011,22 @@ dependencies = [
  "jam-types",
  "jamnp-s",
  "m2-reference",
+]
+
+[[package]]
+name = "m2-sim"
+version = "0.1.0"
+dependencies = [
+ "ed25519-consensus",
+ "jam-std-common",
+ "jam-types",
+ "jamnp-s",
+ "m2-emu",
+ "m2-reference",
+ "m2-runner",
+ "m2-scenario",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]

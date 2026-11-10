@@ -26,4 +26,3 @@ m2-scenario = { path = "../../crates/m2-scenario" }
 m2-emu = { path = "../../crates/m2-emu" }
 m2-reference = { path = "../../crates/m2-reference" }
 jamnp-s = { path = "../../crates/jamnp-s" }
-quinn = { workspace = true }
