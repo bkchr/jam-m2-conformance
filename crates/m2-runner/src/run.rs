@@ -1005,15 +1005,7 @@ mod tests {
     #[test]
     fn a_work_item_refines_into_a_signed_guarantee() -> Result<(), m2_reference::chain::ChainError>
     {
-        jam_types::ProtocolParameters::tiny()
-            .apply()
-            .expect("tiny parameters apply");
-        let ports: Vec<u16> = (0..VALIDATOR_COUNT).map(|i| 41000 + i as u16).collect();
-        let anchor = m2_reference::chain::current_epoch_start_slot();
-        let spec = spec::tiny_spec(&loopback_ips(), &ports, anchor)
-            .map_err(|e| m2_reference::chain::ChainError::Chain(e.to_string()))?;
-        let chain = RefChain::with_spec(5, spec)?;
-        seed_past_slots(&chain)?;
+        let chain = anchored_chain(41000)?;
 
         let item = jam_node::hazmat::BuildItem::new(
             jam_node::DEV_BOOTSTRAP_SERVICE_ID,
@@ -1048,6 +1040,65 @@ mod tests {
                 signature.val_index
             );
         }
+        Ok(())
+    }
+
+    /// A CE 133 submission carries the real package, and `package()` is the
+    /// exact inverse of `from_package`.
+    ///
+    /// The typed view is only worth having if it survives a package the
+    /// engine actually built: a hand-made one would agree with a codec that
+    /// got the field order wrong, because both sides would be mine.
+    #[test]
+    fn a_submission_round_trips_the_real_work_package()
+    -> Result<(), m2_reference::chain::ChainError> {
+        use jamnp_s::codec::ce131_136::WorkPackageSubmission;
+
+        let chain = anchored_chain(44000)?;
+        let item = jam_node::hazmat::BuildItem::new(
+            jam_node::DEV_BOOTSTRAP_SERVICE_ID,
+            jam_types::WorkPayload(Vec::new()),
+            jam_types::max_refine_gas(),
+            jam_types::max_accumulate_gas(),
+            Vec::new(),
+            Vec::new(),
+            0,
+        );
+        let work = chain.guarantee_work(vec![item], 0)?;
+
+        let mut sub = WorkPackageSubmission::from_package(0, &work.package, Vec::new());
+        let decoded = sub.package().expect("the package decodes");
+        assert_eq!(
+            codec::Encode::encode(&decoded),
+            codec::Encode::encode(&work.package),
+            "decoding and re-encoding must return the same bytes"
+        );
+        assert!(
+            sub.validate_initial_size(),
+            "a one-item package is far below the CE 133 cap"
+        );
+
+        // The initial message is the core index and then the package, with no
+        // length prefix on the package: it runs to the end of the message.
+        let wire = sub.encode_initial();
+        let (core_index, work_package) =
+            WorkPackageSubmission::decode_initial(&mut &wire[..]).expect("message 1 decodes");
+        assert_eq!(core_index, 0);
+        assert_eq!(work_package, sub.work_package);
+
+        // Because the package is not length-prefixed, a node could append junk
+        // and a plain `Decode` would stop short and never notice.
+        sub.work_package.push(0xff);
+        assert!(
+            codec::Decode::decode(&mut &sub.work_package[..])
+                .map(|p: jam_types::WorkPackage| codec::Encode::encode(&p))
+                .is_ok(),
+            "a plain decode accepts the junk, which is what `package` has to catch"
+        );
+        assert!(
+            sub.package().is_err(),
+            "trailing bytes after the package must be rejected"
+        );
         Ok(())
     }
 

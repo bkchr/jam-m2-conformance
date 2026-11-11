@@ -1,7 +1,9 @@
 # N3 — design for the guaranteeing lane
 
-Status: inspection done, nothing implemented. Written 2026-11-10 against `main` at `e444700`,
-with polkajam pinned at `940ef56`.
+Status: §5 steps 0-3 done — the upstream export PR is open, guarantor assignment is resolved,
+`m2-reference` builds and guarantees work, and `WorkPackageSubmission` has its typed view. No
+N3 rows are graded yet; that is step 4. Written 2026-11-10 against `main` at `e444700`, with
+polkajam pinned at `940ef56`; updated 2026-11-11.
 
 This document exists because N2's did its job: before any code, it found an attempt cap read off
 the wrong checkout, two checks that could not fail, and a deferral whose premise was false. N3 is
@@ -48,9 +50,11 @@ submit_work_items(items, core)  -> (ReportGuarantee, Bytes) // all three, and su
 ```
 
 So the harness can build a real work package, refine it, and hold both the bundle bytes and a
-signed guarantee — which is what CE 133, CE 134 and CE 135 carry. `jamnp-s`'s
-`WorkPackageSubmission` still has `// TODO(P1): typed GP WorkPackage once m2-reference exposes
-it`; this is what unblocks that.
+signed guarantee — which is what CE 133, CE 134 and CE 135 carry.
+
+`jamnp-s`'s `WorkPackageSubmission` carried `// TODO(P1): typed GP WorkPackage once
+m2-reference exposes it`. The premise was wrong: `WorkPackage` is `jam_types::WorkPackage`,
+already a dependency of `jamnp-s`, and nothing was waiting on `m2-reference` at all.
 
 Codecs for CE 133, 134, 135, 146 and 148 already exist in `jamnp-s`.
 
@@ -158,7 +162,17 @@ epoch boundary falls between proving and delivery.
    - **`CoreAssignments` cannot be factored into a helper.** Its type lives behind a private
      module upstream, so the value can be used but not named, and a helper returning one has
      nothing to return it as. Both accessors therefore repeat the two-line lookup.
-3. **`jamnp-s`: type `WorkPackageSubmission`** against the real `WorkPackage`, closing its TODO.
+3. ~~**`jamnp-s`: type `WorkPackageSubmission`** against the real `WorkPackage`, closing its
+   TODO.~~ Done. The field stays `Vec<u8>` and the typed view is the pair `from_package` /
+   `package`, for two reasons: what a node put on the wire is what the lane grades, so a
+   package that fails to decode has to survive as bytes to be reported; and `WorkPackage`'s
+   `Decode` reads the installed protocol parameters, which carrying a message must not require.
+
+   One finding: **CE 133's package is not length-prefixed** — it runs to the end of message 1
+   (`simple.md:372`). A plain `Decode` therefore stops at the end of the package and never
+   looks at what follows, so a node appending junk to a well-formed package goes unnoticed.
+   `package()` rejects trailing bytes explicitly, and the test asserts that a plain decode
+   accepts them, so the check cannot rot into a tautology.
 4. **N3 first half** — CE 133 and CE 135, with their faults, and the inclusion rows.
 5. **N3 second half** — CE 134's byte-exactness, CE 146 and CE 148, once item 4 lands.
 
