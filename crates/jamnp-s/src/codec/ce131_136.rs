@@ -88,13 +88,54 @@ pub struct WorkPackageSubmission {
     /// Core index the work-package is destined for.
     pub core_index: u16,
     /// Raw GP-encoded `Work-Package` (`simple.md:367`).
-    // TODO(P1): typed GP WorkPackage once m2-reference exposes it.
+    ///
+    /// The field stays bytes on purpose, and the typed view is the pair
+    /// [`from_package`](Self::from_package) / [`package`](Self::package).
+    /// Two reasons, both the same reason the [`Ticket`] decoder does not
+    /// range-check its attempt:
+    ///
+    /// - What a node put on the wire is what the lane grades. A package that
+    ///   does not decode is a finding, not a parse failure, and a typed field
+    ///   would throw away the bytes needed to report it.
+    /// - `WorkPackage`'s own `Decode` reads the installed protocol
+    ///   parameters, because its item and import sequences are bounded by
+    ///   them. Carrying a CE 133 message must not require a chain
+    ///   configuration to have been installed first.
     pub work_package: Vec<u8>,
     /// Extrinsic data referenced by the work-package (`simple.md:368`).
     pub extrinsics: Vec<Vec<u8>>,
 }
 
 impl WorkPackageSubmission {
+    /// Builds a submission around a real GP work-package.
+    ///
+    /// This is the encoding side of the typed view; see
+    /// [`work_package`](Self::work_package) for why the field itself is bytes.
+    pub fn from_package(
+        core_index: u16,
+        package: &jam_types::WorkPackage,
+        extrinsics: Vec<Vec<u8>>,
+    ) -> Self {
+        Self { core_index, work_package: package.encode(), extrinsics }
+    }
+
+    /// Decodes [`work_package`](Self::work_package) as a GP work-package.
+    ///
+    /// Strict: trailing bytes are an error. `Decode` alone would stop at the
+    /// end of the package and leave whatever followed unread, so a node that
+    /// appended junk to a well-formed package would otherwise pass.
+    ///
+    /// Requires the protocol parameters to be installed, for the reason on
+    /// [`work_package`](Self::work_package).
+    pub fn package(&self) -> Result<jam_types::WorkPackage, codec::Error> {
+        let mut input = &self.work_package[..];
+        let package = jam_types::WorkPackage::decode(&mut input)?;
+        if !input.is_empty() {
+            return Err("trailing bytes after the work-package".into());
+        }
+        Ok(package)
+    }
+
     /// Message 1: `Core Index ++ Work-Package` (`simple.md:372`).
     pub fn encode_initial(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(2 + self.work_package.len());

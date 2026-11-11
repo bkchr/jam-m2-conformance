@@ -920,6 +920,188 @@ mod tests {
         Ok(())
     }
 
+    /// The whole guaranteeing path on one trivial work item: a package, the
+    /// report it refines to, the bundle, and a guarantee signed by the
+    /// validators holding the core.
+    ///
+    /// Here rather than in `m2-reference` because it needs a chain whose
+    /// genesis is anchored to the current epoch. An unanchored one refuses
+    /// twice over -- the guarantee's slot names an epoch the state has never
+    /// heard of, and once past that, genesis is far too old to be a lookup
+    /// anchor -- and anchoring is `spec::tiny_spec`'s job, which lives here.
+    ///
+    /// It also measures what refining costs on the interpreter backend, which
+    /// `RefChain` forces because the compiler backend needs a userfaultfd
+    /// sandbox. N3 schedules work packages into slots, so the figure decides
+    /// whether that calendar is realistic.
+    /// A reference chain anchored to the current epoch, seeded to the present.
+    ///
+    /// Everything about guaranteeing needs one: assignments come from the
+    /// storage for a slot, and an unanchored chain's state is at epoch 0 while
+    /// its clock is eight hundred thousand epochs later, so it has no
+    /// assignment for any slot the harness would ask about.
+    fn anchored_chain(base_port: u16) -> Result<RefChain, m2_reference::chain::ChainError> {
+        jam_types::ProtocolParameters::tiny()
+            .apply()
+            .expect("tiny parameters apply");
+        let ports: Vec<u16> = (0..VALIDATOR_COUNT).map(|i| base_port + i as u16).collect();
+        let anchor = m2_reference::chain::current_epoch_start_slot();
+        let spec = spec::tiny_spec(&loopback_ips(), &ports, anchor)
+            .map_err(|e| m2_reference::chain::ChainError::Chain(e.to_string()))?;
+        let chain = RefChain::with_spec(5, spec)?;
+        seed_past_slots(&chain)?;
+        Ok(chain)
+    }
+
+    /// Every validator holds exactly one core, and the two directions of the
+    /// assignment agree. A harness that read them apart would grade a node
+    /// against a split the engine never made.
+    #[test]
+    fn the_assignment_is_a_partition_and_both_directions_agree()
+    -> Result<(), m2_reference::chain::ChainError> {
+        let chain = anchored_chain(42000)?;
+        let slot = chain.best_slot();
+        let mut seen = Vec::new();
+        for core in 0..jam_types::core_count() {
+            let holders = chain
+                .guarantors_for(core, slot)
+                .expect("an active core has holders");
+            for val in &holders {
+                assert_eq!(
+                    chain.core_for(*val, slot),
+                    Some(core),
+                    "validator {val} is listed under core {core} but does not name it"
+                );
+            }
+            seen.extend(holders);
+        }
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..jam_types::max_val_count()).collect::<Vec<_>>(),
+            "every validator holds exactly one core"
+        );
+        assert!(
+            chain.guarantors_for(jam_types::core_count(), slot).is_none(),
+            "a core outside the active set has no holders"
+        );
+        Ok(())
+    }
+
+    /// The assignment rotates within an epoch, which is the half of the rule a
+    /// harness caching one lookup would silently lose.
+    #[test]
+    fn the_assignment_rotates_within_an_epoch() -> Result<(), m2_reference::chain::ChainError> {
+        let chain = anchored_chain(43000)?;
+        let slot = chain.best_slot();
+        assert_ne!(
+            chain.core_for(0, slot),
+            chain.core_for(0, slot + jam_types::rotation_period()),
+            "the core a validator holds must change across a rotation boundary"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_work_item_refines_into_a_signed_guarantee() -> Result<(), m2_reference::chain::ChainError>
+    {
+        let chain = anchored_chain(41000)?;
+
+        let item = jam_node::hazmat::BuildItem::new(
+            jam_node::DEV_BOOTSTRAP_SERVICE_ID,
+            jam_types::WorkPayload(Vec::new()),
+            jam_types::max_refine_gas(),
+            jam_types::max_accumulate_gas(),
+            Vec::new(),
+            Vec::new(),
+            0,
+        );
+        let core = 0;
+        let started = std::time::Instant::now();
+        let work = chain.guarantee_work(vec![item], core)?;
+        eprintln!("refine took {:?}", started.elapsed());
+
+        assert!(!work.bundle.is_empty(), "the bundle carries the package");
+        assert!(
+            !work.guarantee.signatures.is_empty(),
+            "the guarantee is signed"
+        );
+        // Every signer must hold the core -- at the guarantee's *own* slot, not
+        // the chain head's. The assignment rotates every `rotation_period`, so
+        // the two disagree whenever a run straddles a boundary, and asserting
+        // against the head made this test fail about half the time.
+        let holders = chain
+            .guarantors_for(core, work.guarantee.slot)
+            .expect("an active core has holders");
+        for signature in work.guarantee.signatures.iter() {
+            assert!(
+                holders.contains(&signature.val_index),
+                "validator {} signed for a core it does not hold ({holders:?})",
+                signature.val_index
+            );
+        }
+        Ok(())
+    }
+
+    /// A CE 133 submission carries the real package, and `package()` is the
+    /// exact inverse of `from_package`.
+    ///
+    /// The typed view is only worth having if it survives a package the
+    /// engine actually built: a hand-made one would agree with a codec that
+    /// got the field order wrong, because both sides would be mine.
+    #[test]
+    fn a_submission_round_trips_the_real_work_package()
+    -> Result<(), m2_reference::chain::ChainError> {
+        use jamnp_s::codec::ce131_136::WorkPackageSubmission;
+
+        let chain = anchored_chain(44000)?;
+        let item = jam_node::hazmat::BuildItem::new(
+            jam_node::DEV_BOOTSTRAP_SERVICE_ID,
+            jam_types::WorkPayload(Vec::new()),
+            jam_types::max_refine_gas(),
+            jam_types::max_accumulate_gas(),
+            Vec::new(),
+            Vec::new(),
+            0,
+        );
+        let work = chain.guarantee_work(vec![item], 0)?;
+
+        let mut sub = WorkPackageSubmission::from_package(0, &work.package, Vec::new());
+        let decoded = sub.package().expect("the package decodes");
+        assert_eq!(
+            codec::Encode::encode(&decoded),
+            codec::Encode::encode(&work.package),
+            "decoding and re-encoding must return the same bytes"
+        );
+        assert!(
+            sub.validate_initial_size(),
+            "a one-item package is far below the CE 133 cap"
+        );
+
+        // The initial message is the core index and then the package, with no
+        // length prefix on the package: it runs to the end of the message.
+        let wire = sub.encode_initial();
+        let (core_index, work_package) =
+            WorkPackageSubmission::decode_initial(&mut &wire[..]).expect("message 1 decodes");
+        assert_eq!(core_index, 0);
+        assert_eq!(work_package, sub.work_package);
+
+        // Because the package is not length-prefixed, a node could append junk
+        // and a plain `Decode` would stop short and never notice.
+        sub.work_package.push(0xff);
+        assert!(
+            codec::Decode::decode(&mut &sub.work_package[..])
+                .map(|p: jam_types::WorkPackage| codec::Encode::encode(&p))
+                .is_ok(),
+            "a plain decode accepts the junk, which is what `package` has to catch"
+        );
+        assert!(
+            sub.package().is_err(),
+            "trailing bytes after the package must be rejected"
+        );
+        Ok(())
+    }
+
     /// Defect 2: at every NUT position the harness emulates the other five
     /// validators and never the NUT itself. The old contiguous range gave
     /// `0..nut_index`, which both lost the validators above the NUT and
